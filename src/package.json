@@ -1,0 +1,21 @@
+{
+  "name": "tenma-archive",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "check": "node scripts/check-db.js",
+    "probe": "node scripts/probe-media.js",
+    "rebuild": "node scripts/rebuild.js",
+    "try-tags": "node scripts/try-tags.js",
+    "test": "node --test 'test/*.test.js'",
+    "test:ui": "node --test 'test/ui.test.js'"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

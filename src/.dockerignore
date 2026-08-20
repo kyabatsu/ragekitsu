@@ -1,0 +1,13 @@
+# The database is a mount, never a layer. Copying data/ into the image would
+# bake a snapshot of the archive into it, ship it to every rebuild, and quietly
+# shadow the real one if the /data mount were ever missing.
+data/
+node_modules/
+.git/
+test/
+scripts/try-tags.js
+*.md
+!README.md
+.dockerignore
+Dockerfile
+docker-compose.yml

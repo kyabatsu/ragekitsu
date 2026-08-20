@@ -1,0 +1,80 @@
+# Container Manager → Project → Create → point it at the folder holding this
+# file. Project name `ragekitsu`.
+#
+# Two mounts, doing different jobs:
+#
+#   /data    the database. Read-write, ~1 MB, and the only thing here that
+#            cannot be regenerated. Back this up, not the container.
+#   /media   the raws. Read-ONLY on purpose — the archive never writes media,
+#            it only reads and stats it. ls-audit moves files around over the
+#            Pi's own mount, so nothing here needs write access, and 21 TB of
+#            irreplaceable recordings should not be reachable for writing by a
+#            web server that has no reason to touch them.
+#
+# TENMA_MEDIA_ROOT is the PARENT of `raws/`, not raws itself. ls-rec's
+# archive_media_prefix ("raws/") is what joins the two, and getting the pair
+# wrong does not error — it makes every capture read `lost`.
+
+services:
+  tenma:
+    build: 
+      context: ./src
+      dockerfile: Dockerfile
+    container_name: ragekitsu
+    restart: unless-stopped
+    # The image runs as uid 1000 (`USER node`). A folder made in File Station
+    # belongs to your DSM account instead, and the failure is not obvious: the
+    # server dies at startup with `attempt to write a readonly database`,
+    # because WAL mode creates -wal and -shm *next to* the file, so the
+    # directory has to be writable, not just the database.
+    #
+    # Either `chown -R 1000:1000` the data dir over SSH, or uncomment this and
+    # put your own ids in — `id yourusername` over SSH prints them.
+    # user: "1026:100"
+    ports:
+      # LAN-bound so the Pi posts ingest packets straight here rather than out
+      # through the reverse proxy. DSM itself owns 5000/5001.
+      - "8000:8000"
+    volumes:
+      # Long-form syntax rather than "src:dst:ro" because the media path has a
+      # space in it. The short form is split on colons so a space is survivable
+      # when quoted, but this leaves nothing to get wrong.
+      - type: bind
+        source: /volume2/docker/ragekitsu/data
+        target: /data
+      - type: bind
+        source: /volume1/Volume01/edit-video_library/Tenma Maemi/archives
+        target: /media
+        read_only: true
+    environment:
+      TENMA_DB: /data/archive.db
+      TENMA_MEDIA_ROOT: /media
+      PORT: "8000"
+      TENMA_HOST: "0.0.0.0"
+
+      # Must match archive_token in the Pi's config.json.
+      # `openssl rand -hex 32` over SSH. Unset disables ingest entirely, which
+      # is the safe failure rather than an open one.
+      TENMA_INGEST_TOKEN: "ecd474f2b1dbe607f849ad9542b81195757bdb251b346b3f62f02902b2e4a3fd"
+
+      # ─────────────────────────────────────────────────────────────────────
+      # DELETE THIS LINE BEFORE THE ROUTER EVER FORWARDS A PORT HERE.
+      #
+      # It mints a session for any handle with no verification, and the first
+      # account to sign in becomes admin. On a LAN-only box that is a
+      # convenience; on a reachable one it is not a weak password, it is no
+      # password. Nothing else in the app gates on it — remove the line,
+      # restart, and the sign-in control stops rendering.
+      TENMA_DEV_AUTH: "1"
+      # ─────────────────────────────────────────────────────────────────────
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 60s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

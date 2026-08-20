@@ -1,0 +1,16 @@
+# The archive itself never travels with the code. It is per-machine state, it
+# is rebuilt by migrate() on boot from whatever vintage it happens to be, and
+# the -wal/-shm files beside it belong to that one .db and nothing else.
+data/
+
+# Scratch databases the scripts and tests leave behind.
+*.try.db
+*.try.db-*
+*-test.db
+*-test.db-*
+
+src/node_modules/
+.DS_Store
+*.log
+@eaDir/
+@tmp/
