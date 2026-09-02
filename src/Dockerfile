@@ -30,7 +30,9 @@ ENV NODE_ENV=production \
     PORT=8000 \
     TENMA_DB=/data/archive.db \
     TENMA_MEDIA_ROOT=/media \
+    TENMA_CACHE_ROOT=/cache \
     TENMA_HOST=0.0.0.0
+
 
 EXPOSE 8000
 

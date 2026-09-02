@@ -333,6 +333,24 @@ CREATE TABLE IF NOT EXISTS segment (
   start_s       INTEGER NOT NULL,
   end_s         INTEGER,                     -- NULL = runs to the next segment
 
+  -- Which row of the strip. 0 is what she played; 1 is what happened inside
+  -- that — "No Caller ID", "Chapter VI of story". Two lanes, and the ENUM
+  -- refuses a third: a strip with a row nobody fills is worse than not having
+  -- it, and anything finer belongs in the lane-1 label.
+  --
+  -- A LANE, NOT A parent_id, and that was the decision. A parent link would
+  -- buy one thing — a guaranteed answer to "inside what" — and every edge case
+  -- it has comes from having to keep that answer true: a containment rule, a
+  -- cascade policy when the parent is retracted, and a child that turns
+  -- invalid the moment someone nudges the parent's boundary by four minutes.
+  -- Lanes buy the same picture for a GROUP BY. Nothing cascades: deleting the
+  -- Nikke block does not un-happen No Caller ID. And an inner block may cross
+  -- an outer boundary — a sponsored read that starts inside the game and ends
+  -- after she has moved on — which containment would have refused outright.
+  -- "Inside what" is answered where it is needed, at projection time, by
+  -- looking at which lane-0 block covers the start. See projectSegments.
+  lane          INTEGER NOT NULL DEFAULT 0,
+
   kind          TEXT NOT NULL DEFAULT 'unknown',   -- game|person|type|meta|unknown
   -- What this block is about. NULL is fine — a waiting screen is not about
   -- anything. When set, the strip renders `label ?? tag.name`, so you can write
@@ -532,4 +550,164 @@ END;
 CREATE TRIGGER IF NOT EXISTS stream_au AFTER UPDATE ON stream BEGIN
   INSERT INTO stream_fts(stream_fts, rowid, title, summary) VALUES('delete', old.rowid, old.title, old.summary);
   INSERT INTO stream_fts(rowid, title, summary) VALUES (new.rowid, new.title, new.summary);
+END;
+
+-- ---------------------------------------------------------------------------
+-- snippets
+--
+-- A short standalone clip on the NAS beside the raws. Deliberately not a
+-- capture and not a segment: a snippet has no broadcast, no platform and no
+-- second clock, so its offsets are its own file's seconds and nothing else.
+-- Its own table keeps every case in the axis machinery — covers_s,
+-- anchor_clock, positionToAxis — from having to grow a branch for the one
+-- kind of media that never had a clock to be wrong about.
+--
+-- source_stream_id is a link, not a dependency. Most of these were cut long
+-- before this archive existed and will never resolve to a stream row.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS snippet (
+  id            TEXT PRIMARY KEY,           -- ULID
+  slug          TEXT NOT NULL UNIQUE,       -- the filename stem, the importer's key
+  title         TEXT NOT NULL,
+  summary       TEXT,                       -- human blurb; editable, unlike the transcript
+  video_path    TEXT NOT NULL,              -- relative to TENMA_MEDIA_ROOT
+  poster_path   TEXT,                       -- first frame, written by the importer
+  duration_s    REAL,
+  width         INTEGER,
+  height        INTEGER,
+  bytes         INTEGER,
+
+  source_stream_id TEXT REFERENCES stream(id) ON DELETE SET NULL,
+  source_offset_s  INTEGER,
+
+  -- When the clip landed, as distinct from when this row was made. created_at
+  -- is the row's own age and a bulk import stamps every row with the same
+  -- second, so ordering on it sorts by whatever order readdir returned —
+  -- alphabetical — and buries the newest clip at the bottom. Taken from the
+  -- file's mtime, the only record of when a clip was added that lives outside
+  -- this database.
+  added_at      INTEGER,
+
+  -- What the file actually CONTAINS. The extension is a claim and ffprobe's
+  -- format_name cannot settle it either -- it reports "matroska,webm" for a
+  -- real WebM and for an ordinary Matroska alike, because WebM *is* Matroska
+  -- with a restricted codec list. Only the codecs decide whether a browser
+  -- will play it, so they are recorded rather than re-derived. servedType()
+  -- in archive.js turns these three into a Content-Type.
+  container     TEXT,
+  video_codec   TEXT,
+  audio_codec   TEXT,
+  -- A web-playable rewrap of an unplayable original, relative to the CACHE
+  -- root -- never the media root, which is read-only and holds the masters.
+  -- NULL is the normal case and means "serve video_path directly".
+  play_path     TEXT,
+  -- Content hash. Written by scripts/check-media.js, not by the importer:
+  -- hashing the whole collection costs minutes and answers a question the
+  -- import does not ask. Finds the same clip filed twice under two names, and
+  -- is what a future upload checks to know it already holds this file.
+  sha256        TEXT,
+
+  -- The flat join of snippet_line.text. Denormalised because FTS5 indexes one
+  -- column on one row, and a child table would need its own index and its own
+  -- join on every search. Derived — rewritten whenever the lines are.
+  transcript    TEXT,
+  -- none    nobody has run one
+  -- auto    a machine produced it
+  -- empty   a machine ran and heard no speech — a real answer, not a gap
+  -- failed  a machine ran and could not; transcript_note says why
+  -- edited  a human has been through it
+  transcript_status TEXT NOT NULL DEFAULT 'none',
+  -- The ASR run's report on itself. Kept because at a thousand clips the
+  -- question is never "is there a transcript" but "which ones need running
+  -- again, and why" — and because `WHERE transcript_model = 'large-v3'` is the
+  -- list to re-run when a better model lands.
+  transcript_model  TEXT,
+  transcript_at     INTEGER,
+  transcript_note   TEXT,
+
+  status        TEXT NOT NULL DEFAULT 'confirmed',
+  origin        TEXT NOT NULL DEFAULT 'vault',
+  author_id     TEXT REFERENCES person(id) ON DELETE SET NULL,
+  retracted_at  INTEGER,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+
+-- One row per transcript line, carrying the timing WhisperX already produced.
+-- Not tombstoned and not changeset-managed: a transcript is replaced whole by
+-- its next pass, and thirty rows of "who edited line 14" is noise rather than
+-- history. The human-editable prose is snippet.summary.
+CREATE TABLE IF NOT EXISTS snippet_line (
+  id         TEXT PRIMARY KEY,
+  snippet_id TEXT NOT NULL REFERENCES snippet(id) ON DELETE CASCADE,
+  seq        INTEGER NOT NULL,
+  start_s    REAL NOT NULL,
+  end_s      REAL,
+  speaker    TEXT,                          -- nullable; for diarization later
+  text       TEXT NOT NULL,
+  UNIQUE(snippet_id, seq)
+);
+
+-- ---------------------------------------------------------------------------
+-- taglets — the snippet vocabulary
+--
+-- Deliberately NOT the `tag` table. That one is a curated list of what a
+-- stream was ABOUT, and it is shared with segment.kind, where every entry has
+-- to mean a colour on a timeline. `meta:funny` is not a chapter colour and
+-- `copyright:phase_connect` is not a thing a stream is about. Two vocabularies
+-- because they answer two questions; merging them would force every taglet
+-- kind to also be a legal chapter kind.
+--
+-- The shape is Danbooru's, because that is the shape that survives a thousand
+-- short clips: a namespace, a machine slug, a display name.
+--   character   who is in it        blue
+--   copyright   what it belongs to  violet
+--   meta        what it is like     yellow
+--   general     everything else     grey
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS taglet (
+  id           TEXT PRIMARY KEY,
+  name         TEXT NOT NULL,               -- "Eimi Isami"
+  slug         TEXT NOT NULL UNIQUE,        -- "eimi-isami", derived from name
+  kind         TEXT NOT NULL DEFAULT 'general',
+  summary      TEXT,
+  status       TEXT NOT NULL DEFAULT 'confirmed',   -- proposed | confirmed
+  origin       TEXT NOT NULL DEFAULT 'vault',
+  author_id    TEXT REFERENCES person(id) ON DELETE SET NULL,
+  retracted_at INTEGER,
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS snippet_taglet (
+  id         TEXT PRIMARY KEY,
+  snippet_id TEXT NOT NULL REFERENCES snippet(id) ON DELETE CASCADE,
+  taglet_id  TEXT NOT NULL REFERENCES taglet(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(snippet_id, taglet_id)
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS snippet_fts USING fts5(
+  title, summary, transcript,
+  content='snippet', content_rowid='rowid',
+  tokenize = "porter unicode61 remove_diacritics 2",
+  prefix = '2 3'
+);
+
+CREATE TRIGGER IF NOT EXISTS snippet_ai AFTER INSERT ON snippet BEGIN
+  INSERT INTO snippet_fts(rowid, title, summary, transcript)
+    VALUES (new.rowid, new.title, new.summary, new.transcript);
+END;
+CREATE TRIGGER IF NOT EXISTS snippet_ad AFTER DELETE ON snippet BEGIN
+  INSERT INTO snippet_fts(snippet_fts, rowid, title, summary, transcript)
+    VALUES('delete', old.rowid, old.title, old.summary, old.transcript);
+END;
+CREATE TRIGGER IF NOT EXISTS snippet_au AFTER UPDATE ON snippet BEGIN
+  INSERT INTO snippet_fts(snippet_fts, rowid, title, summary, transcript)
+    VALUES('delete', old.rowid, old.title, old.summary, old.transcript);
+  INSERT INTO snippet_fts(rowid, title, summary, transcript)
+    VALUES (new.rowid, new.title, new.summary, new.transcript);
 END;

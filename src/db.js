@@ -53,6 +53,50 @@ const MIGRATIONS = [
        created_at INTEGER NOT NULL,
        reviewed_by TEXT REFERENCES person(id), reviewed_at INTEGER)`],
 
+  /* ---- the job queue ------------------------------------------------------
+     The archive never fetches, never writes to the media tree and never
+     deletes from it. It publishes INTENT here and ls-rec subscribes: the Pi
+     asks for work on a tick it already runs, and the archive opens no outbound
+     socket at all. See `File management` in review.md.
+
+     The one rule the shape enforces: a job names an ID and a VERB. `url` is
+     the single exception and it is inert here — the host allowlist lives in
+     ls-rec's config, so a compromised archive still cannot make the recorder
+     fetch from an attacker's host. Nothing in this table is a path the worker
+     is told to trust; roots and filenames come from the worker's own config.
+
+     status
+       proposed  somebody asked for it; no worker will see it
+       approved  an editor said yes — this is what the poll claims
+       claimed   a worker holds a lease; another poll skips it until it lapses
+       done      finished, result_path recorded
+       failed    terminal, and `error` says why. NOT re-queued automatically:
+                 a job that fails ffmpeg and returns to the queue is an
+                 infinite loop with a 74-second period. An editor re-approves. */
+  ['job', null,
+    `CREATE TABLE IF NOT EXISTS job (
+       id           TEXT PRIMARY KEY,
+       kind         TEXT NOT NULL,              -- fetch | promote | purge
+       status       TEXT NOT NULL DEFAULT 'proposed',
+       snippet_id   TEXT REFERENCES snippet(id) ON DELETE CASCADE,
+       url          TEXT,
+       payload      TEXT,                       -- JSON; kind-specific, never a path
+       requested_by TEXT REFERENCES person(id) ON DELETE SET NULL,
+       approved_by  TEXT REFERENCES person(id) ON DELETE SET NULL,
+       claimed_by   TEXT,                       -- the worker's own name for itself
+       claimed_at   INTEGER,
+       attempts     INTEGER NOT NULL DEFAULT 0,
+       result_path  TEXT,
+       error        TEXT,
+       created_at   INTEGER NOT NULL,
+       updated_at   INTEGER NOT NULL,
+       finished_at  INTEGER)`],
+  // The claim query's index: status first because it is the selective one —
+  // a queue is nearly all `done`.
+  ['job', `CREATE INDEX IF NOT EXISTS ix_job_claim ON job(status, kind, created_at)`],
+  ['job', `CREATE INDEX IF NOT EXISTS ix_job_snippet ON job(snippet_id)
+             WHERE snippet_id IS NOT NULL`],
+
   // --- clocks -------------------------------------------------------------
   // Two absolute times per capture instead of one relative one. See the block
   // comment on `capture` in schema.sql for why relative was never going to
@@ -104,6 +148,15 @@ const MIGRATIONS = [
        created_at INTEGER NOT NULL,
        updated_at INTEGER NOT NULL)`],
 
+  /* --- the second lane -----------------------------------------------------
+     Defaulting to 0 is the whole migration: every chapter ever drawn is a
+     lane-0 chapter, stays exactly where it is, and keeps tiling as before.
+     No index. The lane is filtered in memory alongside the axis conversion
+     that already has to happen per row, and a stream has tens of segments,
+     not thousands — ix_segment_stream(stream_id, start_s) is still the one
+     that matters. */
+  ['segment', 'lane', 'ALTER TABLE segment ADD COLUMN lane INTEGER NOT NULL DEFAULT 0'],
+
   // --- materialised timeline ----------------------------------------------
   ['stream', 'timeline_json', 'ALTER TABLE stream ADD COLUMN timeline_json TEXT'],
   ['stream', 'timeline_at',   'ALTER TABLE stream ADD COLUMN timeline_at INTEGER'],
@@ -132,6 +185,147 @@ const MIGRATIONS = [
   ['tag', 'retracted_at', 'ALTER TABLE tag ADD COLUMN retracted_at INTEGER'],
 
   ['segment', 'tag_id', 'ALTER TABLE segment ADD COLUMN tag_id TEXT REFERENCES tag(id) ON DELETE SET NULL'],
+
+  // --- snippets -----------------------------------------------------------
+  //
+  // A snippet is a short standalone clip on the NAS beside the raws. It is NOT
+  // a capture and not a segment: it has no broadcast, no platform, no clock to
+  // convert through, and its offsets are its own file's seconds and nothing
+  // else. Giving it its own table means none of the axis machinery — covers_s,
+  // anchor_clock, positionToAxis — has to grow a case for something that never
+  // had a second clock to be wrong about.
+  //
+  // source_stream_id is a link, not a dependency: most of these were cut long
+  // before this archive existed and will never resolve to a stream row.
+  ['snippet', null,
+    `CREATE TABLE IF NOT EXISTS snippet (
+       id            TEXT PRIMARY KEY,
+       slug          TEXT NOT NULL UNIQUE,
+       title         TEXT NOT NULL,
+       summary       TEXT,
+       video_path    TEXT NOT NULL,
+       poster_path   TEXT,
+       duration_s    REAL,
+       width         INTEGER,
+       height        INTEGER,
+       bytes         INTEGER,
+       source_stream_id TEXT REFERENCES stream(id) ON DELETE SET NULL,
+       source_offset_s  INTEGER,
+       -- The flat join of snippet_line.text, denormalised so FTS5 can index one
+       -- column on one row. Derived, and rewritten whenever the lines are.
+       transcript    TEXT,
+       -- none | auto | edited. 'auto' is a machine's best guess and should be
+       -- allowed to look like one; 'edited' means a human has been through it.
+       transcript_status TEXT NOT NULL DEFAULT 'none',
+       status        TEXT NOT NULL DEFAULT 'confirmed',
+       origin        TEXT NOT NULL DEFAULT 'vault',
+       author_id     TEXT REFERENCES person(id) ON DELETE SET NULL,
+       retracted_at  INTEGER,
+       created_at    INTEGER NOT NULL,
+       updated_at    INTEGER NOT NULL)`],
+
+  // One row per transcript line, with the timing WhisperX already produced.
+  // Not tombstoned and not changeset-managed: a transcript is replaced whole by
+  // its next pass, and thirty rows of "who edited line 14" is noise, not
+  // history. The editable human-facing text is snippet.summary.
+  ['snippet_line', null,
+    `CREATE TABLE IF NOT EXISTS snippet_line (
+       id         TEXT PRIMARY KEY,
+       snippet_id TEXT NOT NULL REFERENCES snippet(id) ON DELETE CASCADE,
+       seq        INTEGER NOT NULL,
+       start_s    REAL NOT NULL,
+       end_s      REAL,
+       speaker    TEXT,
+       text       TEXT NOT NULL,
+       UNIQUE(snippet_id, seq))`],
+
+  // --- taglets ------------------------------------------------------------
+  //
+  // Deliberately NOT the `tag` table. That vocabulary is a curated list of
+  // things a stream was ABOUT — a game, a format — and it is shared with
+  // segment.kind, where every entry has to mean a colour on a timeline.
+  // `meta:funny` is not a chapter colour and `copyright:phase_connect` is not
+  // something a stream is about. Two vocabularies because they answer two
+  // questions; one table would have forced every taglet kind to also be a
+  // legal chapter kind.
+  //
+  // The shape is Danbooru's, because that is the shape that works for a
+  // thousand short clips: a namespace, a machine slug, a display name.
+  ['taglet', null,
+    `CREATE TABLE IF NOT EXISTS taglet (
+       id           TEXT PRIMARY KEY,
+       name         TEXT NOT NULL,
+       slug         TEXT NOT NULL UNIQUE,
+       kind         TEXT NOT NULL DEFAULT 'general',
+       summary      TEXT,
+       status       TEXT NOT NULL DEFAULT 'confirmed',
+       origin       TEXT NOT NULL DEFAULT 'vault',
+       author_id    TEXT REFERENCES person(id) ON DELETE SET NULL,
+       retracted_at INTEGER,
+       created_at   INTEGER NOT NULL,
+       updated_at   INTEGER NOT NULL)`],
+
+  ['snippet_taglet', null,
+    `CREATE TABLE IF NOT EXISTS snippet_taglet (
+       id         TEXT PRIMARY KEY,
+       snippet_id TEXT NOT NULL REFERENCES snippet(id) ON DELETE CASCADE,
+       taglet_id  TEXT NOT NULL REFERENCES taglet(id) ON DELETE CASCADE,
+       created_at INTEGER NOT NULL,
+       updated_at INTEGER NOT NULL,
+       UNIQUE(snippet_id, taglet_id))`],
+
+  ['snippet_fts', null,
+    `CREATE VIRTUAL TABLE IF NOT EXISTS snippet_fts USING fts5(
+       title, summary, transcript,
+       content='snippet', content_rowid='rowid',
+       tokenize = "porter unicode61 remove_diacritics 2",
+       prefix = '2 3')`],
+
+  // --- what the transcriber said about itself -----------------------------
+  //
+  // The ASR run's own report, kept because at a thousand clips the question is
+  // not "is there a transcript" but "which forty do I need to run again, and
+  // why". Without these, a clip whose transcription FAILED and a clip that is
+  // genuinely silent both read as transcript_status='none' and there is no way
+  // to tell them apart short of re-reading a thousand sidecars.
+  //
+  // Also makes a model upgrade tractable: `WHERE transcript_model='large-v3'`
+  // is the list to re-run when something better arrives.
+  /* When the clip landed, as distinct from when this row was made.
+     created_at is the row's own age and every import stamps it with the same
+     second, so ordering on it — or on the ULID, which is minted from it —
+     sorts a thousand clips by the order readdir happened to return them, which
+     is alphabetical. That put the newest clip at the bottom of the list.
+     Taken from the file's mtime, which is the only record of when a clip was
+     added that survives outside the archive. */
+  ['snippet', 'added_at', 'ALTER TABLE snippet ADD COLUMN added_at INTEGER'],
+
+  /* What the file actually CONTAINS, recorded because the extension is a claim
+     and `format_name` cannot settle it either — ffprobe reports
+     "matroska,webm" for a real WebM and an ordinary Matroska alike. Without
+     these three the server has no way to send an honest Content-Type, and a
+     clip whose codecs a browser cannot decode simply renders blank with
+     nothing logged anywhere. See servedType() in archive.js. */
+  ['snippet', 'container',   'ALTER TABLE snippet ADD COLUMN container TEXT'],
+  ['snippet', 'video_codec', 'ALTER TABLE snippet ADD COLUMN video_codec TEXT'],
+  ['snippet', 'audio_codec', 'ALTER TABLE snippet ADD COLUMN audio_codec TEXT'],
+  /* A web-playable rewrap of an unplayable original, under the CACHE root —
+     never the media root, which is mounted read-only and holds the masters.
+     Set only when the original cannot be served as-is; NULL is the normal
+     case and means "serve video_path directly". */
+  ['snippet', 'play_path',   'ALTER TABLE snippet ADD COLUMN play_path TEXT'],
+  /* Content hash, filled by the audit rather than the importer — hashing 70GB
+     costs ten minutes and answers a question the import does not ask. It earns
+     its place twice: it finds the same clip filed twice under two names in a
+     collection scraped together over years, and it is what a future upload
+     checks against to know it already has this file. */
+  ['snippet', 'sha256',      'ALTER TABLE snippet ADD COLUMN sha256 TEXT'],
+
+  ['snippet', 'transcript_model', 'ALTER TABLE snippet ADD COLUMN transcript_model TEXT'],
+  ['snippet', 'transcript_at',    'ALTER TABLE snippet ADD COLUMN transcript_at INTEGER'],
+  // The transcriber's own reason for a non-ok status. Free text from the tool,
+  // shown to nobody but an admin looking at a failed batch.
+  ['snippet', 'transcript_note',  'ALTER TABLE snippet ADD COLUMN transcript_note TEXT'],
 ];
 
 // Rebuilds — for the shape changes ALTER TABLE cannot express. Each runs only
@@ -200,6 +394,39 @@ const POST_MIGRATION = [
      BEFORE DELETE ON capture
      WHEN EXISTS (SELECT 1 FROM segment WHERE anchor_id = OLD.id AND retracted_at IS NULL)
      BEGIN SELECT RAISE(ABORT, 'capture still anchors segments — convert them first'); END`],
+
+  // --- snippets -----------------------------------------------------------
+  // The list's actual sort, so it is an index scan rather than a sort of the
+  // whole table. id breaks ties, and does so deterministically — several clips
+  // copied in one go share an mtime to the second.
+  ['snippet', `CREATE INDEX IF NOT EXISTS ix_snippet_live ON snippet(added_at DESC, id DESC)
+     WHERE retracted_at IS NULL`],
+  ['snippet_line', `CREATE INDEX IF NOT EXISTS ix_snippet_line ON snippet_line(snippet_id, seq)`],
+  ['taglet', `CREATE INDEX IF NOT EXISTS ix_taglet_live ON taglet(status, kind, slug)
+     WHERE retracted_at IS NULL`],
+  // Both directions: "what is on this snippet" renders every row, and "what is
+  // tagged X" is the whole point of the filter.
+  ['snippet_taglet', `CREATE INDEX IF NOT EXISTS ix_sniptag_snip ON snippet_taglet(snippet_id)`],
+  ['snippet_taglet', `CREATE INDEX IF NOT EXISTS ix_sniptag_tag ON snippet_taglet(taglet_id)`],
+
+  // External-content FTS: the triggers ARE the index. Without them the table
+  // silently answers every query with nothing, which looks exactly like "no
+  // results" and is the reason to keep these beside the ones for note/stream
+  // rather than somewhere clever.
+  ['snippet', `CREATE TRIGGER IF NOT EXISTS snippet_ai AFTER INSERT ON snippet BEGIN
+     INSERT INTO snippet_fts(rowid, title, summary, transcript)
+       VALUES (new.rowid, new.title, new.summary, new.transcript);
+   END`],
+  ['snippet', `CREATE TRIGGER IF NOT EXISTS snippet_ad AFTER DELETE ON snippet BEGIN
+     INSERT INTO snippet_fts(snippet_fts, rowid, title, summary, transcript)
+       VALUES('delete', old.rowid, old.title, old.summary, old.transcript);
+   END`],
+  ['snippet', `CREATE TRIGGER IF NOT EXISTS snippet_au AFTER UPDATE ON snippet BEGIN
+     INSERT INTO snippet_fts(snippet_fts, rowid, title, summary, transcript)
+       VALUES('delete', old.rowid, old.title, old.summary, old.transcript);
+     INSERT INTO snippet_fts(rowid, title, summary, transcript)
+       VALUES (new.rowid, new.title, new.summary, new.transcript);
+   END`],
 ];
 
 // Data backfills. Every one is guarded by `IS NULL`, so it fills what has never
@@ -222,6 +449,11 @@ const BACKFILLS = [
   ['note', 'note.offset_precision_s', `
     UPDATE note SET offset_precision_s = 120
     WHERE offset_precision_s IS NULL AND origin = 'vault' AND offset_s IS NOT NULL`],
+
+  // Rows imported before added_at existed: the row's own age is the best
+  // available answer, and it is what they were being ordered by anyway.
+  ['snippet', 'snippet.added_at',
+   'UPDATE snippet SET added_at = created_at WHERE added_at IS NULL'],
 
   // Every tag that already exists came from the import and is therefore
   // already part of the vocabulary — confirmed, not proposed.

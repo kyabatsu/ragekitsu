@@ -11,7 +11,7 @@
 // viewer's suggestion, and it is what keeps the history complete.
 
 import { statSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { resolve, sep } from 'node:path';
 import { bit, bumpGeneration, isUlid, now, slugify, tx, ulid } from './db.js';
 
 // ===========================================================================
@@ -95,11 +95,25 @@ const TRUNCATE_RATIO = 0.97;
  *  NFD, so an accented or Japanese title can sit on disk under a different byte
  *  sequence. Try each normalisation before concluding a capture is missing —
  *  the failure mode is a silent "lost", which is the worst way to lose this
- *  particular signal. */
+ *  particular signal.
+ *
+ *  Containment is checked HERE rather than at the routes, because the routes
+ *  are not all alike and the difference is invisible from the call site.
+ *  `/media/video/:capture_id` looks a path up by id, so its argument is
+ *  trusted; `/media/thumb/:rest(*)` takes the path straight off the URL, and
+ *  express decodes route params AFTER path resolution — so `..%2F` survives
+ *  where a bare `../` is normalised away, and `join()` walks straight out of
+ *  the root. Resolving and comparing is the same check `/api/media/browse`
+ *  already does; putting it in the one function every caller goes through
+ *  means the next route to be added inherits it instead of forgetting it.
+ *  statMedia() is a caller too, and its paths come from ingest, which builds
+ *  them from a config-supplied prefix. */
 export function resolveMedia(root, rel) {
   if (!root || !rel) return null;
+  const base = resolve(root);
   for (const form of ['NFC', 'NFD', null]) {
-    const cand = join(root, form ? rel.normalize(form) : rel);
+    const cand = resolve(base, form ? rel.normalize(form) : rel);
+    if (cand !== base && !cand.startsWith(base + sep)) continue;
     try { statSync(cand); return cand; } catch { /* try the next form */ }
   }
   return null;
@@ -278,6 +292,99 @@ export const KINDS = ['game', 'person', 'type', 'meta'];
 // to skip. It gets a hatch rather than a swatch for the same reason.
 export const SEGMENT_KINDS = [...KINDS, 'unknown'];
 
+// The snippet vocabulary, and a separate list on purpose — see the block
+// comment on `taglet` in schema.sql. Danbooru's namespaces, because they are
+// the ones that survive a thousand short clips:
+//
+//   character   who is in it        blue
+//   copyright   what it belongs to  violet
+//   meta        what it is like     yellow
+//   general     everything else     grey
+//
+// 'general' is the default rather than a sentinel like segment's 'unknown':
+// an untyped taglet is a perfectly ordinary taglet, not a gap in the record.
+export const TAGLET_KINDS = ['character', 'copyright', 'meta', 'general'];
+
+/* ── what a browser will actually play ───────────────────────────────────
+ *
+ * A file extension is a claim, not a fact, and `ffprobe` will not settle it
+ * either: it reports `format_name = "matroska,webm"` for a real WebM and for
+ * an ordinary Matroska file alike, because WebM *is* Matroska with a
+ * restricted codec list. So the only thing that decides playability is which
+ * codecs are inside.
+ *
+ * The failure this exists to stop is specific and silent. `ffmpeg -c copy`
+ * into a `.webm` name produces H.264 in a Matroska container, which is a
+ * perfectly valid file that no browser will play — Chrome answers
+ * DEMUXER_ERROR_NO_SUPPORTED_STREAMS, Firefox says the MIME type is not
+ * supported. Nothing on the server errors, nothing is logged, and the clip is
+ * simply blank. *Reproduced against Chromium and confirmed against the
+ * VP9/Opus control, which plays.*
+ *
+ * Returns the Content-Type to serve, or null when nothing honest can be sent
+ * and the file needs a remux first.
+ */
+const WEBM_VIDEO = new Set(['vp8', 'vp9', 'av1']);
+const WEBM_AUDIO = new Set(['vorbis', 'opus']);
+const MP4_VIDEO  = new Set(['h264', 'hevc', 'av1']);
+const MP4_AUDIO  = new Set(['aac', 'mp3', 'opus', 'flac', 'alac']);
+
+export function servedType(container, vcodec, acodec) {
+  const c = String(container || '').toLowerCase();
+  const v = String(vcodec || '').toLowerCase();
+  // No audio track is fine and common for a short clip; an unknown one is not.
+  const aOk = (set) => !acodec || set.has(String(acodec).toLowerCase());
+
+  if (c.includes('matroska') || c.includes('webm')) {
+    // A Matroska file carrying VP9/Opus is byte-for-byte a WebM file whatever
+    // it is named, so an .mkv here needs a correct header and nothing else.
+    return WEBM_VIDEO.has(v) && aOk(WEBM_AUDIO) ? 'video/webm' : null;
+  }
+  if (c.includes('mp4') || c.includes('mov') || c.includes('m4v')) {
+    return MP4_VIDEO.has(v) && aOk(MP4_AUDIO) ? 'video/mp4' : null;
+  }
+  return null;
+}
+
+/* Can the bitstream survive a container swap, or does it need real encoding?
+   H.264/AAC in Matroska is a 70ms `-c copy` into mp4 — measured. VP9 in an
+   mp4 is legal but poorly supported, so it goes the other way. Anything else
+   (MPEG-4 Part 2 from an old .avi, ProRes from an editor) needs a re-encode,
+   which is minutes rather than milliseconds and is not the importer's job. */
+export function remuxTarget(vcodec, acodec) {
+  const v = String(vcodec || '').toLowerCase();
+  const a = String(acodec || '').toLowerCase();
+  if (MP4_VIDEO.has(v) && (!acodec || MP4_AUDIO.has(a))) return 'mp4';
+  if (WEBM_VIDEO.has(v) && (!acodec || WEBM_AUDIO.has(a))) return 'webm';
+  return null;   // needs transcoding, not remuxing
+}
+
+/* What actually has to be re-encoded, per stream.
+ *
+ * "Needs a re-encode" is too blunt a verdict, and the real collection proved
+ * it: of three unplayable clips, two were H.264 video with UNCOMPRESSED PCM
+ * audio in an mp4, and one was VP9 video with perfectly good AAC. Not one of
+ * them needed both streams touched. Re-encoding the video of a file whose only
+ * fault is its audio track is quality thrown away for nothing, and it is
+ * hundreds of times slower than the copy it should have been.
+ *
+ * Returns { container, video, audio } where each stream is 'copy' or 'encode',
+ * and audio may be 'none'. `copy` is exact — the bitstream is moved, not
+ * re-compressed.
+ */
+export function fixPlan(vcodec, acodec, { target = 'mp4' } = {}) {
+  const v = String(vcodec || '').toLowerCase();
+  const a = acodec ? String(acodec).toLowerCase() : null;
+  const [vOk, aOk] = target === 'webm'
+    ? [WEBM_VIDEO, WEBM_AUDIO]
+    : [MP4_VIDEO, MP4_AUDIO];
+  return {
+    container: target,
+    video: vOk.has(v) ? 'copy' : 'encode',
+    audio: !a ? 'none' : (aOk.has(a) ? 'copy' : 'encode'),
+  };
+}
+
 /** Sort segments onto the axis and tile them.
  *
  *  Storage is not constrained to be contiguous — a human editing a strip will
@@ -291,6 +398,7 @@ export const SEGMENT_KINDS = [...KINDS, 'unknown'];
 export function projectSegments(rows, capsById, startedAt, domain) {
   const placed = rows.map((r) => ({
     id: r.id,
+    lane: r.lane === 1 ? 1 : 0,
     kind: SEGMENT_KINDS.includes(r.kind) ? r.kind : 'unknown',
     // `label ?? tag.name` — write "Mario Kart (200cc)" on one block and still
     // link the entity. The colour is NOT read through the tag: it was copied
@@ -310,6 +418,33 @@ export function projectSegments(rows, capsById, startedAt, domain) {
   })).filter((x) => x.start_s !== null)
     .sort((a, b) => a.start_s - b.start_s || String(a.id).localeCompare(String(b.id)));
 
+  /* The two lanes are projected differently and the difference is the design.
+     Lane 0 is tiled below: a broadcast is continuous, so a gap in it is a
+     stretch nobody has labelled yet, and saying so with the hatch is a true
+     claim. Lane 1 is NOT tiled: the last forty minutes of a two-hour game are
+     simply not called anything, and painting a hatch there would invent an
+     obligation. Gaps in the inner lane are gaps. */
+  const lane1 = placed.filter((x) => x.lane === 1);
+  const lane0 = placed.filter((x) => x.lane !== 1);
+
+  /* "Inside what", answered here rather than stored. This is the whole reason
+     a lane needs no parent_id: the containing block is a fact about geometry,
+     recomputed on every projection, so it cannot go stale, cannot be orphaned
+     and cannot refuse a sub-chapter that crosses a boundary. Resolved at the
+     inner block's START — a block that straddles two outer ones belongs, for
+     naming and for colour, to the one it began in.
+
+     It carries the colour too. A lane-1 block has no tag and usually no kind
+     worth picking ("Chapter VI of story" is not a game, a person or a type),
+     so it is drawn in its container's hue. That also makes the strip say
+     "part of that" without a bracket or a leader line. */
+  const under = (seg) => {
+    const o = lane0.find((x) => x.end_s !== null
+      && seg.start_s >= x.start_s && seg.start_s < x.end_s);
+    return o ? { id: o.id, label: o.label, kind: o.kind } : null;
+  };
+  for (const s of lane1) s.under = under(s);
+
   if (domain === null || domain === undefined) {
     return { tiled: false, segments: placed };
   }
@@ -325,20 +460,33 @@ export function projectSegments(rows, capsById, startedAt, domain) {
     // reading "none of this is worth opening", about a stream nobody has looked
     // at. When it really is a waiting screen, someone authors a meta segment.
     out.push(seg ? { ...seg, start_s: a, end_s: b }
-                 : { id: null, kind: 'unknown', label: null, origin: 'projection',
+                 : { id: null, lane: 0, kind: 'unknown', label: null, origin: 'projection',
                      author: null, frame: 'stream', anchor_id: null,
                      start_s: a, end_s: b, exact: true, synthetic: true });
   };
 
   let cursor = 0;
-  placed.forEach((seg, i) => {
-    const next = placed[i + 1];
+  /* Untouched from here down, and that is on purpose: lane 0 runs exactly the
+     code it ran before the second lane existed, over exactly the rows it saw
+     before, so nothing about an existing strip can have moved. */
+  lane0.forEach((seg, i) => {
+    const next = lane0[i + 1];
     const end = seg.end_s ?? (next ? next.start_s : domain);
     if (seg.start_s > cursor) push(cursor, seg.start_s, null);
     push(Math.max(seg.start_s, cursor), end, seg);
     cursor = Math.max(cursor, Math.min(end, domain));
   });
   if (cursor < domain) push(cursor, domain, null);
+
+  /* Clamped to the domain like everything else, but never filled and never
+     merged. A lane-1 block with no end runs nowhere — unlike lane 0, where a
+     missing end means "until the next one", because there is no continuity to
+     inherit from inside a game. */
+  for (const s of lane1) {
+    const a = Math.max(0, Math.min(s.start_s, domain));
+    const b = Math.max(a, Math.min(s.end_s ?? s.start_s, domain));
+    if (b - a > 0) out.push({ ...s, start_s: a, end_s: b });
+  }
 
   return { tiled: true, segments: out };
 }
@@ -354,20 +502,29 @@ export function segmentOverlaps(db, streamId) {
   const rows = db.prepare(
     `SELECT * FROM segment WHERE stream_id = ? AND retracted_at IS NULL`).all(streamId);
   const placed = rows
-    .map((r) => ({ id: r.id, label: r.label,
+    .map((r) => ({ id: r.id, label: r.label, lane: r.lane ?? 0,
                    a: axisOf(r, caps, s.started_at, 'start_s'),
                    b: axisOf(r, caps, s.started_at, 'end_s') }))
     .filter((x) => x.a !== null && x.b !== null)
     .sort((x, y) => x.a - y.a);
 
   const bad = [];
-  for (let i = 1; i < placed.length; i++) {
-    if (placed[i].a < placed[i - 1].b) {
-      bad.push({ first: placed[i - 1].id, second: placed[i].id,
-                 first_label: placed[i - 1].label, second_label: placed[i].label,
-                 overlap_s: placed[i - 1].b - placed[i].a });
+  /* Per lane. Overlap is a claim about one row of the strip: two things cannot
+     both be what she played at 01:14, and two things cannot both be what was
+     happening inside that — but a lane-1 block sitting under a lane-0 one is
+     the entire point of the second lane, and checking the two together would
+     refuse every sub-chapter ever drawn. */
+  for (const lane of [0, 1]) {
+    const lp = placed.filter((x) => x.lane === lane);
+    for (let i = 1; i < lp.length; i++) {
+      if (lp[i].a < lp[i - 1].b) {
+        bad.push({ first: lp[i - 1].id, second: lp[i].id,
+                   first_label: lp[i - 1].label, second_label: lp[i].label,
+                   overlap_s: lp[i - 1].b - lp[i].a });
+      }
     }
   }
+  // Backwards is backwards in either lane, so this one stays global.
   for (const p of placed) {
     if (p.b < p.a) bad.push({ first: p.id, second: p.id, first_label: p.label,
                               second_label: p.label, overlap_s: p.a - p.b,
@@ -541,8 +698,16 @@ export function watchSources(caps, servePref) {
     }
   }
   if (servePref) {
-    const boost = { remote: ['youtube', 'twitch'], mirror: ['mirror'], local: ['local'] };
-    for (const w of out) if ((boost[servePref] ?? []).includes(w.kind)) w.rank -= 100;
+    /* A KIND, or one of the older class names. The class names came first —
+       'remote' meaning "whichever platform" — and the record editor then grew a
+       field that wrote 'YT' and 'TW', which this map has never contained. So
+       the setting matched nothing, the chain never reordered, and the only
+       symptom was that changing the default source appeared to do nothing at
+       all. Accepting a bare kind fixes that and keeps every stored class name
+       working, since a class name is simply not a kind. */
+    const CLASSES = { remote: ['youtube', 'twitch'], mirror: ['mirror'], local: ['local'] };
+    const want = CLASSES[servePref] ?? [servePref];
+    for (const w of out) if (want.includes(w.kind)) w.rank -= 100;
   }
   out.sort((a, b) => a.rank - b.rank);
   return out.map(({ rank, ...rest }) => rest);
@@ -660,6 +825,12 @@ export const WRITABLE = {
   segment: {
     stream_id: 'text', frame: 'text', anchor_id: 'text', anchor_clock: 'text',
     start_s: 'int', end_s: 'int', kind: 'text', label: 'text', tag_id: 'text',
+    // Writable so that moving a block between lanes is a changeset like every
+    // other decision — reviewable, attributable, undoable. It was briefly
+    // tempting to set it once at creation and never again; then the first
+    // mis-drawn sub-chapter would have needed a delete and a redraw, losing
+    // who drew it and when.
+    lane: 'int',
   },
   tag: {
     name: 'text', slug: 'text', kind: 'text', parent_id: 'text',
@@ -669,6 +840,19 @@ export const WRITABLE = {
   // stream is a decision like any other, and it needs a row in the log saying
   // who decided it.
   stream_tag: { stream_id: 'text', tag_id: 'text' },
+  snippet: {
+    title: 'text', summary: 'text', video_path: 'text', poster_path: 'text',
+    source_stream_id: 'text', source_offset_s: 'int', status: 'text',
+    // duration_s, width, height and bytes are measurements of a file. A human
+    // correcting them by hand would be describing something other than what is
+    // on disk, so they are set by the importer and read-only after.
+    //
+    // transcript is likewise derived — from snippet_line, whole, on each pass.
+    // Making it writable would let an edit survive as the search index while
+    // the lines under it said something else.
+  },
+  taglet: { name: 'text', slug: 'text', kind: 'text', summary: 'text', status: 'text' },
+  snippet_taglet: { snippet_id: 'text', taglet_id: 'text' },
 };
 
 // Fields that must be present to create one of these from nothing.
@@ -679,19 +863,35 @@ const REQUIRED = {
   segment: ['stream_id', 'start_s'],
   tag: ['name'],
   stream_tag: ['stream_id', 'tag_id'],
+  // No title requirement beyond this: the importer derives one from the
+  // filename stem, and a clip with a bad title is recoverable where a clip with
+  // no file is not.
+  snippet: ['title', 'video_path'],
+  taglet: ['name'],
+  snippet_taglet: ['snippet_id', 'taglet_id'],
 };
 
 // Streams, notes and segments are tombstoned; captures and tags are genuinely
 // removable because nothing external points at them.
 // stream_tag is genuinely removable — untagging is not a claim worth a
 // tombstone, and the changeset that did it is already the record.
-const TOMBSTONED = new Set(['stream', 'note', 'segment', 'tag']);
+// A snippet is content and tombstones like a stream. A taglet tombstones like
+// a tag; snippet_taglet is a junction and removes cleanly, same as stream_tag.
+const TOMBSTONED = new Set(['stream', 'note', 'segment', 'tag', 'snippet', 'taglet']);
 const OPS = new Set(['create', 'update', 'delete']);
 
 // Closed vocabularies, checked at validate time so a typo cannot become a
 // colour nobody has a swatch for.
 const ENUMS = {
   'segment.kind': SEGMENT_KINDS,
+  /* Numbers, deliberately, and not a range check. `cast('int', …)` has already
+     run by the time ENUMS is consulted, so [0, 1].includes(value) does the job
+     the existing machinery was built for and the refusal reads
+     "segment.lane must be one of 0, 1" without a line of new error handling.
+     A third lane is refused rather than clamped: the strip has two rows, and
+     silently drawing a lane-2 block into lane 1 would put a claim somewhere
+     nobody put it. */
+  'segment.lane': [0, 1],
   'segment.frame': ['capture', 'stream', 'unknown'],
   'segment.anchor_clock': ['remote', 'local'],
   'note.frame': ['capture', 'stream', 'unknown'],
@@ -701,6 +901,24 @@ const ENUMS = {
   // category out of somebody who was in the middle of doing something else.
   'tag.kind': SEGMENT_KINDS,
   'tag.status': ['proposed', 'confirmed'],
+  'taglet.kind': TAGLET_KINDS,
+  'taglet.status': ['proposed', 'confirmed'],
+  /* The publication gate.
+       proposed   imported, not yet looked at — invisible to the public
+       confirmed  someone combed through it and said yes
+       rejected   someone looked and said no. NOT retracted: the file stays,
+                  the row stays, and it can be revisited. A tombstone means
+                  "this should not exist"; this means "not for the front page".
+     The three are distinct on purpose — a queue that cannot tell "not yet
+     reviewed" from "reviewed and declined" shows you the same thousand clips
+     every time you open it. */
+  'snippet.status': ['proposed', 'confirmed', 'rejected'],
+  /* Which source the theater opens with. Kinds, plus the three older class
+     names that predate them and are still stored on some rows. Checked here
+     because the failure mode is silence: an unknown value is not refused by
+     watchSources, it simply boosts nothing, and the setting looks like it
+     saved and then did not work. */
+  'stream.serve_pref': ['youtube', 'twitch', 'mirror', 'local', 'remote'],
 };
 
 /** name -> slug. Derived, never authored, so the two cannot drift apart.
@@ -788,7 +1006,14 @@ export function validate(db, changes) {
     if (allowed && value !== null && !allowed.includes(value)) {
       throw new ChangeError(`${tt}.${field} must be one of ${allowed.join(', ')}`);
     }
-    out.push({ target_type: tt, target_id: tid, op, field, value });
+    /* What the author believed the field held when they decided. Carried
+       through only when supplied — see propose(), which prefers it over its
+       own read and falls back when it is absent, so every existing caller
+       behaves exactly as before. */
+    const hasBase = Object.prototype.hasOwnProperty.call(raw, 'base_value');
+    out.push({ target_type: tt, target_id: tid, op, field, value,
+               ...(hasBase ? { base_value: raw.base_value === null ? null
+                                                                   : String(raw.base_value) } : {}) });
   }
 
   for (const [tid, tt] of creating) {
@@ -813,12 +1038,21 @@ export function propose(db, { authorId = null, reason = null, changes, autoApply
     list.forEach((c, i) => {
       let base = null;
       if (c.op === 'update') {
-        // What the field held when this was written. If it differs at review
-        // time, someone else got there first.
-        base = currentValue(db, c.target_type, c.target_id, c.field);
-        if (String(base ?? '') === String(c.value ?? '')) {
+        const seen = currentValue(db, c.target_type, c.target_id, c.field);
+        if (String(seen ?? '') === String(c.value ?? '')) {
           throw new ChangeError(`${c.target_type}.${c.field} is already that value`);
         }
+        /* The author's own answer wins where they gave one.
+           Reading this server-side is the natural thing to do and it is subtly
+           wrong: it records what the field held at SUBMIT, not what the author
+           was looking at when they decided. Someone who opens a clip, is
+           distracted for ten minutes while an editor retitles it, then submits,
+           gets a base_value of the editor's new title — so stale() sees no
+           conflict and the suggestion silently reverts an edit its author never
+           saw, with the history recording it as deliberate.
+           Absent a client value the old behaviour stands, which is still the
+           right fallback: a base read now beats no base at all. */
+        base = Object.prototype.hasOwnProperty.call(c, 'base_value') ? c.base_value : seen;
       }
       db.prepare(`INSERT INTO change(id, changeset_id, seq, target_type, target_id,
                     op, field, value, base_value) VALUES(?,?,?,?,?,?,?,?,?)`)
@@ -949,52 +1183,64 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
     // Two people can both propose "Mario Kart" before either is reviewed. Both
     // mint their own ULID, and the second to be approved would hit UNIQUE(slug)
     // and roll the whole changeset back — losing an otherwise good suggestion
-    // over a race. Resolve instead: point the rest of the changeset at the tag
+    // over a race. Resolve instead: point the rest of the changeset at the row
     // that already exists, and write down that it happened.
-    for (const [tid, c] of [...creates]) {
-      if (c.type !== 'tag' || !c.fields.name) continue;
-      const slug = slugify(c.fields.name);
-      const existing = db.prepare('SELECT id FROM tag WHERE slug = ?').get(slug);
-      if (!existing || existing.id === tid) continue;
-      creates.delete(tid);
-      for (const ch of changes) {
-        if (ch.value === tid && ch.target_type !== 'tag') {
-          db.prepare('UPDATE change SET value = ? WHERE id = ?').run(existing.id, ch.id);
-          ch.value = existing.id;
+    //
+    // Written once over both vocabularies rather than twice: `tag` and `taglet`
+    // are different lists answering different questions, but they collide in
+    // exactly the same way and a second copy of this is a second place for the
+    // pending-INSERT rewrite below to be forgotten.
+    for (const vocab of ['tag', 'taglet']) {
+      for (const [tid, c] of [...creates]) {
+        if (c.type !== vocab || !c.fields.name) continue;
+        const slug = slugify(c.fields.name);
+        const existing = db.prepare(`SELECT id FROM ${vocab} WHERE slug = ?`).get(slug);
+        if (!existing || existing.id === tid) continue;
+        creates.delete(tid);
+        for (const ch of changes) {
+          if (ch.value === tid && ch.target_type !== vocab) {
+            db.prepare('UPDATE change SET value = ? WHERE id = ?').run(existing.id, ch.id);
+            ch.value = existing.id;
+          }
         }
-      }
-      // `creates` was collected from `changes` before this rewrite, so it still
-      // holds the id we just discarded. Rewriting only the change rows leaves
-      // the pending INSERTs pointing at a tag that will never exist, and the
-      // whole changeset dies on a foreign key instead.
-      for (const pending of creates.values()) {
-        for (const [k, v] of Object.entries(pending.fields)) {
-          if (v === tid) pending.fields[k] = existing.id;
+        // `creates` was collected from `changes` before this rewrite, so it
+        // still holds the id we just discarded. Rewriting only the change rows
+        // leaves the pending INSERTs pointing at a row that will never exist,
+        // and the whole changeset dies on a foreign key instead.
+        for (const pending of creates.values()) {
+          for (const [k, v] of Object.entries(pending.fields)) {
+            if (v === tid) pending.fields[k] = existing.id;
+          }
         }
+        record(vocab, existing.id, 'name', c.fields.name, c.fields.name);
+        merged.push({ wanted: tid, resolved_to: existing.id, slug });
       }
-      record('tag', existing.id, 'name', c.fields.name, c.fields.name);
-      merged.push({ wanted: tid, resolved_to: existing.id, slug });
     }
 
-    // Same idea one level up: two people tagging the same stream with the same
+    // Same idea one level up: two people tagging the same thing with the same
     // thing is not a conflict, it is agreement. The pair already being there
     // means the changeset's intent is satisfied, so drop the insert rather than
-    // failing UNIQUE(stream_id, tag_id) and rolling back everything else in it.
-    for (const [tid, c] of [...creates]) {
-      if (c.type !== 'stream_tag') continue;
-      const have = db.prepare(
-        'SELECT id FROM stream_tag WHERE stream_id = ? AND tag_id = ?')
-        .get(c.fields.stream_id, c.fields.tag_id);
-      if (!have) continue;
-      creates.delete(tid);
-      merged.push({ wanted: tid, resolved_to: have.id, already: 'attached' });
+    // failing the UNIQUE and rolling back everything else in it.
+    for (const [jt, [a, b]] of Object.entries({
+      stream_tag: ['stream_id', 'tag_id'],
+      snippet_taglet: ['snippet_id', 'taglet_id'],
+    })) {
+      for (const [tid, c] of [...creates]) {
+        if (c.type !== jt) continue;
+        const have = db.prepare(
+          `SELECT id FROM ${jt} WHERE ${a} = ? AND ${b} = ?`)
+          .get(c.fields[a], c.fields[b]);
+        if (!have) continue;
+        creates.delete(tid);
+        merged.push({ wanted: tid, resolved_to: have.id, already: 'attached' });
+      }
     }
 
     for (const [tid, { type: tt, fields }] of creates) {
       // Provenance is stamped by the applier, never taken from the payload —
       // otherwise anyone could submit a note attributed to someone else, or one
       // that claims to have come from the vault.
-      if (tt === 'tag') {
+      if (tt === 'tag' || tt === 'taglet') {
         // slug is DERIVED. Letting a client send both is how a tag ends up
         // named one thing and matched by another.
         fields.slug = slugify(fields.name);
@@ -1005,11 +1251,16 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
         // suggestion, invisible in the picker — until someone confirms it.
         // Same rule as auto-apply, read from the same place.
         fields.status = authorMayEdit(db, cs.author_id) ? 'confirmed' : 'proposed';
-        // 'unknown', not a guess. A tag minted from an autocomplete miss has
-        // no category until someone gives it one, and picking the most common
-        // one for them is inference from a name — the same move as reading a
-        // game off a stream title.
-        if (!fields.kind) fields.kind = 'unknown';
+        // No guess at a category. A row minted from an autocomplete miss has
+        // none until someone gives it one, and picking the most common one for
+        // them is inference from a name — the same move as reading a game off a
+        // stream title. The two vocabularies spell "uncategorised" differently:
+        // a segment kind is a colour and 'unknown' earns a hatch, while an
+        // untyped taglet is an ordinary taglet.
+        if (!fields.kind) fields.kind = tt === 'taglet' ? 'general' : 'unknown';
+      } else if (tt === 'snippet') {
+        fields.origin = 'user';
+        fields.author_id = cs.author_id;
       } else if (tt === 'note' || tt === 'segment') {
         fields.origin = 'user';
         fields.author_id = cs.author_id;
@@ -1035,14 +1286,15 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
       if (c.op === 'update') {
         db.prepare(`UPDATE ${c.target_type} SET ${c.field} = ?, updated_at = ? WHERE id = ?`)
           .run(c.value, t, c.target_id);
-        // A rename that leaves the slug behind means the tag answers to its old
+        // A rename that leaves the slug behind means the row answers to its old
         // URL and matches on its old spelling forever.
-        if (c.target_type === 'tag' && c.field === 'name') {
+        if ((c.target_type === 'tag' || c.target_type === 'taglet') && c.field === 'name') {
+          const tbl = c.target_type;
           const slug = slugify(c.value);
-          const was = db.prepare('SELECT slug FROM tag WHERE id = ?').get(c.target_id)?.slug;
+          const was = db.prepare(`SELECT slug FROM ${tbl} WHERE id = ?`).get(c.target_id)?.slug;
           if (was !== slug) {
-            db.prepare('UPDATE tag SET slug = ? WHERE id = ?').run(slug, c.target_id);
-            record('tag', c.target_id, 'slug', was, slug);
+            db.prepare(`UPDATE ${tbl} SET slug = ? WHERE id = ?`).run(slug, c.target_id);
+            record(tbl, c.target_id, 'slug', was, slug);
           }
         }
       } else if (c.op === 'delete') {

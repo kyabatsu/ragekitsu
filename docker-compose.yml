@@ -1,7 +1,7 @@
 # Container Manager → Project → Create → point it at the folder holding this
 # file. Project name `ragekitsu`.
 #
-# Two mounts, doing different jobs:
+# Three mounts, doing different jobs:
 #
 #   /data    the database. Read-write, ~1 MB, and the only thing here that
 #            cannot be regenerated. Back this up, not the container.
@@ -10,6 +10,11 @@
 #            Pi's own mount, so nothing here needs write access, and 21 TB of
 #            irreplaceable recordings should not be reachable for writing by a
 #            web server that has no reason to touch them.
+#   /cache   derived files — snippet posters today. Read-write, and separate
+#            from both of the above on purpose: /media must stay read-only, and
+#            /data is the thing you back up. Everything here is regenerable
+#            from the media by re-running scripts/import-snippets.js, so losing
+#            it costs one import pass and nothing else. Do NOT back it up.
 #
 # TENMA_MEDIA_ROOT is the PARENT of `raws/`, not raws itself. ls-rec's
 # archive_media_prefix ("raws/") is what joins the two, and getting the pair
@@ -46,9 +51,34 @@ services:
         source: /volume1/Volume01/edit-video_library/Tenma Maemi/archives
         target: /media
         read_only: true
+      # Same uid caveat as /data above: the importer writes here as uid 1000,
+      # so `mkdir -p` it and `chown -R 1000:1000` it over SSH before the first
+      # import, or every poster generation fails with EACCES and every clip
+      # imports without a still.
+      - type: bind
+        source: /volume2/docker/ragekitsu/cache
+        target: /cache
+      # The ONLY place the container may write inside volume1, and pointedly
+      # not under archives/ — it is a sibling, so it is outside the served tree
+      # and invisible to the importer's non-recursive readdir. Uploads land
+      # here; the Pi promotes approved ones into archives/ with a rename(2),
+      # which is atomic and copies no bytes precisely because this is the same
+      # volume. Same uid caveat as /cache: chown -R 1000:1000 it over SSH
+      # before the first upload, or every write fails with EACCES.
+      - type: bind
+        source: /volume1/Volume01/edit-video_library/Tenma Maemi/quarantine
+        target: /quarantine
     environment:
       TENMA_DB: /data/archive.db
       TENMA_MEDIA_ROOT: /media
+      # Where generated stills go. Unset and the archive falls back to whatever
+      # posters already exist under /media, which is a fine degraded mode —
+      # rows render without a picture rather than breaking.
+      TENMA_CACHE_ROOT: /cache
+      # Where received bytes wait for a human. Unset disables uploads outright
+      # rather than falling back to somewhere writable — a silent fallback here
+      # would put unreviewed files somewhere nobody is watching.
+      TENMA_QUARANTINE_ROOT: /quarantine
       PORT: "8000"
       TENMA_HOST: "0.0.0.0"
 
