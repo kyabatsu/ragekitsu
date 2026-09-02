@@ -26,6 +26,7 @@ services:
       context: ./src
       dockerfile: Dockerfile
     container_name: ragekitsu
+    user: "1027:100"
     restart: unless-stopped
     # The image runs as uid 1000 (`USER node`). A folder made in File Station
     # belongs to your DSM account instead, and the failure is not obvious: the

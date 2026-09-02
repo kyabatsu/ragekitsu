@@ -91,12 +91,6 @@ const MIGRATIONS = [
        created_at   INTEGER NOT NULL,
        updated_at   INTEGER NOT NULL,
        finished_at  INTEGER)`],
-  // The claim query's index: status first because it is the selective one —
-  // a queue is nearly all `done`.
-  ['job', `CREATE INDEX IF NOT EXISTS ix_job_claim ON job(status, kind, created_at)`],
-  ['job', `CREATE INDEX IF NOT EXISTS ix_job_snippet ON job(snippet_id)
-             WHERE snippet_id IS NOT NULL`],
-
   // --- clocks -------------------------------------------------------------
   // Two absolute times per capture instead of one relative one. See the block
   // comment on `capture` in schema.sql for why relative was never going to
@@ -380,6 +374,11 @@ const RETIRED = [
 // against it threw `no such table: main.capture` from inside migrate(), which
 // is a spectacularly unhelpful way to say "there is no archive here".
 const POST_MIGRATION = [
+  // The claim query's index: status first because it is the selective one —
+  // a queue is nearly all `done`.
+  ['job', `CREATE INDEX IF NOT EXISTS ix_job_claim ON job(status, kind, created_at)`],
+  ['job', `CREATE INDEX IF NOT EXISTS ix_job_snippet ON job(snippet_id)
+     WHERE snippet_id IS NOT NULL`],
   ['segment', `CREATE INDEX IF NOT EXISTS ix_segment_stream ON segment(stream_id, start_s)
      WHERE retracted_at IS NULL`],
   ['segment', `CREATE INDEX IF NOT EXISTS ix_segment_tag ON segment(tag_id, start_s)
