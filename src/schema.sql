@@ -111,6 +111,31 @@ CREATE TABLE IF NOT EXISTS stream (
   chat_sources   TEXT,                       -- 'YT' | 'TW' | 'YT,TW'
   chat_ok        INTEGER NOT NULL DEFAULT 0, -- merged file seen on disk
 
+  -- What the merged file says about itself, read out of its header by
+  -- ls-audit and sent alongside the path. The archive never opens a chat
+  -- file: they run to megabytes, and the theater's question — "is there
+  -- anything here, and should I warn about it" — has to be answerable from
+  -- the row.
+  chat_version   INTEGER,                    -- merged schema version
+  chat_messages  INTEGER,                    -- how many, after dedupe
+  chat_first_ms  INTEGER,                    -- epoch ms of the first message
+  chat_last_ms   INTEGER,                    -- ...and the last
+  -- {"YT":"complete","TW":"unknown"} — per platform, because it is a property
+  -- of how that platform was captured. complete: the source records deletions
+  -- and bans. none: it cannot (a VOD download has no moderation history).
+  -- unknown: a live Twitch capture from before the recorder could see
+  -- CLEARCHAT at all. Sorted keys, no spaces, so it compares as a string.
+  chat_moderation TEXT,
+  -- WHICH FILE the five columns above describe.
+  --
+  -- Not redundant with chat_path: chat_path is editable — the record editor's
+  -- picker repoints it in two clicks — and the moment it moves, the count and
+  -- the span become five perfectly plausible numbers about a different file.
+  -- Nothing in them would look wrong. So the reader compares this against
+  -- chat_path and treats a mismatch as "not known", and the next ls-audit run
+  -- fills it in again. Derived on write, never sent and never editable.
+  chat_meta_path TEXT,
+
   -- Tombstone. Never DELETE a stream: the next vault import would helpfully
   -- recreate it, and someone may have been wrong.
   retracted_at   INTEGER,
@@ -422,7 +447,12 @@ CREATE TABLE IF NOT EXISTS tag (
   -- thing; a segment says that thing was happening between here and here. If
   -- the two lists could disagree, the chip and the block would be different
   -- colours for one fact.
-  kind       TEXT NOT NULL DEFAULT 'unknown', -- game|person|type|meta|unknown
+  -- media|character|type|elements|meta|general|unknown. Which SURFACES a kind
+  -- may be offered on is KIND_SURFACES in archive.js, not a column: `meta` and
+  -- `general` describe a clip, `elements` only ever labels a stretch of a
+  -- broadcast, and the rest are shared. A row is never hidden by that map —
+  -- it governs the pickers, not the data.
+  kind       TEXT NOT NULL DEFAULT 'unknown',
 
   -- Episode variants roll up. The vault import made ten separate rows for
   -- CLAIR OBSCUR: EXPEDITION 33 (#2 … #11), which means ?tag= returns one
@@ -432,6 +462,20 @@ CREATE TABLE IF NOT EXISTS tag (
 
   thumb_path TEXT,                           -- box art, under the media root
   summary    TEXT,
+
+  -- Where the description and the art were harvested from, and whether they
+  -- are still untouched. `seeded` is one bit for the row: cleared by the
+  -- applier on any human edit to name, summary or thumb_path, set again by a
+  -- re-seed. See the block in db.js.
+  seed_url   TEXT,
+  seeded     INTEGER,
+
+  -- A tag with a gate RESTRICTS whatever carries it: a viewer must hold the
+  -- grant named here to see the clip or the stream. Free text, so a new gate is
+  -- another flag rather than another column, and it lives on the vocabulary
+  -- rather than on the row so marking one tag `restricted` gates everything
+  -- filed under it at once.
+  gate       TEXT,
 
   -- There was a `seg_kind` here once: a second vocabulary, parallel to `kind`,
   -- for the colour a tag suggests on the timeline. It is gone. One tag, one
@@ -650,44 +694,54 @@ CREATE TABLE IF NOT EXISTS snippet_line (
 );
 
 -- ---------------------------------------------------------------------------
--- taglets — the snippet vocabulary
+-- the snippet half of the vocabulary
 --
--- Deliberately NOT the `tag` table. That one is a curated list of what a
--- stream was ABOUT, and it is shared with segment.kind, where every entry has
--- to mean a colour on a timeline. `meta:funny` is not a chapter colour and
--- `copyright:phase_connect` is not a thing a stream is about. Two vocabularies
--- because they answer two questions; merging them would force every taglet
--- kind to also be a legal chapter kind.
+-- This used to argue for two tables, and the argument was: `tag` is shared with
+-- segment.kind where every entry has to mean a colour on a timeline, so
+-- merging would force every snippet kind to also be a legal chapter kind.
 --
--- The shape is Danbooru's, because that is the shape that survives a thousand
--- short clips: a namespace, a machine slug, a display name.
---   character   who is in it        blue
---   copyright   what it belongs to  violet
---   meta        what it is like     yellow
---   general     everything else     grey
+-- That was the right objection and the wrong conclusion. The answer is
+-- KIND_SURFACES in archive.js: one vocabulary, and a map saying which surfaces
+-- each kind is OFFERED on. `meta` and `general` are snippet-only and never
+-- reach the strip; `elements` is timeline-only; `media` and `character` are
+-- shared, which they always were in fact — `copyright` and `character` named
+-- the same subjects `game` and `person` named in the other table. Two rows for
+-- one person is what actually cost something: a rename had to happen twice and
+-- could diverge, and it did.
+--
+-- The shape is still Danbooru's, because that is the shape that survives a
+-- thousand short clips: a namespace, a machine slug, a display name.
+--   media       what it belongs to  violet    shared
+--   character   who is in it        blue      shared
+--   meta        what it IS          yellow    snippets only
+--   general     everything else     grey      snippets only
 -- ---------------------------------------------------------------------------
 
-CREATE TABLE IF NOT EXISTS taglet (
-  id           TEXT PRIMARY KEY,
-  name         TEXT NOT NULL,               -- "Eimi Isami"
-  slug         TEXT NOT NULL UNIQUE,        -- "eimi-isami", derived from name
-  kind         TEXT NOT NULL DEFAULT 'general',
-  summary      TEXT,
-  status       TEXT NOT NULL DEFAULT 'confirmed',   -- proposed | confirmed
-  origin       TEXT NOT NULL DEFAULT 'vault',
-  author_id    TEXT REFERENCES person(id) ON DELETE SET NULL,
-  retracted_at INTEGER,
-  created_at   INTEGER NOT NULL,
-  updated_at   INTEGER NOT NULL
-);
+-- `taglet` was here: a second vocabulary for snippets, with its own kinds
+-- (character, copyright, meta, general), its own autocomplete and its own
+-- proposal flow. It held the same subjects `tag` held — `copyright` and
+-- `character` were `game` and `person` under other names — so renaming a
+-- person meant editing two rows in two tables that could silently diverge, and
+-- a slug could exist on both sides meaning one thing.
+--
+-- Merged into `tag`. What was genuinely snippet-only survived as two kinds
+-- rather than as a table; `gate` came the other way and is why a stream can be
+-- gated at all. The rebuild that moved the rows is in db.js, keyed on
+-- snippet_taglet gaining `tag_id`, so it runs exactly once.
 
+-- The snippet half of the same vocabulary. Still its own junction rather than
+-- one shared with stream_tag: "this clip is about that" and "this broadcast was
+-- about that" are different relationships and collapsing them would make every
+-- query ask which kind of row it had. The TABLE keeps its old name so the
+-- history, which addresses change rows by target_type, can still resolve its
+-- own past.
 CREATE TABLE IF NOT EXISTS snippet_taglet (
   id         TEXT PRIMARY KEY,
   snippet_id TEXT NOT NULL REFERENCES snippet(id) ON DELETE CASCADE,
-  taglet_id  TEXT NOT NULL REFERENCES taglet(id) ON DELETE CASCADE,
+  tag_id     TEXT NOT NULL REFERENCES tag(id) ON DELETE CASCADE,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
-  UNIQUE(snippet_id, taglet_id)
+  UNIQUE(snippet_id, tag_id)
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS snippet_fts USING fts5(

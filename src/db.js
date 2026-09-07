@@ -91,6 +91,17 @@ const MIGRATIONS = [
        created_at   INTEGER NOT NULL,
        updated_at   INTEGER NOT NULL,
        finished_at  INTEGER)`],
+  /* Where the file is RIGHT NOW, relative to the quarantine root, while it
+     waits for a human. `video_path` is the destination it will have once an
+     editor approves and the Pi renames it into the media tree — so the row
+     knows both its current and its eventual home, and promote is "clear this
+     column", not "rewrite the path everything else reads".
+
+     Null for every clip the importer wrote, which is what makes this safe to
+     add: `quarantine_path IS NOT NULL` is exactly the set of files living
+     outside the served tree. */
+  ['snippet', 'quarantine_path', 'ALTER TABLE snippet ADD COLUMN quarantine_path TEXT'],
+
   // --- clocks -------------------------------------------------------------
   // Two absolute times per capture instead of one relative one. See the block
   // comment on `capture` in schema.sql for why relative was never going to
@@ -164,6 +175,18 @@ const MIGRATIONS = [
   ['stream', 'chat_sources', 'ALTER TABLE stream ADD COLUMN chat_sources TEXT'],
   ['stream', 'chat_ok',      'ALTER TABLE stream ADD COLUMN chat_ok INTEGER NOT NULL DEFAULT 0'],
 
+  // --- what the merged chat says about itself -------------------------------
+  // Also not backfilled, and it cannot be: only something that has read the
+  // file knows these, and the archive is the one process that never opens it.
+  // Every existing stream keeps them NULL, which reads as "not known" and
+  // renders as a chat panel with no numbers on it rather than a wrong one.
+  ['stream', 'chat_version',    'ALTER TABLE stream ADD COLUMN chat_version INTEGER'],
+  ['stream', 'chat_messages',   'ALTER TABLE stream ADD COLUMN chat_messages INTEGER'],
+  ['stream', 'chat_first_ms',   'ALTER TABLE stream ADD COLUMN chat_first_ms INTEGER'],
+  ['stream', 'chat_last_ms',    'ALTER TABLE stream ADD COLUMN chat_last_ms INTEGER'],
+  ['stream', 'chat_moderation', 'ALTER TABLE stream ADD COLUMN chat_moderation TEXT'],
+  ['stream', 'chat_meta_path',  'ALTER TABLE stream ADD COLUMN chat_meta_path TEXT'],
+
   // --- tag becomes an entity ----------------------------------------------
   // updated_at first, and it is not cosmetic: apply() stamps created_at AND
   // updated_at on every create, so `tag` not having one meant creating a tag
@@ -233,40 +256,26 @@ const MIGRATIONS = [
        text       TEXT NOT NULL,
        UNIQUE(snippet_id, seq))`],
 
-  // --- taglets ------------------------------------------------------------
+  // --- the snippet half of the vocabulary ----------------------------------
   //
-  // Deliberately NOT the `tag` table. That vocabulary is a curated list of
-  // things a stream was ABOUT — a game, a format — and it is shared with
-  // segment.kind, where every entry has to mean a colour on a timeline.
-  // `meta:funny` is not a chapter colour and `copyright:phase_connect` is not
-  // something a stream is about. Two vocabularies because they answer two
-  // questions; one table would have forced every taglet kind to also be a
-  // legal chapter kind.
+  // `taglet` used to be created here, as a second table. The argument was that
+  // `tag` is shared with segment.kind where every entry has to mean a colour on
+  // a timeline, so one table would force every snippet kind to also be a legal
+  // chapter kind. Right objection, wrong conclusion — KIND_SURFACES in
+  // archive.js says which surfaces a kind is OFFERED on, and that costs a map
+  // rather than a table. The rebuild that moved the rows is below.
   //
-  // The shape is Danbooru's, because that is the shape that works for a
-  // thousand short clips: a namespace, a machine slug, a display name.
-  ['taglet', null,
-    `CREATE TABLE IF NOT EXISTS taglet (
-       id           TEXT PRIMARY KEY,
-       name         TEXT NOT NULL,
-       slug         TEXT NOT NULL UNIQUE,
-       kind         TEXT NOT NULL DEFAULT 'general',
-       summary      TEXT,
-       status       TEXT NOT NULL DEFAULT 'confirmed',
-       origin       TEXT NOT NULL DEFAULT 'vault',
-       author_id    TEXT REFERENCES person(id) ON DELETE SET NULL,
-       retracted_at INTEGER,
-       created_at   INTEGER NOT NULL,
-       updated_at   INTEGER NOT NULL)`],
-
+  // Nothing recreates `taglet`: a table that exists and is never read is the
+  // same trap as an orphan column, and a fresh database growing one would put
+  // it straight back.
   ['snippet_taglet', null,
     `CREATE TABLE IF NOT EXISTS snippet_taglet (
        id         TEXT PRIMARY KEY,
        snippet_id TEXT NOT NULL REFERENCES snippet(id) ON DELETE CASCADE,
-       taglet_id  TEXT NOT NULL REFERENCES taglet(id) ON DELETE CASCADE,
+       tag_id     TEXT NOT NULL REFERENCES tag(id) ON DELETE CASCADE,
        created_at INTEGER NOT NULL,
        updated_at INTEGER NOT NULL,
-       UNIQUE(snippet_id, taglet_id))`],
+       UNIQUE(snippet_id, tag_id))`],
 
   ['snippet_fts', null,
     `CREATE VIRTUAL TABLE IF NOT EXISTS snippet_fts USING fts5(
@@ -320,6 +329,140 @@ const MIGRATIONS = [
   // The transcriber's own reason for a non-ok status. Free text from the tool,
   // shown to nobody but an admin looking at a failed batch.
   ['snippet', 'transcript_note',  'ALTER TABLE snippet ADD COLUMN transcript_note TEXT'],
+
+  /* How far the conversion has got, mirroring transcript_status deliberately:
+     the two answer the same shape of question about the same row, and a reader
+     who has understood one has understood the other.
+
+       none     nothing to do, or nothing has asked yet. Every imported clip.
+       queued   a normalize job exists and no worker has taken it
+       running  a worker holds it — this is the state the UI calls "converting"
+       done     play_path and poster_path are what the worker left
+       failed   normalize_note says why; the clip still plays if it ever could
+
+     `none` and not `queued` as the default, because fifteen hundred imported
+     rows were normalized by scripts/normalize-media.js years before this
+     column existed and marking them all as waiting would invent a backlog. */
+  ['snippet', 'normalize_status',
+   "ALTER TABLE snippet ADD COLUMN normalize_status TEXT NOT NULL DEFAULT 'none'"],
+  ['snippet', 'normalize_note', 'ALTER TABLE snippet ADD COLUMN normalize_note TEXT'],
+
+  /* The shape of the sound: 480 amplitude buckets, base64'd, about 640 bytes.
+     Only ever set for a clip with no picture, where it IS the picture — a
+     waveform the page can draw, fill as it plays, and accept a click on.
+
+     A column rather than a file with a route: it is smaller than the request
+     headers needed to fetch it separately, and it rides along with the row the
+     page already asked for, so the player has it before it needs it. */
+  ['snippet', 'waveform', 'ALTER TABLE snippet ADD COLUMN waveform TEXT'],
+
+  /* Where a clip came from, when it came from a link rather than a file. Kept
+     even after the bytes arrive: it is the only record of what was fetched,
+     it is what stops the same link being submitted twice, and it is what an
+     editor looks at when a clip turns out to be somebody's reupload. */
+  ['snippet', 'source_url', 'ALTER TABLE snippet ADD COLUMN source_url TEXT'],
+
+  /* What happened, in order, in the words a person would use.
+
+     Deliberately NOT more changesets. A changeset answers "what field went
+     from what to what, and can it be undone"; this answers "who did what".
+     They overlap and are not the same question — approving is both, editing a
+     transcript is only the second, and a changeset that has not been applied
+     yet is only the first.
+
+     `actor_handle` and `actor_role` are denormalised on purpose. A log that
+     said "admin kyabatsu removed this" and then rendered as "removed by
+     (deleted user)" a year later has lost the part worth keeping — and the
+     role is the role AT THE TIME, which is a fact about the event rather than
+     about the person, and would otherwise quietly rewrite itself every time
+     somebody was promoted.
+
+     `detail` is JSON because the interesting part differs per verb: a
+     submission carries a title and taglets, a rename carries two strings, a
+     purge carries what was destroyed. Read-only, rendered, never queried on. */
+  ['event', null, `CREATE TABLE IF NOT EXISTS event (
+     id           TEXT PRIMARY KEY,
+     at           INTEGER NOT NULL,
+     actor_id     TEXT REFERENCES person(id) ON DELETE SET NULL,
+     actor_handle TEXT,
+     actor_role   TEXT,
+     verb         TEXT NOT NULL,
+     target_type  TEXT NOT NULL,
+     target_id    TEXT NOT NULL,
+     detail       TEXT,
+     changeset_id TEXT REFERENCES changeset(id) ON DELETE SET NULL)`],
+
+  /* How the fetch is going, mirroring normalize_status and transcript_status
+     because it answers the same shape of question about the same row.
+
+       none     nothing to fetch — every uploaded and every imported clip
+       queued   a fetch job exists and the recorder has not taken it
+       running  the recorder holds it
+       done     the bytes landed in quarantine; normalize takes over
+       failed   fetch_note says why, and the row has no bytes at all
+
+     A row can sit at `queued` for as long as the recorder is off, which is
+     the whole reason this is a column and not an inference: the page has to
+     be able to say "waiting for the recorder" rather than draw a player over
+     a file that does not exist yet. */
+  ['snippet', 'fetch_status',
+   "ALTER TABLE snippet ADD COLUMN fetch_status TEXT NOT NULL DEFAULT 'none'"],
+  ['snippet', 'fetch_note', 'ALTER TABLE snippet ADD COLUMN fetch_note TEXT'],
+
+  /* Names a submitter typed that are not in the vocabulary. A JSON array of
+     raw strings — deliberately NOT taglet rows.
+
+     A proposed taglet in the taglet table would be autocompleted, which means
+     the second person to want "Selen Tatsuki" gets it offered to them before
+     anybody has agreed it should exist, and a typo becomes permanent
+     vocabulary the moment a second clip picks it up. Kept as loose text, they
+     stay attached to the clip that suggested them and go nowhere else until an
+     editor mints the real taglet. Somebody suggesting the same name on a
+     second upload types it again, which is the intended cost. */
+  ['snippet', 'taglet_suggestions',
+   'ALTER TABLE snippet ADD COLUMN taglet_suggestions TEXT'],
+
+  /* ── gates ────────────────────────────────────────────────────────────────
+     A taglet with a gate is a taglet that restricts what carries it: any
+     snippet tagged with it is invisible to anyone not holding a grant of that
+     name. Null for every ordinary taglet, which is nearly all of them.
+
+     On the TAGLET and not on the snippet, because the tagging already happened
+     — clips marked `restricted` become gated the moment that one taglet is
+     flagged, with no bulk edit — and because a second audience later is
+     another flag rather than another column. The gate name is a free string so
+     it can mean whatever the person distributing grants decides it means. */
+  ['taglet', 'gate', 'ALTER TABLE taglet ADD COLUMN gate TEXT'],
+  /* The same column on `tag`, which is what gives a STREAM a gate. It arrives
+     here rather than in the rebuild below because MIGRATIONS runs first, so the
+     column is already there when the rebuild copies the taglets' gates across. */
+  ['tag', 'gate', 'ALTER TABLE tag ADD COLUMN gate TEXT'],
+
+  /* ---- seeding a tag's description and art from somewhere else -----------
+     `seed_url` is where a harvest reads from, and it is also the record of
+     where a description CAME from — Fandom is CC-BY-SA and an unattributed
+     copy of it is not a thing this archive should hold.
+
+     `seeded` is one flag for the whole row, not one per field: 1 while the
+     description and art are still exactly what the harvest wrote, cleared by
+     the applier the moment a human edits any of name, summary or thumb_path.
+     Per-field marks were the other option and they answer a question nobody
+     asks — what you actually want to know is "has anyone been over this yet",
+     and that is one bit. A re-seed sets it back to 1. */
+  ['tag', 'seed_url', 'ALTER TABLE tag ADD COLUMN seed_url TEXT'],
+  ['tag', 'seeded',   'ALTER TABLE tag ADD COLUMN seeded INTEGER'],
+
+  /* What a person is allowed past. One row per grant held, rather than a list
+     on `person`, because the interesting questions are "who can see the
+     restricted set" and "when was this given, and by whom" — both of which are
+     a scan of a column here and neither of which a JSON blob answers. */
+  ['person_grant', null,
+   `CREATE TABLE IF NOT EXISTS person_grant (
+      id         TEXT PRIMARY KEY,
+      person_id  TEXT NOT NULL REFERENCES person(id) ON DELETE CASCADE,
+      name       TEXT NOT NULL,
+      granted_by TEXT REFERENCES person(id) ON DELETE SET NULL,
+      created_at INTEGER NOT NULL)`],
 ];
 
 // Rebuilds — for the shape changes ALTER TABLE cannot express. Each runs only
@@ -348,6 +491,129 @@ const REBUILDS = [
     db.exec('ALTER TABLE stream_tag_new RENAME TO stream_tag');
     db.exec('CREATE INDEX IF NOT EXISTS ix_stream_tag_rev ON stream_tag(tag_id, stream_id)');
   }],
+
+  /* One vocabulary: `taglet` moves into `tag` and the junction repoints.
+   *
+   * Keyed on snippet_taglet gaining `tag_id`, so it runs exactly once and is a
+   * no-op on a fresh database, which is created from schema.sql already merged.
+   * Inside tx() like every rebuild, which matters more here than anywhere else
+   * in this file: it moves ~140 vocabulary rows and ~1400 links, and half of
+   * that is not a state anybody could reason about afterwards.
+   *
+   * Two rows can describe one subject, and they collapse rather than both
+   * surviving:
+   *   - same slug   `goddess-of-victory-nikke` was a game here and a copyright
+   *                 there, which is the same franchise twice.
+   *   - same name   the batch import minted `shiina` from `shiina_sometitle`
+   *                 while `amanogawa-shiina` already existed. Same person, two
+   *                 slugs, and nothing but the display name says so.
+   * The tag row wins in both cases — it carries parent_id, thumb art and the
+   * fuller slug — and the taglet's snippet links repoint at it.
+   *
+   * A collision it CANNOT resolve throws, and the transaction takes the whole
+   * boot down with it. That is deliberate: a half-merged vocabulary is a
+   * database where some clips have quietly lost their tags, which is not
+   * something anybody notices in time. scripts/tag-merge-report.js prints
+   * every one of these before you deploy, so hitting it here means the report
+   * was not read.
+   */
+  ['snippet_taglet', 'tag_id', (db, ulidFn, t) => {
+    if (!db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='taglet'`).get()) {
+      // No taglet table: an old database that never had one. Just reshape the
+      // junction so the column name matches what everything now reads.
+      db.exec('ALTER TABLE snippet_taglet RENAME COLUMN taglet_id TO tag_id');
+      return;
+    }
+
+    // copyright and character were `game` and `person` under other names.
+    // meta and general are the two that genuinely only describe a clip.
+    const KIND = { copyright: 'media', character: 'character',
+                   meta: 'meta', general: 'general' };
+
+    const taglets = db.prepare(
+      'SELECT * FROM taglet ORDER BY created_at, id').all();
+    const bySlug = new Map(db.prepare('SELECT * FROM tag').all().map((r) => [r.slug, r]));
+    const byName = new Map(db.prepare('SELECT * FROM tag').all()
+      .map((r) => [String(r.name).trim().toLowerCase(), r]));
+
+    const moved = new Map();      // taglet id -> tag id
+    const insTag = db.prepare(
+      `INSERT INTO tag(id, name, slug, kind, summary, status, origin, author_id,
+                       gate, retracted_at, created_at, updated_at)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`);
+
+    for (const l of taglets) {
+      const kind = KIND[l.kind];
+      if (!kind) {
+        throw new Error(`tag merge: taglet "${l.name}" has kind '${l.kind}', `
+          + 'which has no target. Re-file it, then restart.');
+      }
+      const twin = bySlug.get(l.slug) ?? byName.get(String(l.name).trim().toLowerCase());
+      if (twin) {
+        /* Both sides have to be describing the same thing. They are when the
+           kinds agree — and after the vocabulary landing they agree whenever
+           the subject is shared, because `copyright` already became `media` and
+           `character` was already `character`.
+           `unknown` is not a disagreement, it is the absence of an answer, so
+           the side that HAS one wins. That matters more than it looks: a tag
+           whose kind was lost is exactly the row a merge should repair, and
+           refusing to merge it would turn a recoverable gap into a failed boot. */
+        if (twin.kind === 'unknown' && kind !== 'unknown') {
+          db.prepare('UPDATE tag SET kind = ?, updated_at = ? WHERE id = ?')
+            .run(kind, t, twin.id);
+          twin.kind = kind;
+        } else if (kind !== 'unknown' && twin.kind !== kind) {
+          throw new Error(`tag merge: "${l.name}" is '${twin.kind}' as a tag and `
+            + `'${kind}' as a taglet. One of them has to move before this can run — `
+            + 'see scripts/tag-merge-report.js.');
+        }
+        moved.set(l.id, twin.id);
+        // The gate is the one thing the taglet may know that the tag does not.
+        if (l.gate && !twin.gate) {
+          db.prepare('UPDATE tag SET gate = ?, updated_at = ? WHERE id = ?')
+            .run(l.gate, t, twin.id);
+        }
+        continue;
+      }
+      insTag.run(l.id, l.name, l.slug, kind, l.summary ?? null,
+                 l.status ?? 'confirmed', l.origin ?? 'vault', l.author_id ?? null,
+                 l.gate ?? null, l.retracted_at ?? null,
+                 l.created_at ?? t, l.updated_at ?? t);
+      moved.set(l.id, l.id);
+      bySlug.set(l.slug, { id: l.id, slug: l.slug, kind });
+      byName.set(String(l.name).trim().toLowerCase(), { id: l.id, kind });
+    }
+
+    /* Rebuilt rather than ALTERed: the foreign key names `taglet(id)` and
+       SQLite cannot repoint one in place. The UNIQUE also has to be re-derived,
+       because two taglets that just collapsed into one tag would otherwise
+       collide on a snippet that carried both — INSERT OR IGNORE takes the
+       first, which is the same link either way. */
+    db.exec(`CREATE TABLE snippet_taglet_new (
+      id TEXT PRIMARY KEY,
+      snippet_id TEXT NOT NULL REFERENCES snippet(id) ON DELETE CASCADE,
+      tag_id     TEXT NOT NULL REFERENCES tag(id) ON DELETE CASCADE,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE(snippet_id, tag_id))`);
+    const ins = db.prepare(
+      `INSERT OR IGNORE INTO snippet_taglet_new(id, snippet_id, tag_id, created_at, updated_at)
+       VALUES(?,?,?,?,?)`);
+    for (const r of db.prepare('SELECT * FROM snippet_taglet').all()) {
+      const to = moved.get(r.taglet_id);
+      // A link to a taglet that is not there is already broken; dropping it is
+      // the only honest thing, and the FK would refuse it anyway.
+      if (!to) continue;
+      ins.run(r.id, r.snippet_id, to, r.created_at ?? t, r.updated_at ?? t);
+    }
+    db.exec('DROP TABLE snippet_taglet');
+    db.exec('ALTER TABLE snippet_taglet_new RENAME TO snippet_taglet');
+
+    /* Dropped, not left sitting there. An unused table full of plausible values
+       is the same trap as an unused column — somebody reads a name off it in a
+       year and now there are two answers to what a tag is called. */
+    db.exec('DROP TABLE taglet');
+  }],
 ];
 
 // Columns that turned out to be a mistake. Each runs only while its column is
@@ -374,6 +640,26 @@ const RETIRED = [
 // against it threw `no such table: main.capture` from inside migrate(), which
 // is a spectacularly unhelpful way to say "there is no archive here".
 const POST_MIGRATION = [
+  /* Holding a grant twice is not a different state from holding it once, and
+     the UNIQUE is what lets the grant endpoint be idempotent rather than
+     having to read-then-write. */
+  ['person_grant',
+   'CREATE UNIQUE INDEX IF NOT EXISTS person_grant_one ON person_grant(person_id, name)'],
+  ['taglet', 'CREATE INDEX IF NOT EXISTS taglet_gate ON taglet(gate) WHERE gate IS NOT NULL'],
+  ['tag', 'CREATE INDEX IF NOT EXISTS tag_gate ON tag(gate) WHERE gate IS NOT NULL'],
+  /* The same-link check runs on every submission, and it is the only query
+     that reads this column. */
+  ['snippet', `CREATE INDEX IF NOT EXISTS ix_snippet_source_url ON snippet(source_url)
+     WHERE source_url IS NOT NULL`],
+  /* Partial, because the answer is almost always "none of them": suggestions
+     exist on clips between upload and review, and the queue that reads this
+     wants exactly that handful out of the whole archive. */
+  ['snippet', `CREATE INDEX IF NOT EXISTS ix_snippet_suggestions
+     ON snippet(id) WHERE taglet_suggestions IS NOT NULL`],
+  /* The two questions the log is ever asked, and they want different orders:
+     one snippet's story, and the archive's. */
+  ['event', 'CREATE INDEX IF NOT EXISTS ix_event_target ON event(target_id, at DESC)'],
+  ['event', 'CREATE INDEX IF NOT EXISTS ix_event_at ON event(at DESC)'],
   // The claim query's index: status first because it is the selective one —
   // a queue is nearly all `done`.
   ['job', `CREATE INDEX IF NOT EXISTS ix_job_claim ON job(status, kind, created_at)`],
@@ -406,7 +692,7 @@ const POST_MIGRATION = [
   // Both directions: "what is on this snippet" renders every row, and "what is
   // tagged X" is the whole point of the filter.
   ['snippet_taglet', `CREATE INDEX IF NOT EXISTS ix_sniptag_snip ON snippet_taglet(snippet_id)`],
-  ['snippet_taglet', `CREATE INDEX IF NOT EXISTS ix_sniptag_tag ON snippet_taglet(taglet_id)`],
+  ['snippet_taglet', `CREATE INDEX IF NOT EXISTS ix_sniptag_tag ON snippet_taglet(tag_id)`],
 
   // External-content FTS: the triggers ARE the index. Without them the table
   // silently answers every query with nothing, which looks exactly like "no
@@ -436,6 +722,63 @@ const POST_MIGRATION = [
 // offset_s into an absolute time, once. Before it, every capture's position is
 // relative to stream.started_at, so correcting a stream's start time drags
 // every capture and every note with it. After it, the axis is just an axis.
+/* ── the one vocabulary ──────────────────────────────────────────────────
+ *
+ * A tag is filed under one of these and a block of time is coloured by one of
+ * these, and they are the same list because "what is this tag" and "what is
+ * this block" are the same question asked twice.
+ *
+ *   media      what it belongs to — a game, a franchise, an agency, an event
+ *   character  a guest, a member, a person the block is about
+ *   type       what kind of stream this stretch is — collab, watchalong,
+ *              karaoke, zatsudan, event
+ *   elements   the scaffolding around it — intro, outro, break, waiting screen
+ *   meta       what a snippet IS rather than what it is about — reviewed,
+ *              duplicate, animated, audio only, restricted
+ *   general    everything else about a snippet
+ *
+ * Closed, because it is a colour and a colour has to mean the same thing in
+ * every stream in the archive. Extending it is a deliberate edit to this line.
+ *
+ * IT LIVES HERE, not in archive.js, and archive.js re-exports it. It reads
+ * like the wrong home — this is the schema layer and that is the domain layer
+ * — and it is the right one for exactly one reason: the two BACKFILLS below
+ * are the only code in the archive that has to name the whole vocabulary
+ * literally, they run on every boot with no ran-once guard, and getting the
+ * list wrong there does not fail, it silently rewrites the column. archive.js
+ * imports db.js, so db.js importing archive.js is a cycle, and BACKFILLS is
+ * built at module scope — that cycle is a TDZ ReferenceError during boot, not
+ * a warning. Keeping the vocabulary upstream of both is the only arrangement
+ * in which there is one list and no cycle.
+ */
+export const KINDS = ['media', 'character', 'type', 'elements', 'meta', 'general'];
+
+/* ...plus the sentinel. This is what the two columns may HOLD; KINDS is what
+ * a person may choose. 'unknown' is not a category — it is where a tag sits
+ * between being minted and being filed — so it is offered in a picker only to
+ * something that already is one.
+ *
+ * `KIND_SURFACES` was here: a map of which kinds each picker was allowed to
+ * offer, so that Intro and Break — which only ever label a stretch of a
+ * broadcast — stayed out of a stream's tag row, where the only answer they can
+ * give is "no streams". It was right about the dead end and wrong about the
+ * price. It produced three derived lists that had to agree, an `?surface=`
+ * parameter that had to be passed correctly at every call site, and a theater
+ * screen on which `elements` could not be created at all — so the one place
+ * the kind was genuinely needed was the one place it was missing.
+ *
+ * The vocabulary is now offered whole, everywhere, and filing something
+ * uselessly is an editor's mistake to make and to undo. That also means
+ * `tag.kind` and `segment.kind` are the same domain rather than two lists that
+ * happen to match — which is exactly the shape that silently diverged once
+ * already and cost every block in the archive its colour. */
+export const ALL_KINDS = [...KINDS, 'unknown'];
+
+/** `'a', 'b'` — a vocabulary as a SQL literal list, so a backfill's WHERE
+ *  cannot drift from the vocabulary it is supposed to be enforcing. These are
+ *  closed lists of bare words defined above, never user input. */
+const sqlList = (words) => words.map((w) => `'${w}'`).join(', ');
+
 const BACKFILLS = [
   ['capture', 'capture.remote_start_wall', `
     UPDATE capture SET remote_start_wall =
@@ -469,15 +812,30 @@ const BACKFILLS = [
   // — a word nobody planned for — becomes 'unknown' rather than being filed
   // under whichever bucket looked closest, because a wrong category is a
   // wrong colour on a strip somebody will read as fact.
-  ['tag', 'tag.kind → game|person|type|meta', `
+  //
+  // THE LIST IN THE `WHERE` IS THE CURRENT VOCABULARY AND HAS TO MOVE WITH IT.
+  // This runs on EVERY boot — BACKFILLS have no ran-once guard, unlike
+  // MIGRATIONS and REBUILDS (issues.md #13) — so a kind missing from that list
+  // is not "left alone", it is reset to 'unknown' on the next restart. When the
+  // vocabulary was renamed, this still named the old one, and every media,
+  // character and elements tag in the archive silently became unfiled.
+  //
+  // `meta` passes through untouched because it is still a kind, now a
+  // snippet-only one. Which of the old VOD `meta` tags are formats and which
+  // are scaffolding is a decision by name, and scripts/tag-vocab-migrate.js is
+  // where that is made; this only refuses to destroy anything.
+  ['tag', 'tag.kind → the current vocabulary', `
     UPDATE tag SET kind = CASE kind
-        WHEN 'format' THEN 'type'
-        WHEN 'talk'   THEN 'type'
-        WHEN 'music'  THEN 'type'
-        WHEN 'read'   THEN 'type'
-        WHEN 'idle'   THEN 'meta'
+        WHEN 'format'    THEN 'type'
+        WHEN 'talk'      THEN 'type'
+        WHEN 'music'     THEN 'type'
+        WHEN 'read'      THEN 'type'
+        WHEN 'idle'      THEN 'elements'
+        WHEN 'game'      THEN 'media'
+        WHEN 'person'    THEN 'character'
+        WHEN 'copyright' THEN 'media'
         ELSE 'unknown' END
-    WHERE kind IS NULL OR kind NOT IN ('game', 'person', 'type', 'meta', 'unknown')`],
+    WHERE kind IS NULL OR kind NOT IN (${sqlList(ALL_KINDS)})`],
 
   // One word for one thing. The vault wrote `#srt` — a subtitle file — for what
   // is actually a short, and the editor displays `short`. Storing one word and
@@ -486,14 +844,50 @@ const BACKFILLS = [
   ['note', 'note.tag srt → short', `
     UPDATE note SET tag = 'short' WHERE tag = 'srt'`],
 
-  ['segment', 'segment.kind → game|person|type|meta', `
+  /* The same mapping as the tag backfill above, because it is the same
+     vocabulary — and built from ALL_KINDS rather than typed out, because
+     typing it out is what broke it.
+
+     What it used to say, for the next person who is tempted to hand-write one
+     of these: `NOT IN ('game','person','type','meta','unknown')`, the vocabulary
+     from before the rename. Three of the five live kinds were absent, so every
+     restart selected every media, character and elements block, dropped it
+     through a CASE with no arm for it, and filed it under ELSE 'unknown'.
+     `type` is a member of both vocabularies, which is why one colour in four
+     survived and the whole thing read as random damage rather than as a rule.
+
+     'idle' folds to 'elements' here, not to 'meta'. A waiting screen is
+     scaffolding, and `meta` is not a colour a strip can draw at all any more. */
+  ['segment', 'segment.kind → the current vocabulary', `
     UPDATE segment SET kind = CASE kind
-        WHEN 'talk'  THEN 'type'
-        WHEN 'music' THEN 'type'
-        WHEN 'read'  THEN 'type'
-        WHEN 'idle'  THEN 'meta'
+        WHEN 'format'    THEN 'type'
+        WHEN 'talk'      THEN 'type'
+        WHEN 'music'     THEN 'type'
+        WHEN 'read'      THEN 'type'
+        WHEN 'idle'      THEN 'elements'
+        WHEN 'game'      THEN 'media'
+        WHEN 'person'    THEN 'character'
+        WHEN 'copyright' THEN 'media'
         ELSE 'unknown' END
-    WHERE kind IS NULL OR kind NOT IN ('game', 'person', 'type', 'meta', 'unknown')`],
+    WHERE kind IS NULL OR kind NOT IN (${sqlList(ALL_KINDS)})`],
+
+  /* An unlabelled block that carries a filed tag takes the tag's filing.
+     This is the repair pass for the damage the line above used to do, and it
+     is worth keeping afterwards on its own terms: 'unknown' is a sentinel, not
+     a choice — the block kind picker does not offer it — so a block reading
+     'unknown' while its tag reads 'media' is never something a person asked
+     for. It is a first paint, not a repaint.
+
+     Deliberately NOT a general "keep segment.kind in step with tag.kind". The
+     colour is copied onto the block when a human picks the tag, precisely so
+     that re-filing a game later does not repaint forty old streams, and a
+     block someone has filed differently from its tag is left alone. Only the
+     blocks nobody has ever labelled are touched. */
+  ['segment', 'segment.kind ← its tag, where unlabelled', `
+    UPDATE segment SET kind = (SELECT t.kind FROM tag t WHERE t.id = segment.tag_id)
+     WHERE kind = 'unknown' AND tag_id IS NOT NULL
+       AND (SELECT t.kind FROM tag t WHERE t.id = segment.tag_id)
+             IN (${sqlList(KINDS)})`],
 ];
 
 /** Accept a file or a directory. Pointing at a folder is the natural reading of

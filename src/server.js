@@ -6,18 +6,29 @@
 
 import express from 'express';
 import { createHash } from 'node:crypto';
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { execFile } from 'node:child_process';
+import {
+  createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync,
+  renameSync, rmSync, statSync, writeFileSync,
+} from 'node:fs';
+import { setPriority } from 'node:os';
+import { createGunzip } from 'node:zlib';
 import { dirname, extname, join, resolve, sep } from 'node:path';
+import { Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 import {
-  bumpGeneration, create, meta, now, open, resolveDbPath, tx, ulid,
+  bumpGeneration, create, meta, now, open, resolveDbPath, slugify, tx, ulid,
 } from './db.js';
 import {
-  ChangeError, KINDS, SEGMENT_KINDS, apply, axisToPosition, buildTimeline, clocksOf,
-  deepLink, hms, projectNote, propose, recompute, reject, resolveMedia,
+  ALL_KINDS, ChangeError, KINDS,
+  apply, axisToPosition, buildTimeline, clocksOf,
+  classifyMedia, deepLink, hms, moovFirst, normalizeArgs, overBitrate, pcmArgs,
+  peaksFromPcm, posterArgs, probeMedia, projectNote, propose, recompute, reject,
+  resolveMedia, wavePosterArgs,
   servedType, sourcesFor, stale, summary, thumbFor, watchSources,
 } from './archive.js';
 import {
@@ -135,6 +146,8 @@ export function makeApp(config = CONFIG) {
     s.duration_s, s.vod_state, s.chat_state, s.serve_pref, s.thumb_path,
     s.retracted_at, s.retracted_why, s.merged_into, s.origin,
     s.chat_path, s.chat_sources, s.chat_ok,
+    s.chat_version, s.chat_messages, s.chat_first_ms, s.chat_last_ms,
+    s.chat_moderation, s.chat_meta_path,
     s.local_date, s.local_month, s.start_sod, s.updated_at, s.timeline_json`;
 
   // Captures and tags folded into the row as JSON by SQLite — one query per
@@ -183,6 +196,14 @@ export function makeApp(config = CONFIG) {
     const t = thumbFor(row.thumb_path, caps);
     const timeline = row.timeline_json ? JSON.parse(row.timeline_json) : null;
 
+    const chatMeta = row.chat_path && row.chat_meta_path === row.chat_path
+      ? { version: row.chat_version ?? null,
+          messages: row.chat_messages ?? null,
+          first_ms: row.chat_first_ms ?? null,
+          last_ms: row.chat_last_ms ?? null,
+          moderation: row.chat_moderation
+            ? JSON.parse(row.chat_moderation) : null }
+      : null;
     const out = {
       id: row.id,
       idx: row.idx,
@@ -234,18 +255,39 @@ export function makeApp(config = CONFIG) {
         width: c.width ?? null, height: c.height ?? null,
         probed_at: c.probed_at ?? null,
         video_ok: !!c.video_ok, chat_ok: !!c.chat_ok,
-        mirror_url: c.mirror_url, alive: c.alive,
+        // video_path was missing here, and video_ok — a boolean — was standing
+        // in for it. The record editor's "hosted video" box reads this key, so
+        // it rendered empty on every capture that HAS a file, the browse panel
+        // opened at `raws` instead of beside the file, and the save-time
+        // comparison was always against ''. Nothing was wrong with the widget.
+        video_path: c.video_path ?? null,
+        // Same omission, different symptom: watchSources puts mirror_platform
+        // on the mirror source, so without it here a mirror could never be
+        // told which platform it is on, and the tile had no name.
+        mirror_url: c.mirror_url, mirror_platform: c.mirror_platform ?? null,
+        alive: c.alive,
       })),
       chat: {
         // Honest about which kind of "no chat" this is. A file that exists but
         // has never been imported is not the same claim as a file that never
         // existed, and the panel should say which.
         state: row.chat_state,
-        imported: false,
+        // "There is a merged file and the archive has seen it on disk" — the
+        // one question the panel needs answered before it chooses between
+        // rendering chat and explaining why it cannot.
+        //
+        // It was a hardcoded `false`, left from a design where chat was read
+        // INTO the database. Nothing is imported now: the file is served
+        // whole, so the flag means what it always should have meant.
+        imported: !!(row.chat_path && row.chat_ok),
         // The merged file, once ls-audit has built one. This is what a player
         // should load: every platform's messages in one origin-tagged file.
         merged: row.chat_path ?? null,
         merged_ok: row.chat_path ? !!row.chat_ok : null,
+        // Where to fetch it. Given rather than built client-side, so the page
+        // never has to know that chat lives under the media root at all —
+        // and so the day chat moves, one string changes.
+        url: row.chat_path ? `/media/chat/${row.id}` : null,
         // Which platforms are inside it. Read from the stream once merged,
         // because by then the raws are in deep storage and the captures no
         // longer carry a path to count. Before that, the captures are the
@@ -257,6 +299,13 @@ export function makeApp(config = CONFIG) {
           : caps.filter((c) => c.chat_path)
             .map((c) => ({ capture_id: c.id, platform: c.platform,
                            file_ok: !!c.chat_ok, imported_at: null, messages: null })),
+        // What the file says about itself — and only while it still describes
+        // the file this row points at. Repointing chat_path leaves a count and
+        // a span behind that are entirely plausible and about something else,
+        // and nothing in the numbers would look wrong. null means "not known",
+        // which the panel can say; a wrong number is not something it can
+        // recover from.
+        meta: chatMeta,
       },
     };
     if (row.retracted_at) {
@@ -461,9 +510,14 @@ export function makeApp(config = CONFIG) {
     const timeline = row.timeline_json
       ? JSON.parse(row.timeline_json) : buildTimeline(R, row.id);
     out.segments = timeline.segments;
+    /* A timeline materialised before this existed has no such key, and `?? []`
+       is the difference between an older row rendering normally and the strip
+       throwing on the first `.length`. It fills in on that stream's next
+       recompute; scripts/rebuild.js does the lot. */
+    out.segments_past = timeline.segments_past ?? [];
     out.coverage = timeline.coverage;
     out.counts = timeline.counts;
-    out.segment_kinds = SEGMENT_KINDS;   // includes the 'unknown' sentinel
+    out.segment_kinds = ALL_KINDS;   // includes the 'unknown' sentinel
     out.kinds = KINDS;                   // the four a human may choose from
 
     const span = Math.min(Math.max(Number(req?.query?.rail ?? 4) || 4, 0), 12);
@@ -522,6 +576,29 @@ export function makeApp(config = CONFIG) {
 
   /** The vocabulary. `q=` makes it the autocomplete behind "type a game name":
    *  prefix-first, so typing "mario" ranks Mario Kart above Super Mario. */
+  /* What sits INSIDE a block carrying a tag.
+   *
+   * Written once and used by both the count and the list, because the two
+   * disagreeing is the failure this file has already had several times: a tab
+   * that says 2 over a list of 5 is worse than either number alone.
+   *
+   * `host.end_s` is NULL when a chapter runs to the next one — the schema says
+   * so on the column — so the bound is the next lane-0 start, then the stream's
+   * duration, then a sentinel. Same resolution projectSegments does, in SQL. */
+  const insideFrom = ({ tag, withStream = false }) => `segment sub
+      JOIN segment host ON host.stream_id = sub.stream_id AND host.lane = 0
+           AND host.retracted_at IS NULL AND host.tag_id = ${tag}
+      ${withStream ? 'JOIN stream s ON s.id = sub.stream_id' : ''}
+      WHERE sub.lane = 1 AND sub.retracted_at IS NULL
+        ${withStream ? 'AND s.retracted_at IS NULL' : ''}
+        AND sub.start_s >= host.start_s
+        AND sub.start_s < COALESCE(host.end_s,
+              (SELECT MIN(n.start_s) FROM segment n
+                WHERE n.stream_id = host.stream_id AND n.lane = 0
+                  AND n.retracted_at IS NULL AND n.start_s > host.start_s),
+              (SELECT st.duration_s FROM stream st WHERE st.id = host.stream_id),
+              1000000000)`;
+
   app.get('/api/tags', (req, res) => {
     const q = String(req.query.q ?? '').trim().toLowerCase();
     const limit = Math.min(Math.max(Number(req.query.limit ?? 500) || 500, 1), 500);
@@ -533,16 +610,31 @@ export function makeApp(config = CONFIG) {
     const where = ['t.retracted_at IS NULL'];
     const params = [];
     if (!wantProposed) where.push(`t.status = 'confirmed'`);
+    /* `?surface=` was here, and filtered the vocabulary down to the kinds
+       that surface was allowed to offer. It is gone: one vocabulary, searched
+       whole, everywhere. The parameter is still ACCEPTED and ignored rather
+       than rejected, because a browser holding a cached copy of the old page
+       will keep sending it for as long as its cache lives, and answering that
+       with a 400 turns a stale tab into a tag picker that returns nothing. */
     if (q) {
       where.push('(t.slug LIKE ? OR lower(t.name) LIKE ?)');
       params.push(`%${q}%`, `%${q}%`);
     }
     const rows = R.prepare(
+      /* The snippet count comes back HERE rather than from a second call when
+         a row opens. It is one correlated subquery over an indexed junction,
+         and the alternative is that the retract warning cannot say how much it
+         is about to touch — which is the one place a vague warning costs
+         something. */
       `SELECT t.id, t.slug, t.name, t.kind, t.thumb_path, t.summary,
-              t.status, t.parent_id, p.name AS parent_name, p.slug AS parent_slug,
+              t.status, t.parent_id, t.seed_url, t.seeded, t.gate,
+              p.name AS parent_name, p.slug AS parent_slug,
               COUNT(DISTINCT st.stream_id) n,
+              (SELECT COUNT(*) FROM snippet_taglet sl JOIN snippet sn ON sn.id = sl.snippet_id
+                WHERE sl.tag_id = t.id AND sn.retracted_at IS NULL) snippets,
               (SELECT COUNT(*) FROM segment g
-                WHERE g.tag_id = t.id AND g.retracted_at IS NULL) blocks
+                WHERE g.tag_id = t.id AND g.retracted_at IS NULL) blocks,
+              (SELECT COUNT(*) FROM ${insideFrom({ tag: 't.id' })}) inside
        FROM tag t
        LEFT JOIN stream_tag st ON st.tag_id = t.id
        LEFT JOIN tag p ON p.id = t.parent_id
@@ -557,10 +649,86 @@ export function makeApp(config = CONFIG) {
       // the reason parent_id exists at all.
       thumb: t.thumb_path ? `/media/thumb/${t.thumb_path}` : null,
       summary: t.summary, status: t.status,
+      seed_url: t.seed_url ?? null,
+      // 1 only while the description and art are still exactly what a harvest
+      // wrote. Any human edit clears it in the applier.
+      seeded: t.seeded === 1,
+      gate: t.gate ?? null,
       parent: t.parent_id ? { id: t.parent_id, name: t.parent_name, slug: t.parent_slug } : null,
-      streams: t.n, blocks: t.blocks,
+      streams: t.n, snippets: t.snippets, blocks: t.blocks, inside: t.inside,
     })) });
   });
+
+  /* What is actually under a tag — the three lists the expanded row shows.
+   *
+   * Lazy, on expand, and not part of /api/tags: the counts are cheap enough to
+   * carry for 222 rows and the CONTENTS are not. One tag opening at a time is
+   * one query; the same rows folded into the list payload would be 222 of
+   * them for a screen that shows one.
+   *
+   * Snippets go through the same visibility rule the snippet list uses, so a
+   * gated clip does not become visible by being tagged. That is the whole
+   * reason this is not a naive join.
+   */
+  app.get('/api/tags/:id/uses', (req, res) => {
+    const t = R.prepare('SELECT id FROM tag WHERE id = ? AND retracted_at IS NULL')
+      .get(req.params.id);
+    if (!t) return res.status(404).json({ error: 'no such tag' });
+    const lim = Math.min(Math.max(Number(req.query.limit ?? 40) || 40, 1), 200);
+
+    const streams = R.prepare(
+      `SELECT s.id, s.idx, s.title, s.local_date AS date, s.duration_s, s.timeline_json
+         FROM stream s JOIN stream_tag st ON st.stream_id = s.id
+        WHERE st.tag_id = ? AND s.retracted_at IS NULL
+        ORDER BY s.started_at DESC LIMIT ?`).all(t.id, lim);
+
+    const me = req.person?.id ?? null;
+    const vis = snipVisibleSql(me);
+    const gate = gateSql(req);
+    const snippets = R.prepare(
+      `SELECT s.id, s.title, s.duration_s, s.status
+         FROM snippet s JOIN snippet_taglet sl ON sl.snippet_id = s.id
+        WHERE sl.tag_id = ? AND s.retracted_at IS NULL AND ${vis.sql}
+          ${gate.sql ? `AND ${gate.sql}` : ''}
+        ORDER BY s.created_at DESC LIMIT ?`)
+      .all(t.id, ...vis.params, ...gate.params, lim);
+
+    /* The sub-chapters, not the block itself. Listing the block that carries
+       the tag tells you what you already clicked on — what is worth reading is
+       what happened inside it. */
+    const inside = R.prepare(
+      `SELECT sub.id, sub.start_s, sub.end_s, sub.label, sub.kind, sub.stream_id,
+              s.idx, host.label AS under
+         FROM ${insideFrom({ tag: '?', withStream: true })}
+        ORDER BY s.started_at DESC, sub.start_s LIMIT ?`).all(t.id, lim);
+
+    res.json({
+      streams: streams.map((r) => ({
+        id: r.id, idx: r.idx, title: r.title, date: r.date, duration_s: r.duration_s,
+        /* The coloured strip, already computed. buildTimeline's projection is
+           stored on the row, so drawing a stream's shape here costs a JSON
+           parse rather than a rebuild. */
+        strip: stripOf(r.timeline_json),
+      })),
+      snippets, inside,
+    });
+  });
+
+  /* The projected timeline, reduced to what a 100px bar needs: a kind and a
+     share of the width. Anything the projection could not place is skipped —
+     a strip is a summary, and a summary that invents coverage is worse than a
+     shorter one. */
+  function stripOf(json) {
+    if (!json) return [];
+    let tl; try { tl = JSON.parse(json); } catch { return []; }
+    const segs = (tl?.segments ?? []).filter(
+      (x) => Number.isFinite(x.start_s) && Number.isFinite(x.end_s) && x.end_s > x.start_s
+        && (x.lane ?? 0) !== 1);
+    const span = segs.length ? Math.max(...segs.map((x) => x.end_s)) : 0;
+    if (!span) return [];
+    return segs.map((x) => ({ kind: x.kind ?? 'unknown',
+      pct: Math.max(0.5, ((x.end_s - x.start_s) / span) * 100) }));
+  }
 
   app.get('/api/months', (req, res) => {
     res.json({ months: R.prepare(
@@ -643,6 +811,10 @@ export function makeApp(config = CONFIG) {
     res.json({ id: p.id, handle: p.handle, role: p.role, provider: p.provider,
                display_name: p.display_name ?? null, avatar_url: p.avatar_url ?? null,
                can: capabilities(p),
+               // So the page can tell "there is nothing here" from "there is
+               // something here you may not see" without probing for it.
+               grants: R.prepare('SELECT name FROM person_grant WHERE person_id = ?')
+                 .all(p.id ?? '').map((r) => r.name),
                // So the UI knows whether to offer the dev sign-in at all,
                // rather than probing a 404 to find out.
                dev_auth: !!config.devAuth });
@@ -682,17 +854,78 @@ export function makeApp(config = CONFIG) {
     throw e;
   };
 
+  /* An uploaded poster that a change has just stopped pointing at.
+   *
+   *  Only ever called for a changeset that has APPLIED. A suggester's clear is
+   *  queued, and a queued clear that had already deleted the file would be a
+   *  refusal that came too late to refuse anything.
+   *
+   *  Two homes, two disposals. Still in quarantine means the Pi has not taken
+   *  it yet and the archive can simply unlink it — quarantine is one of the two
+   *  roots it holds a write handle for. Already promoted means it is in the
+   *  media tree, which is mounted read-only here by design, so the only way to
+   *  remove it is to write the job down and let the recorder come and take it.
+   *
+   *  Scoped to `posters/` and to a minted name. A thumb_path someone typed in
+   *  pointing at a file that was already in the archive is not ours to purge,
+   *  and this is the check that keeps a clear from deleting one.
+   */
+  const POSTER_REL = /^posters\/([0-9A-HJKMNP-TV-Z]{26})\.png$/;
+
+  function posterAftercare(csId, by) {
+    let rows;
+    try {
+      rows = R.prepare(
+        `SELECT field, value, base_value FROM change
+          WHERE changeset_id = ? AND target_type IN ('stream', 'tag')
+            AND field = 'thumb_path'`)
+        .all(csId);
+    } catch { return; }
+    for (const r of rows) {
+      const was = r.base_value;
+      if (!was || was === r.value) continue;
+      const m = POSTER_REL.exec(was);
+      if (!m) continue;
+      // Still waiting for the Pi: drop it where it stands and there is nothing
+      // for anyone to come and collect.
+      const qRel = `${m[1]}.png`;
+      const qAbs = config.quarantineRoot ? join(config.quarantineRoot, qRel) : null;
+      if (qAbs && existsSync(qAbs)) {
+        try { rmSync(qAbs, { force: true }); } catch { /* already gone */ }
+        W.prepare(
+          `UPDATE job SET status = 'cancelled', error = 'the poster was cleared before it moved',
+                          finished_at = ?, updated_at = ?
+            WHERE kind = 'promote' AND snippet_id IS NULL
+              AND status IN ('approved', 'proposed') AND payload LIKE ?`)
+          .run(now(), now(), `%"${qRel}"%`);
+        continue;
+      }
+      // In the media tree. The archive cannot reach it; the recorder can.
+      enqueueJob('purge', { payload: { path: was }, by });
+    }
+    bumpGeneration(W);
+  }
+
   app.post('/api/changesets', requireRole('suggester'), (req, res) => {
     // An editor's own applies on submission; everyone else's queues. This is
     // the only way any decision in the archive changes.
     try {
-      res.json(propose(W, {
+      const out = propose(W, {
         authorId: req.person.id,
         reason: req.body?.reason ?? null,
         changes: req.body?.changes ?? [],
         autoApply: atLeast(req.person, 'editor'),
         mediaRoot: config.mediaRoot,
-      }));
+      });
+      /* Only once it has actually landed. A suggester's changeset is queued
+         rather than applied, and "sparklemuffin tagged this" is a lie until a
+         reviewer says yes — the proposal is already recorded, as a changeset,
+         which is the right place for a thing that has not happened yet. */
+      if (out?.status === 'applied') {
+        logChangeset(req, out.id);
+        posterAftercare(out.id, req.person.id);
+      }
+      res.json(out);
     } catch (e) { return changeError(res, e); }
   });
 
@@ -735,10 +968,15 @@ export function makeApp(config = CONFIG) {
       return res.status(400).json({ error: 'decision must be approve or reject' });
     }
     try {
-      res.json(decision === 'approve'
-        ? apply(W, req.params.id, { reviewerId: req.person.id, note, force: !!force,
-                                    mediaRoot: config.mediaRoot })
-        : reject(W, req.params.id, { reviewerId: req.person.id, note }));
+      if (decision !== 'approve') {
+        return res.json(reject(W, req.params.id, { reviewerId: req.person.id, note }));
+      }
+      const out = apply(W, req.params.id, { reviewerId: req.person.id, note, force: !!force,
+                                            mediaRoot: config.mediaRoot });
+      // The second apply site. A suggester's clear reaches disk HERE and
+      // nowhere else, which is the whole point of doing this on apply.
+      posterAftercare(req.params.id, req.person.id);
+      return res.json(out);
     } catch (e) { return changeError(res, e); }
   });
 
@@ -783,7 +1021,13 @@ export function makeApp(config = CONFIG) {
                       'local_start_wall', 'local_start_precision_s'];
   const LOOKUP_STREAM = ['id', 'idx', 'title', 'started_at', 'tz_offset_min',
                          'duration_s', 'vod_state', 'chat_state', 'origin',
-                         'retracted_at', 'chat_path', 'chat_sources'];
+                         'retracted_at', 'chat_path', 'chat_sources',
+                         // Read back so ls-audit's diff sees them as `same` on
+                         // a re-run. A field the archive accepts but will not
+                         // show is a field that collides on every sweep,
+                         // forever, and asks a human about it every time.
+                         'chat_version', 'chat_messages', 'chat_first_ms',
+                         'chat_last_ms', 'chat_moderation'];
 
   const shape = (row, keys) => Object.fromEntries(keys.map((k) => [k, row?.[k] ?? null]));
 
@@ -884,7 +1128,36 @@ export function makeApp(config = CONFIG) {
   ]);
   const INGEST_STREAM = new Set([
     'title', 'started_at', 'tz_offset_min', 'chat_path', 'chat_sources',
+    // chat_meta_path is deliberately absent: it is derived from the path in
+    // the same packet, so a caller cannot claim that a description belongs to
+    // a file it does not describe.
+    'chat_version', 'chat_messages', 'chat_first_ms', 'chat_last_ms',
+    'chat_moderation',
   ]);
+  const CHAT_META = ['chat_version', 'chat_messages', 'chat_first_ms',
+                     'chat_last_ms', 'chat_moderation'];
+  const MODERATION = new Set(['complete', 'none', 'unknown']);
+
+  /** Moderation coverage as one canonical string, or null if it is not one.
+   *
+   *  Canonical because it is COMPARED, not merely stored. ls-audit reads the
+   *  stream back before every write and skips whatever already matches, and
+   *  that comparison is a string one — so {"YT":"a","TW":"b"} and
+   *  {"TW":"b","YT":"a"} being two spellings of one fact would make this field
+   *  collide on every sweep for the rest of the project's life. Sorted keys,
+   *  no spaces, and the same shape produced on the ls-audit side.
+   */
+  const canonModeration = (v) => {
+    let o = v;
+    if (typeof o === 'string') { try { o = JSON.parse(o); } catch { return null; } }
+    if (!o || typeof o !== 'object' || Array.isArray(o)) return null;
+    const keys = Object.keys(o).sort();
+    if (!keys.length) return null;
+    for (const k of keys) {
+      if (!['YT', 'TW'].includes(k) || !MODERATION.has(String(o[k]))) return null;
+    }
+    return JSON.stringify(Object.fromEntries(keys.map((k) => [k, String(o[k])])));
+  };
   // Clearing is for paths only. A file can genuinely stop existing, so "this
   // path is no longer true" is an observation. A title or a clock going blank
   // is never an observation, so those can be corrected but never emptied.
@@ -1093,6 +1366,55 @@ export function makeApp(config = CONFIG) {
       }
       sCols.chat_sources = list.join(',') || null;
     }
+
+    /* The file's description of itself. Rejected rather than coerced: a
+       negative message count and the string "lots" are the same bug seen from
+       here, and storing either would put a number on the panel that nobody
+       can trace back to anything. */
+    const chatBad = [];
+    for (const [k, min] of [['chat_version', 1], ['chat_messages', 0],
+                            ['chat_first_ms', 0], ['chat_last_ms', 0]]) {
+      if (sIn[k] === undefined || sIn[k] === null) continue;
+      const n = Number(sIn[k]);
+      if (!Number.isInteger(n) || n < min) chatBad.push(k);
+      else sCols[k] = n;
+    }
+    if (sCols.chat_first_ms != null && sCols.chat_last_ms != null
+        && sCols.chat_first_ms > sCols.chat_last_ms) {
+      chatBad.push('chat_first_ms');
+    }
+    if (sIn.chat_moderation !== undefined && sIn.chat_moderation !== null) {
+      const mod = canonModeration(sIn.chat_moderation);
+      if (mod === null) chatBad.push('chat_moderation');
+      else sCols.chat_moderation = mod;
+    }
+    if (chatBad.length) {
+      return res.status(400).json({
+        error: 'chat metadata must be whole numbers, a first no later than a '
+             + 'last, and moderation of YT/TW to complete|none|unknown',
+        fields: chatBad });
+    }
+    /* Which file all of that describes. Taken from this same packet when it
+       carries a path, and otherwise from the row — never from the caller,
+       because a description and the claim about what it describes arriving
+       separately is exactly how they come to disagree. */
+    if (CHAT_META.some((k) => k in sCols)) {
+      const cur = R.prepare(
+        'SELECT chat_path, chat_meta_path FROM stream WHERE id = ?').get(streamId) ?? {};
+      const target = sCols.chat_path ?? cur.chat_path ?? null;
+      sCols.chat_meta_path = target;
+      /* Re-filed against a different file, so whatever this packet did not
+         mention described the OLD one and is cleared rather than inherited.
+         Without this, a sweep that reports a count and no span leaves the
+         previous file's span behind wearing the new file's path — which the
+         projection then believes, because that is exactly what it checks.
+         The description is a set: partial updates only mean anything while
+         the file underneath stays the same. */
+      if ((cur.chat_meta_path ?? null) !== target) {
+        for (const k of CHAT_META) if (!(k in sCols)) sCols[k] = null;
+      }
+    }
+
     if (Object.keys(sCols).length) {
       W.prepare(`UPDATE stream SET ${Object.keys(sCols).map((k) => `${k}=?`).join(',')},
                  updated_at=? WHERE id=?`).run(...Object.values(sCols), t, streamId);
@@ -1107,6 +1429,934 @@ export function makeApp(config = CONFIG) {
   });
 
   // -------------------------------------------------------------------------
+  // uploads — bytes arriving from a person
+  //
+  // Raw body, not multipart, and that is a simplification rather than a
+  // shortcut. The server names the file, so there is no filename field to
+  // parse. The title and taglets are typed WHILE the bytes move and arrive in
+  // their own request afterwards, so there are no form fields here either.
+  // What is left is one stream with nothing wrapped around it — and multipart
+  // would mean adding a parser, a dependency and a class of bug in order to
+  // carry fields that do not exist at this point in the flow.
+  //
+  // The whole client side is `fetch(url, { method: 'POST', body: file })`.
+  // -------------------------------------------------------------------------
+
+  /* Both caps are enforced on the way IN. A limit checked once the body has
+     arrived has already filled the disk, which is the entire failure mode. */
+  const UP_MAX_BYTES = Number(process.env.TENMA_UPLOAD_MAX_BYTES) || 200 * 1024 * 1024;
+  const UP_MAX_S = Number(process.env.TENMA_UPLOAD_MAX_S) || 600;
+  /* Auth answers who; this answers how much. Without it one careless
+     authenticated person fills the quarantine mount in an afternoon, and
+     "trusted member" plus "convenient" is exactly how that happens by
+     accident rather than malice. */
+  const UP_MAX_PENDING = Number(process.env.TENMA_UPLOAD_MAX_PENDING) || 20;
+
+  /* Our extension table, never the client's. The name is minted here, so the
+     extension is always one we chose — which is what keeps sendMedia's
+     allowlist load-bearing rather than advisory. Cosmetic either way: the
+     Content-Type comes from servedType() reading the CODECS, because a `.webm`
+     holding H.264 is a real file that no browser will play. */
+  const UP_EXT = (container, vcodec, acodec) => {
+    const c = String(container ?? '');
+    /* No video track: it is a sound file, and naming it .mp4 makes every later
+       guess about it wrong. mp4-family containers holding only audio are .m4a
+       — same bytes, honest name. */
+    if (!vcodec) {
+      if (c.includes('mp4') || c.includes('mov') || c.includes('m4a')) return '.m4a';
+      if (c.includes('mp3')) return '.mp3';
+      if (c.includes('flac')) return '.flac';
+      if (c.includes('wav')) return '.wav';
+      if (c.includes('ogg')) return '.ogg';
+      if (c.includes('matroska') || c.includes('webm')) return '.webm';
+      return acodec ? '.bin' : '.bin';
+    }
+    if (c.includes('gif')) return '.gif';
+    if (c.includes('mp4') || c.includes('mov')) return '.mp4';
+    if (c.includes('matroska')) {
+      return ['vp8', 'vp9', 'av1'].includes(String(vcodec)) ? '.webm' : '.mkv';
+    }
+    if (c.includes('webm')) return '.webm';
+    return '.bin';
+  };
+
+  app.post('/api/uploads', requireRole('suggester'), async (req, res) => {
+    if (!config.quarantineRoot) {
+      return res.status(503).json({ error: 'uploads are disabled; set TENMA_QUARANTINE_ROOT' });
+    }
+    const me = req.person?.id ?? null;
+    if (!me) return res.status(401).json({ error: 'sign in first' });
+
+    const pending = R.prepare(
+      `SELECT count(*) c FROM snippet
+        WHERE author_id = ? AND status = 'proposed' AND retracted_at IS NULL`).get(me).c;
+    if (pending >= UP_MAX_PENDING) {
+      return res.status(429).json({
+        error: `you already have ${pending} clip${pending === 1 ? '' : 's'} waiting for review`,
+        pending, limit: UP_MAX_PENDING });
+    }
+
+    const id = ulid();
+    // A dotfile while it is still arriving: the importer skips dotfiles, so a
+    // half-written upload can never be imported as a row for half a file.
+    const partRel = `.part-${id}`;
+    const partAbs = join(config.quarantineRoot, partRel);
+    const scrub = () => { try { rmSync(partAbs, { force: true }); } catch { /* gone */ } };
+
+    const hash = createHash('sha256');
+    let bytes = 0, tooBig = false;
+    const meter = new Transform({
+      transform(chunk, _enc, cb) {
+        bytes += chunk.length;
+        if (bytes > UP_MAX_BYTES) { tooBig = true; return cb(new Error('too big')); }
+        hash.update(chunk);
+        cb(null, chunk);
+      },
+    });
+
+    try {
+      // pipeline destroys the whole chain on error, so exceeding the cap tears
+      // the socket down mid-flight rather than politely reading to the end.
+      await pipeline(req, meter, createWriteStream(partAbs));
+    } catch {
+      scrub();
+      return tooBig
+        ? res.status(413).json({ error: `clips are capped at ${Math.round(UP_MAX_BYTES / 1048576)} MB`,
+                                 limit_bytes: UP_MAX_BYTES })
+        : res.status(400).json({ error: 'the upload did not finish' });
+    }
+    if (!bytes) { scrub(); return res.status(400).json({ error: 'that was an empty file' }); }
+
+    /* Cheapest rejection first. ffprobe costs a syscall and throws out
+       everything that is not media before a hash, a re-encode or a row. */
+    const p = probeMedia(partAbs);
+    /* `broken` and not merely "no video codec". ffmpeg carries demuxers for
+       ANSI art and raw bitmaps and will happily describe a blob of nothing as
+       `bintext, 1280x10000, duration unknown` rather than say it cannot read
+       it — which the old check accepted, because a codec name was present.
+       classifyMedia insists on a positive duration, which every real video has
+       and no hallucinated stream does. */
+    if (!p || classifyMedia(partAbs, p) === 'broken') {
+      scrub();
+      return res.status(415).json({ error: 'that does not look like a video' });
+    }
+    if (p.duration_s && p.duration_s > UP_MAX_S) {
+      scrub();
+      return res.status(413).json({
+        error: `clips are capped at ${Math.round(UP_MAX_S / 60)} minutes`,
+        duration_s: p.duration_s, limit_s: UP_MAX_S });
+    }
+
+    /* Exact-byte dedupe. Not the interesting duplicate — the perceptual check
+       that catches a re-encode of the same moment comes later, and WARNS
+       rather than refuses. This one is the double-click and the "did that
+       work? let me try again", which is worth stopping before the encode. */
+    const sha = hash.digest('hex');
+    const twin = R.prepare(
+      // author_id, because naming the twin is a disclosure and snipVisible is
+      // what decides whether this person is allowed it.
+      `SELECT id, title, status, author_id FROM snippet
+        WHERE sha256 = ? AND retracted_at IS NULL LIMIT 1`).get(sha);
+    if (twin) {
+      scrub();
+      /* Refuse either way, but only NAME it to somebody who could already have
+         found it. Matching bytes against a gated clip used to hand back its id
+         and title — to a person who gets a 404 on that clip from the list, the
+         detail route, the media route and the poster. Somebody else's pending
+         upload leaked the same way.
+
+         What remains is an oracle: an uploader learns the archive holds a file
+         they already possess. That is a much smaller thing than its title, and
+         closing it entirely would mean accepting the duplicate — storing a
+         second copy of a restricted clip and putting it in front of a reviewer
+         — which is worse on every axis that matters here. */
+      const mayName = snipVisible(twin, req);
+      return res.status(409).json({
+        error: mayName
+          ? 'the archive already has this exact file'
+          : 'the archive already has this exact file — an editor can tell you more',
+        ...(mayName
+          ? { snippet: { id: twin.id, title: twin.title, status: twin.status } }
+          : {}),
+      });
+    }
+
+    // Named by us. Kills traversal, extension games, unicode normalisation and
+    // NAS case-collisions in one move — and because `slug` IS the filename
+    // stem, minting the name mints the slug, so the rename-collision class
+    // that cost `tidy-snippets` a whole manifest cannot apply to anything
+    // arriving this way.
+    const ext = UP_EXT(p.container, p.video_codec, p.audio_codec);
+    const rel = `${id}${ext}`;
+    try { renameSync(partAbs, join(config.quarantineRoot, rel)); }
+    catch (e) { scrub(); return res.status(500).json({ error: `could not store it: ${e.code}` }); }
+
+    /* The submitted name is display text and nothing else — it never touches
+       the filesystem, and it is only here so the queue can say "clip_0043.mp4"
+       back to the person who sent it. */
+    const given = String(req.get('x-upload-name') ?? '').slice(0, 200);
+    const title = given.replace(/\.[a-z0-9]{1,8}$/i, '').replace(/[_-]+/g, ' ').trim()
+      || 'Untitled upload';
+
+    const t = now();
+    W.prepare(
+      `INSERT INTO snippet(id, slug, title, video_path, quarantine_path, duration_s,
+                           width, height, bytes, added_at, container, video_codec,
+                           audio_codec, sha256, transcript_status, status, origin,
+                           author_id, created_at, updated_at)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'none','proposed','upload',?,?,?)`)
+      .run(id, id.toLowerCase(), title,
+           // Where it WILL live once an editor approves. The Pi resolves both
+           // roots from its own config; this is a record, not an instruction.
+           `snippets/${rel}`, rel,
+           p.duration_s, p.width, p.height, bytes, t,
+           p.container, p.video_codec, p.audio_codec, sha, me, t, t);
+    /* Queued before the response, so the row is never briefly a clip nobody
+       has asked to convert. The worker polls seconds later; for the common
+       case — an MP4 that is already conformant — it will have finished
+       writing a poster before the submitter has typed a title.
+
+       `queued` and not `running`: the worker sets that when it actually
+       claims, and a status that lies about what is happening is worse than
+       one that is a few seconds behind. */
+    W.prepare("UPDATE snippet SET normalize_status = 'queued' WHERE id = ?").run(id);
+    enqueueJob('normalize', { snippetId: id, by: me });
+    bumpGeneration(W);
+
+    /* The bytes arriving, which is a different moment from the submission —
+       a file can be uploaded and the form abandoned, and a log that only
+       recorded finished submissions would show nothing for the quarantine
+       space that was spent. */
+    logEvent(req, 'uploaded', 'snippet', id,
+             { name: given || title, bytes, duration_s: p?.duration_s ?? null });
+
+    res.status(201).json({
+      snippet: snipRow(R.prepare('SELECT * FROM snippet WHERE id = ?').get(id), { me }),
+      // What still has to happen before anyone but the submitter sees it.
+      next: 'normalize',
+    });
+  });
+
+  /* ---- the submitter's own write ------------------------------------------
+     The title and taglets are typed WHILE the bytes move, so they land here
+     rather than with the upload. This is the one write a suggester gets on a
+     snippet, and it is narrow on purpose: the clip must be theirs, and it must
+     still be `proposed`. An editor's yes or no closes the window — after that
+     the row belongs to the archive and changes go through a changeset like
+     everything else.
+
+     Partial by design. The panel saves a title before the tags are typed, so a
+     field that is absent is left alone rather than cleared. */
+  const upOwn = (req, id) => {
+    const s = R.prepare('SELECT * FROM snippet WHERE id = ? AND retracted_at IS NULL').get(id);
+    if (!s) return { err: [404, 'no such upload'] };
+    const mine = !!s.author_id && s.author_id === req.person?.id;
+    // Not yours and you are not an editor: it does not exist, rather than
+    // "exists but you may not". Same disclosure rule as the media routes.
+    if (!mine && !atLeast(req.person, 'editor')) return { err: [404, 'no such upload'] };
+    if (s.status !== 'proposed') {
+      return { err: [409, 'that has already been reviewed'] };
+    }
+    return { s };
+  };
+
+  app.patch('/api/uploads/:id', requireRole('suggester'), (req, res) => {
+    const { s, err } = upOwn(req, req.params.id);
+    if (err) return res.status(err[0]).json({ error: err[1] });
+
+    const { title, taglets, transcript, auto_transcribe } = req.body ?? {};
+    const t = now();
+
+    if (title !== undefined) {
+      const v = String(title ?? '').trim();
+      if (!v) return res.status(400).json({ error: 'a clip needs a title' });
+      if (v.length > 300) return res.status(400).json({ error: 'that title is too long' });
+      W.prepare('UPDATE snippet SET title = ?, updated_at = ? WHERE id = ?').run(v, t, s.id);
+    }
+
+    /* Existing taglets only. A submitter attaching a tag is describing the
+       clip; minting one is editing the vocabulary, and free-text creation
+       destroys a curated vocabulary faster than anything else. The panel
+       already refuses these in red — this is the same rule where it counts,
+       because the panel is not a security boundary. */
+    if (taglets !== undefined) {
+      /* Matched on the SLUG, but the display name is what gets kept for a
+         suggestion — "Selen Tatsuki" is what an editor needs to read, and
+         `selen-tatsuki` is what the page sent. Both are carried so neither
+         has to be reconstructed. */
+      const raw = [].concat(taglets ?? [])
+        .map((x) => String(x ?? '').trim()).filter(Boolean).slice(0, 40);
+      /* slugify, not a hand-rolled lowercase-and-hyphenate. They agree on
+         `Selen Tatsuki` and disagree on everything with punctuation or an
+         accent in it — so `Amelia Watson!` matched no taglet, was filed as a
+         stray, and sat in the queue as a name the archive already had. The
+         vocabulary is keyed by slugify(); every comparison against it has to
+         be too. */
+      const want = [...new Set(raw.map(slugify))];
+      const found = want.length
+        ? R.prepare(`SELECT id, slug FROM tag
+                      WHERE slug IN (${want.map(() => '?').join(',')})
+                        AND retracted_at IS NULL`).all(...want)
+        : [];
+      const known = new Set(found.map((r) => r.slug));
+
+      /* Names the archive does not have. Kept as text on the clip rather than
+         minted as `proposed` taglets: a proposed taglet is autocompleted, and
+         then the second person to want this name is offered it before anybody
+         agreed it should exist — and a typo becomes vocabulary the moment a
+         second clip picks it up. */
+      const strays = [...new Map(raw
+        .filter((x) => !known.has(slugify(x)))
+        .map((x) => [slugify(x), x.slice(0, 80)])).values()].slice(0, 12);
+
+      tx(W, () => {
+        W.prepare('DELETE FROM snippet_taglet WHERE snippet_id = ?').run(s.id);
+        const ins = W.prepare(
+          `INSERT INTO snippet_taglet(id, snippet_id, tag_id, created_at, updated_at)
+           VALUES(?,?,?,?,?)`);
+        for (const f of found) ins.run(ulid(), s.id, f.id, t, t);
+        W.prepare('UPDATE snippet SET taglet_suggestions = ?, updated_at = ? WHERE id = ?')
+          .run(strays.length ? JSON.stringify(strays) : null, t, s.id);
+      });
+    }
+
+    /* Auto-transcribe on means whisper writes one after approval, which is
+       what `none` has always meant. Off with prose means a human wrote it, so
+       it is `edited` and the next --update pass will leave it alone.
+       Untimed, because the field is a textarea and the words are all anyone
+       has at this point: one line at t=0, which the whole-transcript editor
+       can split and retime later. */
+    if (auto_transcribe === true) {
+      tx(W, () => {
+        W.prepare('DELETE FROM snippet_line WHERE snippet_id = ?').run(s.id);
+        W.prepare(`UPDATE snippet SET transcript = NULL, transcript_status = 'none',
+                                      updated_at = ? WHERE id = ?`).run(t, s.id);
+      });
+    } else if (transcript !== undefined) {
+      const v = String(transcript ?? '').trim();
+      if (v.length > 20000) return res.status(400).json({ error: 'that transcript is too long' });
+      tx(W, () => {
+        W.prepare('DELETE FROM snippet_line WHERE snippet_id = ?').run(s.id);
+        if (v) {
+          W.prepare(
+            `INSERT INTO snippet_line(id, snippet_id, seq, start_s, end_s, speaker, text)
+             VALUES(?,?,0,0,NULL,NULL,?)`).run(ulid(), s.id, v);
+        }
+        W.prepare(
+          `UPDATE snippet SET transcript = ?, transcript_status = ?, updated_at = ?
+            WHERE id = ?`).run(v || null, v ? 'edited' : 'none', t, s.id);
+      });
+    }
+
+    bumpGeneration(W);
+    const fresh2 = R.prepare('SELECT * FROM snippet WHERE id = ?').get(s.id);
+
+    /* The first of these is the submission — the line that says who brought
+       this in and what they called it. Later ones are edits to something
+       already submitted, which is a different sentence and, before an editor
+       has looked, the one worth being able to notice: a title quietly changed
+       after somebody glanced at it is exactly what this log is for. */
+    const first = !R.prepare(
+      `SELECT 1 FROM event WHERE target_id = ? AND verb = 'submitted'`).get(s.id);
+    logEvent(req, first ? 'submitted' : 'edited', 'snippet', s.id, {
+      title: fresh2.title,
+      taglets: TAGLETS_OF.all(s.id).map((x) => x.name),
+      suggested: (() => {
+        try { return JSON.parse(fresh2.taglet_suggestions ?? 'null') ?? []; }
+        catch { return []; }
+      })(),
+      auto_transcribe: fresh2.transcript_status === 'none',
+      source_url: fresh2.source_url ?? null,
+    });
+
+    res.json({ snippet: snipRow(fresh2, { lines: true, me: req.person?.id ?? null }) });
+  });
+
+  /** Withdraw. The submitter's own reject, before anyone has looked at it.
+   *  The bytes go with it: nothing ever pointed at them, no reviewer spent
+   *  attention on them, and leaving them for a sweep that does not exist yet
+   *  is how a quarantine mount fills up with things nobody wants. */
+  app.delete('/api/uploads/:id', requireRole('suggester'), (req, res) => {
+    const { s, err } = upOwn(req, req.params.id);
+    if (err) return res.status(err[0]).json({ error: err[1] });
+
+    if (s.quarantine_path && config.quarantineRoot) {
+      const abs = resolveMedia(config.quarantineRoot, s.quarantine_path);
+      if (abs) { try { rmSync(abs, { force: true }); } catch { /* already gone */ } }
+    }
+    /* Retracted, not merely rejected. `rejected` alone left the row live for
+       every query that filters on retracted_at — including the sha256 dedupe,
+       which then refused the same file forever and named a snippet the person
+       could no longer see anywhere. Withdrawing is also not a review decision:
+       leaving it in the rejected pile makes a clip nobody looked at count as
+       one an editor turned down. The status stays as the record of how it
+       ended; the tombstone is what takes it out of the archive. */
+    const t = now();
+    W.prepare(
+      `UPDATE snippet SET status = 'rejected', quarantine_path = NULL,
+                          retracted_at = ?, updated_at = ?
+        WHERE id = ?`).run(t, t, s.id);
+    logEvent(req, 'withdrew', 'snippet', s.id, { title: s.title });
+    bumpGeneration(W);
+    res.json({ ok: true, id: s.id });
+  });
+
+  // -------------------------------------------------------------------------
+  // grants — who may see what
+  //
+  // The endpoints an admin panel needs, ahead of the panel. Deliberately not a
+  // changeset: a permission is not an editorial claim about the archive that
+  // somebody might later dispute, it is an access decision, and queueing it
+  // for review would mean a suggester could propose granting themselves
+  // something.
+  // -------------------------------------------------------------------------
+
+  /** Every gate name currently in use, so a panel can offer them rather than
+   *  asking somebody to remember how they spelled it. */
+  // -------------------------------------------------------------------------
+  // the log — who did what, in order
+  //
+  // Append-only, and nothing in the archive updates or deletes a row here. It
+  // is the one table whose value is entirely in not being rewritten.
+  //
+  // Worth being plain about what this does and does not protect against. A
+  // rogue EDITOR is well contained: everything they can do goes through a
+  // changeset, so it is attributed, reversible, and now narrated. A rogue
+  // ADMIN is not contained by anything here — they can purge, they can lift a
+  // gate, and with a shell on the NAS they can edit this table directly.
+  // Tamper-evidence would mean hash-chaining and shipping entries off the box,
+  // which is a different project. What holds in the meantime is that the
+  // masters live on the Pi, in a tree this process cannot write to.
+  // -------------------------------------------------------------------------
+
+  const EVENT_INS = W.prepare(
+    `INSERT INTO event(id, at, actor_id, actor_handle, actor_role, verb,
+                       target_type, target_id, detail, changeset_id)
+     VALUES(?,?,?,?,?,?,?,?,?,?)`);
+
+  /** Write one line of the log.
+   *
+   *  Never throws into its caller. A log that can fail an approval is worse
+   *  than a log with a hole in it: the first loses the work, the second loses
+   *  the note about the work.
+   */
+  function logEvent(req, verb, targetType, targetId, detail = null, changesetId = null) {
+    try {
+      const p = req?.person ?? null;
+      EVENT_INS.run(ulid(), now(), p?.id ?? null, p?.handle ?? 'anonymous',
+                    p?.role ?? 'viewer', verb, targetType, String(targetId),
+                    detail ? JSON.stringify(detail) : null, changesetId);
+    } catch (e) { console.error('log:', e?.message ?? e); }
+  }
+
+  /** Turn an applied changeset into the lines a person would write.
+   *
+   *  One place, called after every propose(), so anything that goes through
+   *  the changeset system is narrated without its own endpoint having to
+   *  remember to say so — including whatever gets added next.
+   *
+   *  A changeset is a set of field changes and a log line is a sentence, and
+   *  the two do not map one to one: a taglet attach is two change rows naming
+   *  one link, and the sentence is "tagged X". So the rows are gathered by the
+   *  thing they are about before anything is written.
+   */
+  function logChangeset(req, csId) {
+    if (!csId) return;
+    try {
+      const rows = R.prepare(
+        'SELECT * FROM change WHERE changeset_id = ? ORDER BY seq').all(csId);
+      const name = (id) => R.prepare('SELECT name FROM tag WHERE id = ?').get(id)?.name ?? id;
+
+      /* A junction's rows share a target_id and mean nothing apart: one says
+         which snippet, the other says which taglet. Collected first, written
+         once. */
+      const links = new Map();
+      for (const c of rows) {
+        if (c.target_type !== 'snippet_taglet') continue;
+        const l = links.get(c.target_id) ?? { op: c.op };
+        if (c.field === 'snippet_id') l.snippet = c.value ?? c.base_value;
+        if (c.field === 'tag_id') l.taglet = c.value ?? c.base_value;
+        /* A delete arrives as the bare row plus the pair recorded on its way
+           out, so whichever arrives second must not downgrade the verb. */
+        if (c.op === 'delete') l.op = 'delete';
+        links.set(c.target_id, l);
+      }
+      for (const l of links.values()) {
+        if (!l.snippet || !l.taglet) continue;
+        logEvent(req, l.op === 'delete' ? 'untagged' : 'tagged', 'snippet', l.snippet,
+                 { taglet: name(l.taglet), taglet_id: l.taglet }, csId);
+      }
+
+      for (const c of rows) {
+        if (c.target_type === 'snippet' && c.field === 'title') {
+          logEvent(req, 'renamed', 'snippet', c.target_id,
+                   { from: c.base_value, to: c.value }, csId);
+        } else if (c.target_type === 'snippet' && c.field === 'status') {
+          const verb = c.value === 'confirmed' ? 'approved'
+            : c.value === 'rejected' ? 'rejected' : 'returned to the queue';
+          logEvent(req, verb, 'snippet', c.target_id, null, csId);
+        } else if (c.target_type === 'tag' && c.op === 'create' && c.field === 'name') {
+          logEvent(req, 'minted', 'tag', c.target_id, { name: c.value }, csId);
+        }
+      }
+    } catch (e) { console.error('log changeset:', e?.message ?? e); }
+  }
+
+  /** One snippet's story, resolved into names.
+   *
+   *  Admin-only, alongside the archive-wide log. Editors are arguably the ones
+   *  who most want it, and that is a change of one word here when it is
+   *  wanted — but a surface that names who purged what is the one to be late
+   *  rather than early with.
+   */
+  app.get('/api/snippets/:id/history', requireRole('admin'), (req, res) => {
+    const rows = R.prepare(
+      `SELECT * FROM event WHERE target_id = ? ORDER BY at ASC, id ASC LIMIT 500`)
+      .all(req.params.id);
+    res.json({ events: rows.map(eventRow) });
+  });
+
+  /** Everything, newest first.
+   *
+   *  The reason this exists rather than only the per-snippet view: a purge
+   *  leaves a tombstone that is invisible in every list, so "who deleted that"
+   *  is exactly the line a per-snippet panel can never be opened to read. The
+   *  entry that matters most is the one whose subject is gone.
+   */
+  app.get('/api/events', requireRole('admin'), (req, res) => {
+    const limit = Math.min(Math.max(Number(req.query.limit ?? 100) || 100, 1), 500);
+    const before = req.query.before ?? null;
+    const verb = req.query.verb ? String(req.query.verb) : null;
+    const who = req.query.actor ? String(req.query.actor) : null;
+
+    const where = ['1=1'], params = [];
+    if (before) { where.push('e.id < ?'); params.push(String(before)); }
+    if (verb) { where.push('e.verb = ?'); params.push(verb); }
+    if (who) { where.push('e.actor_handle = ?'); params.push(who); }
+
+    const rows = R.prepare(
+      `SELECT e.* FROM event e WHERE ${where.join(' AND ')}
+        ORDER BY e.at DESC, e.id DESC LIMIT ?`).all(...params, limit + 1);
+    const page = rows.slice(0, limit);
+    res.json({
+      events: page.map(eventRow),
+      next: rows.length > limit ? page[page.length - 1].id : null,
+      actors: R.prepare(
+        'SELECT DISTINCT actor_handle h FROM event ORDER BY h').all().map((r) => r.h),
+    });
+  });
+
+  /** A transcript correction, at the grain somebody would describe it.
+   *
+   *  A per-word fix fires this on every word, and a person correcting eight
+   *  mishearings in a row did ONE thing. So a further touch by the same person
+   *  on the same snippet inside the window folds into the line already there
+   *  rather than adding another — the log says "groyperkirked edited the
+   *  transcript" once, which is what happened.
+   *
+   *  The cost is stated: two corrections half an hour apart read as one. That
+   *  is the right trade for a log meant to be read, and the per-line detail it
+   *  gives up was never recorded anywhere to begin with.
+   */
+  const TRANSCRIPT_WINDOW_S = 30 * 60;
+  function logTranscript(req, snippetId, verb = 'edited the transcript') {
+    try {
+      const me = req.person?.id ?? null;
+      const recent = R.prepare(
+        `SELECT at FROM event
+          WHERE target_id = ? AND verb = ? AND actor_id IS ?
+          ORDER BY at DESC LIMIT 1`).get(String(snippetId), verb, me);
+      if (recent && now() - recent.at < TRANSCRIPT_WINDOW_S) return;
+      logEvent(req, verb, 'snippet', snippetId);
+    } catch (e) { console.error('log transcript:', e?.message ?? e); }
+  }
+
+  /** A stored row as the page wants it: ids resolved, detail parsed.
+   *
+   *  The title comes from the snippet NOW rather than from the event, so a
+   *  line about a snippet that has since been renamed still says which one it
+   *  is — and the rename itself is its own line, carrying both names. A
+   *  purged snippet keeps its row, so even that resolves.
+   */
+  const eventRow = (r) => {
+    let detail = null;
+    try { detail = r.detail ? JSON.parse(r.detail) : null; } catch { /* keep null */ }
+    const t = r.target_type === 'snippet'
+      ? R.prepare('SELECT title, status, retracted_at FROM snippet WHERE id = ?').get(r.target_id)
+      /* 'taglet' as well as 'tag': the vocabularies merged, but every event
+         written before that says `taglet`, and a log that cannot resolve its
+         own past is not a log. Both read from the one table now. */
+      : (r.target_type === 'tag' || r.target_type === 'taglet')
+        ? R.prepare('SELECT name FROM tag WHERE id = ?').get(r.target_id)
+        : r.target_type === 'person'
+          ? R.prepare('SELECT handle FROM person WHERE id = ?').get(r.target_id)
+          : null;
+    return {
+      id: r.id, at: r.at, verb: r.verb,
+      actor: r.actor_handle, actor_role: r.actor_role, actor_id: r.actor_id,
+      target_type: r.target_type, target_id: r.target_id,
+      /* Null when the row it named is genuinely gone — a person deleted, a
+         taglet retracted. The line still renders; it just cannot say more than
+         the id it holds. */
+      target: t ? (t.title ?? t.name ?? t.handle ?? null) : null,
+      target_gone: r.target_type === 'snippet' ? !!t?.retracted_at : !t,
+      detail, changeset_id: r.changeset_id,
+    };
+  };
+
+  /** What the transcription queue is doing, for the admin panel. */
+  app.get('/api/transcribe', requireRole('admin'), (req, res) => {
+    const ready = whisperReady();
+    const rows = R.prepare(
+      `SELECT j.id, j.status, j.snippet_id, j.attempts, j.error, j.created_at,
+              j.claimed_at, j.finished_at, s.title, s.duration_s, s.transcript_status
+         FROM job j LEFT JOIN snippet s ON s.id = j.snippet_id
+        WHERE j.kind = 'transcribe'
+          AND (j.status IN ('approved', 'claimed', 'paused')
+               OR j.finished_at > ?)
+        ORDER BY CASE j.status WHEN 'claimed' THEN 0 WHEN 'approved' THEN 1
+                               WHEN 'paused' THEN 2 ELSE 3 END,
+                 j.created_at
+        LIMIT 200`).all(now() - 24 * 3600);
+    res.json({
+      on: transcribeOn,
+      ready: ready.ok,
+      why: ready.why,
+      model: ready.ok ? (WHISPER.model.split('/').pop() ?? null) : null,
+      running: running ? { job_id: running.jobId, since: running.at } : null,
+      jobs: rows,
+    });
+  });
+
+  /** The big switch. */
+  app.post('/api/transcribe/pause', requireRole('admin'), (req, res) => {
+    const want = req.body?.on;
+    transcribeOn = typeof want === 'boolean' ? want : !transcribeOn;
+    logEvent(req, transcribeOn ? 'resumed transcription' : 'paused transcription',
+             'setting', 'transcribe', null);
+    /* Deliberately NOT persisted. It is the switch you reach for when the box
+       is busy right now, and a restart is the clearest possible signal that
+       "right now" is over. */
+    res.json({ on: transcribeOn });
+  });
+
+  /** One job: pause it, put it back, or stop it. */
+  app.post('/api/jobs/:id/:verb', requireRole('admin'), (req, res) => {
+    const verb = String(req.params.verb);
+    if (!['pause', 'resume', 'cancel', 'retry'].includes(verb)) {
+      return res.status(404).json({ error: 'no such action' });
+    }
+    const j = R.prepare('SELECT * FROM job WHERE id = ?').get(req.params.id);
+    if (!j) return res.status(404).json({ error: 'no such job' });
+    const t = now();
+
+    if (verb === 'pause') {
+      /* Queued only. A running whisper cannot be paused in any way that saves
+         work — it has no checkpoint, so stopping and resuming re-reads the
+         file from the beginning either way. Cancel is the honest verb for a
+         running one, and it is right there. */
+      if (j.status !== 'approved') {
+        return res.status(409).json({
+          error: j.status === 'claimed'
+            ? 'that one is running — cancel it instead, whisper cannot resume mid-file'
+            : `that job is ${j.status}` });
+      }
+      W.prepare("UPDATE job SET status = 'paused', updated_at = ? WHERE id = ?").run(t, j.id);
+      logEvent(req, 'paused a transcription', 'snippet', j.snippet_id ?? j.id, { job_id: j.id });
+      return res.json({ ok: true, status: 'paused' });
+    }
+
+    if (verb === 'retry') {
+      /* Failures only. `failed` is terminal at this end on purpose — the thing
+         that decides whether to try again is a person looking at the queue,
+         and this is that person saying yes. Retrying something that SUCCEEDED
+         is a different act with real consequences (a fetch would download over
+         a file an editor has already reviewed), so it is not offered. */
+      if (j.status !== 'failed') {
+        return res.status(409).json({ error: `that job is ${j.status}, not failed` });
+      }
+      W.prepare(`UPDATE job SET status = 'approved', claimed_by = NULL, claimed_at = NULL,
+                                error = NULL, finished_at = NULL, updated_at = ?
+                  WHERE id = ?`).run(t, j.id);
+      /* And the snippet stops saying the fetch failed, because it is no longer
+         true — the row is what the submitter sees, and leaving it as a failure
+         while the job is queued again is the panel disagreeing with itself. */
+      if (j.kind === 'fetch' && j.snippet_id) {
+        W.prepare(`UPDATE snippet SET fetch_status = 'queued', fetch_note = NULL,
+                                      updated_at = ? WHERE id = ?`).run(t, j.snippet_id);
+      }
+      logEvent(req, 'sent a job back to the recorder', 'snippet', j.snippet_id ?? j.id,
+               { job_id: j.id, kind: j.kind, attempts: j.attempts });
+      bumpGeneration(W);
+      return res.json({ ok: true, status: 'approved' });
+    }
+
+    if (verb === 'resume') {
+      if (j.status !== 'paused') return res.status(409).json({ error: `that job is ${j.status}` });
+      W.prepare("UPDATE job SET status = 'approved', updated_at = ? WHERE id = ?").run(t, j.id);
+      logEvent(req, 'resumed a transcription', 'snippet', j.snippet_id ?? j.id, { job_id: j.id });
+      return res.json({ ok: true, status: 'approved' });
+    }
+
+    // cancel
+    if (['done', 'failed'].includes(j.status)) {
+      return res.status(409).json({ error: `that job already ${j.status}` });
+    }
+    /* Marked BEFORE the kill, because the runner's catch fires the moment the
+       child dies and has to be able to tell this from a crash — and marked for
+       a claimed job whether or not there is a child to kill right now, because
+       the runner checks this set before starting each of its two. */
+    let killed = false;
+    if (j.status === 'claimed') cancelled.add(j.id);
+    if (running && running.jobId === j.id) {
+      try { running.child.kill('SIGKILL'); killed = true; } catch { /* already gone */ }
+      /* Said straight away rather than waiting on the child's callback, so the
+         panel does not go on showing a job that is already stopped. */
+      running = null;
+    }
+    const why = `cancelled by ${req.person?.handle ?? 'an admin'}`;
+    finishJob(j.id, 'failed', null, why);
+    /* What a cancellation MEANS for the snippet, which is different for every
+       kind — and used to be the transcribe answer for all of them, so
+       cancelling a promote would have cleared the transcript of the clip being
+       promoted. A promote or a purge says nothing about the row: the file is
+       where it was, and the row already describes that. */
+    if (j.snippet_id && j.kind === 'transcribe') {
+      /* Back to `none`, not `failed`: nothing is wrong with the snippet,
+         somebody stopped the machine. */
+      W.prepare(`UPDATE snippet SET transcript_status = 'none', transcript_note = NULL,
+                                    updated_at = ? WHERE id = ?`).run(t, j.snippet_id);
+    } else if (j.snippet_id && j.kind === 'fetch') {
+      /* This one does have to show. A link whose fetch was cancelled would
+         otherwise sit in the submitter's panel saying `waiting for the
+         recorder` for as long as the row exists, waiting on a job that is
+         never coming. */
+      W.prepare(`UPDATE snippet SET fetch_status = 'failed', fetch_note = ?,
+                                    updated_at = ? WHERE id = ?`).run(why, t, j.snippet_id);
+    }
+    logEvent(req, j.kind === 'transcribe' ? 'cancelled a transcription'
+                                          : `cancelled a ${j.kind}`,
+             'snippet', j.snippet_id ?? j.id,
+             { job_id: j.id, kind: j.kind, was_running: killed });
+    bumpGeneration(W);
+    res.json({ ok: true, status: 'failed', was_running: killed });
+  });
+
+  app.get('/api/grants', requireRole('admin'), (req, res) => {
+    const gates = R.prepare(
+      `SELECT t.gate AS name, count(DISTINCT st.snippet_id) AS clips,
+              group_concat(DISTINCT t.slug) AS taglets,
+              group_concat(DISTINCT t.id) AS taglet_ids
+         FROM tag t LEFT JOIN snippet_taglet st ON st.tag_id = t.id
+        WHERE t.gate IS NOT NULL AND t.retracted_at IS NULL
+        GROUP BY t.gate ORDER BY t.gate`).all();
+    const people = R.prepare(
+      `SELECT p.id, p.handle, p.role, group_concat(g.name) AS grants
+         FROM person p JOIN person_grant g ON g.person_id = p.id
+        GROUP BY p.id ORDER BY p.handle`).all()
+      .map((r) => ({ ...r, grants: String(r.grants ?? '').split(',').filter(Boolean) }));
+    res.json({
+      /* The ids alongside the slugs, because lifting a gate means clearing it
+         from every taglet that carries it — and a panel holding only slugs
+         would have to go and look each one up again to do that. */
+      gates: gates.map((g) => ({
+        ...g,
+        taglets: String(g.taglets ?? '').split(',').filter(Boolean),
+        taglet_ids: String(g.taglet_ids ?? '').split(',').filter(Boolean),
+      })),
+      people,
+    });
+  });
+
+  /** What the signed-in person holds. Their own, so not admin-gated — a page
+   *  that has to know whether to draw a lock needs this. */
+  app.get('/api/auth/grants', (req, res) => {
+    res.json({ grants: grantsOf(req.person?.id ?? null) });
+  });
+
+  app.post('/api/people/:id/grants', requireRole('admin'), (req, res) => {
+    const name = String(req.body?.name ?? '').trim().toLowerCase();
+    if (!name || name.length > 64) return res.status(400).json({ error: 'a grant needs a name' });
+    const p = R.prepare('SELECT id FROM person WHERE id = ?').get(req.params.id);
+    if (!p) return res.status(404).json({ error: 'no such person' });
+    // Idempotent on the UNIQUE index: granting twice is not a second grant.
+    W.prepare(
+      `INSERT OR IGNORE INTO person_grant(id, person_id, name, granted_by, created_at)
+       VALUES(?,?,?,?,?)`).run(ulid(), p.id, name, req.person.id, now());
+    logEvent(req, 'granted', 'person', p.id, { gate: name });
+    /* The generation is what expires every cached list — a grant that does not
+       bump it leaves the person looking at the page they had before it, for as
+       long as the validator holds. */
+    bumpGeneration(W);
+    res.status(201).json({ grants: grantsOf(p.id) });
+  });
+
+  app.delete('/api/people/:id/grants/:name', requireRole('admin'), (req, res) => {
+    W.prepare('DELETE FROM person_grant WHERE person_id = ? AND name = ?')
+      .run(req.params.id, String(req.params.name).toLowerCase());
+    logEvent(req, 'revoked', 'person', req.params.id,
+             { gate: String(req.params.name).toLowerCase() });
+    bumpGeneration(W);
+    res.json({ grants: grantsOf(req.params.id) });
+  });
+
+  /** Flag a taglet as gating, or clear it. Admin only, and pointedly not an
+   *  editor: flagging `funny` as a gate would hide a third of the archive from
+   *  everyone, which is a bigger blast radius than any single edit an editor
+   *  can make. */
+  app.post('/api/taglets/:id/gate', requireRole('admin'), (req, res) => {
+    const t = R.prepare(
+      'SELECT id, slug FROM tag WHERE id = ? AND retracted_at IS NULL').get(req.params.id);
+    if (!t) return res.status(404).json({ error: 'no such taglet' });
+    const raw = req.body?.gate;
+    const gate = raw == null || raw === '' ? null
+      : String(raw).trim().toLowerCase().slice(0, 64) || null;
+    const was = R.prepare('SELECT gate FROM tag WHERE id = ?').get(t.id)?.gate ?? null;
+    W.prepare('UPDATE tag SET gate = ?, updated_at = ? WHERE id = ?').run(gate, now(), t.id);
+    logEvent(req, gate ? 'gated' : 'ungated', 'taglet', t.id,
+             { slug: t.slug, gate, was });
+    bumpGeneration(W);
+    res.json({ taglet: { id: t.id, slug: t.slug, gate } });
+  });
+
+  // -------------------------------------------------------------------------
+  // links — a clip the archive does not have yet
+  //
+  // Nothing here opens an outbound socket. The archive records that somebody
+  // asked for a URL and publishes a `fetch` job; the recorder, which already
+  // has yt-dlp, a network and its own opinion about which hosts are allowed,
+  // decides whether to honour it. That split is the point: a compromised
+  // archive can ask the recorder to fetch from an attacker's host and the
+  // recorder will say no, because the allowlist that matters is in ls-rec's
+  // config and not in this database.
+  //
+  // The check below is therefore a COURTESY, not a control. It exists so a
+  // pasted Vimeo link is refused in the same second rather than sitting in a
+  // queue for an hour before the Pi declines it.
+  // -------------------------------------------------------------------------
+
+  const LINK_HOSTS = (process.env.TENMA_LINK_HOSTS
+    || 'youtube.com,youtu.be,twitch.tv,twitter.com,x.com,discord.com')
+    .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+
+  /** The URL as the archive will remember it, or null if it is not one we take.
+   *
+   *  Canonicalised before it is stored, because the duplicate check is a string
+   *  comparison and `youtu.be/X`, `www.youtube.com/watch?v=X&t=42` and the same
+   *  link with a tracking parameter are all the same clip. Getting this wrong
+   *  does not break anything — it just lets the same video in twice.
+   */
+  const linkUrl = (raw) => {
+    let u;
+    try { u = new URL(String(raw ?? '').trim()); } catch { return null; }
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+    const host = u.hostname.toLowerCase().replace(/^www\./, '');
+    if (!LINK_HOSTS.some((h) => host === h || host.endsWith(`.${h}`))) return null;
+    u.protocol = 'https:';
+    u.hostname = host;
+    u.hash = '';
+    u.port = '';
+
+    /* youtu.be/X and youtube.com/watch?v=X are the same video and people paste
+       both — the share button gives one and the address bar the other. Left
+       alone they are two different strings, so the duplicate check misses and
+       the recorder downloads it twice. */
+    if (host === 'youtu.be') {
+      const id = u.pathname.replace(/^\//, '').split('/')[0];
+      if (id) { u.hostname = 'youtube.com'; u.pathname = '/watch'; u.search = `?v=${id}`; }
+    }
+
+    /* ONLY what identifies the video. An earlier version kept `t` and `list`
+       too, which meant the same clip linked from a playlist, or at a
+       timestamp, read as a different submission — measured: the same video
+       pasted twice was accepted twice. Neither changes which video gets
+       downloaded, so neither belongs in the identity. */
+    const keep = new Set(['v']);
+    for (const k of [...u.searchParams.keys()]) if (!keep.has(k)) u.searchParams.delete(k);
+    /* An empty query renders as a trailing "?" that makes two identical URLs
+       compare unequal. */
+    if (![...u.searchParams.keys()].length) u.search = '';
+    return u.href;
+  };
+
+  app.post('/api/uploads/link', requireRole('suggester'), (req, res) => {
+    const me = req.person?.id ?? null;
+    if (!me) return res.status(401).json({ error: 'sign in first' });
+
+    const url = linkUrl(req.body?.url);
+    if (!url) {
+      return res.status(400).json({
+        error: `links from ${LINK_HOSTS.join(', ')} only`, hosts: LINK_HOSTS });
+    }
+
+    /* The same quota as bytes. A link costs the archive nothing to accept and
+       costs the RECORDER a download, so if anything it wants the tighter
+       limit — but one number people can hold in their head beats two. */
+    const pending = R.prepare(
+      `SELECT count(*) c FROM snippet
+        WHERE author_id = ? AND status = 'proposed' AND retracted_at IS NULL`).get(me).c;
+    if (pending >= UP_MAX_PENDING) {
+      return res.status(429).json({
+        error: `you already have ${pending} clips waiting for review`,
+        pending, limit: UP_MAX_PENDING });
+    }
+
+    /* Same link twice. Same disclosure rule as the byte-level dedupe: refuse
+       either way, but only NAME the twin to somebody who could already have
+       found it — otherwise submitting a URL becomes a way to ask whether a
+       gated clip came from it. */
+    const twin = R.prepare(
+      `SELECT id, title, status, author_id FROM snippet
+        WHERE source_url = ? AND retracted_at IS NULL LIMIT 1`).get(url);
+    if (twin) {
+      const mayName = snipVisible(twin, req);
+      return res.status(409).json({
+        error: mayName
+          ? 'that link is already in the archive'
+          : 'that link is already in the archive — an editor can tell you more',
+        ...(mayName ? { snippet: { id: twin.id, title: twin.title, status: twin.status } } : {}),
+      });
+    }
+
+    /* A placeholder title from the URL, so the queue reads as something rather
+       than as a row of identical "Untitled". The submitter renames it in the
+       same panel while the recorder works. */
+    const t = now(), id = ulid();
+    const guess = (() => {
+      try {
+        const u = new URL(url);
+        const v = u.searchParams.get('v');
+        return `${u.hostname.replace(/^www\./, '')}${v ? ` ${v}` : u.pathname}`.slice(0, 120);
+      } catch { return 'Pending fetch'; }
+    })();
+
+    /* video_path is NOT NULL, and a link has no file for as long as the
+       recorder takes. Written as the name it WILL have — the same shape an
+       upload uses, where video_path is a destination from the moment the row
+       exists — and rewritten with the real extension when the bytes land.
+       Nothing serves from it in between: the row is `proposed` with no
+       quarantine_path, so every media route resolves it to nothing. */
+    W.prepare(
+      `INSERT INTO snippet(id, slug, title, video_path, source_url, transcript_status,
+                           fetch_status, status, origin, author_id, added_at,
+                           created_at, updated_at)
+       VALUES(?,?,?,?,?,'none','queued','proposed','link',?,?,?,?)`)
+      .run(id, id.toLowerCase(), guess, `snippets/${id}`, url, me, t, t, t);
+    /* The job carries the URL and nothing path-like. The recorder resolves
+       where to put the file from its own config — the archive never names a
+       directory to a worker. */
+    const jobId = enqueueJob('fetch', { snippetId: id, url, by: me });
+    logEvent(req, 'linked', 'snippet', id, { source_url: url });
+    bumpGeneration(W);
+
+    res.status(201).json({
+      snippet: snipRow(R.prepare('SELECT * FROM snippet WHERE id = ?').get(id), { me }),
+      job_id: jobId,
+      next: 'fetch',
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // jobs — what the archive asks the Pi to do
   //
   // The archive publishes intent; ls-rec subscribes. Nothing here opens an
@@ -1114,11 +2364,151 @@ export function makeApp(config = CONFIG) {
   // comment on `job` in db.js.
   // -------------------------------------------------------------------------
 
-  const JOB_KINDS = ['fetch', 'promote', 'purge'];
+  /* `rescan` is deliberately absent, though the Pi does it. Every kind here
+     can be hand-made through POST /api/jobs with a payload of the caller's
+     choosing, and a rescan payload names URLs for the recorder to go and
+     probe. The one route that makes them builds the payload out of capture
+     rows instead, so the URLs are always ones the archive already recorded. */
+  const JOB_KINDS = ['fetch', 'promote', 'purge', 'normalize', 'transcribe'];
+  /* What the RECORDER may claim. `normalize` is missing on purpose: it runs in
+     this process, against the cache mount, and a Pi that claimed one would
+     hold a lease on work it cannot do and cannot see the files for. Kept as a
+     separate list rather than by filtering at the call site, because "which
+     kinds are the Pi's" is a fact about the system, not about one request. */
+  /* `transcribe` is deliberately NOT here. It runs on this server, in the
+     worker slot normalize owns, and two consumers of one kind means the same
+     file transcribed twice — once by each, with whichever finished last
+     overwriting the other. */
+  /* `rescan` is the Pi's for the same reason promote is: the masters are on a
+     mount this process can only read, and the platform probe wants a network
+     and a cookie jar that live on the recorder. */
+  const PI_KINDS = ['fetch', 'promote', 'purge', 'rescan', 'harvest'];
+  /* A clip that is published and whose master is still in quarantine. Written
+     once because two things ask it — the panel, to say how many, and the sweep,
+     to do something about them — and a count that disagreed with what the
+     button then queued would be worse than either. */
+  const strandedSql = `SELECT id, quarantine_path, video_path FROM snippet
+      WHERE status = 'confirmed' AND retracted_at IS NULL
+        AND quarantine_path IS NOT NULL AND video_path IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM job j
+                         WHERE j.snippet_id = snippet.id AND j.kind = 'promote'
+                           AND j.status IN ('approved', 'claimed'))
+      LIMIT 500`;
   /* Five minutes. Long enough that a slow fetch is not stolen out from under
      the worker doing it, short enough that a worker killed mid-job frees its
      work before anyone notices. */
   const JOB_LEASE_S = 300;
+
+  /** Put a job on the queue. Approved on creation, because every caller here
+   *  is either an editor acting or the archive acting on its own behalf —
+   *  `proposed` exists for the day a suggester may ask for one. */
+  const enqueueJob = (kind, { snippetId = null, url = null, payload = null, by = null } = {}) => {
+    const t = now(), id = ulid();
+    W.prepare(
+      `INSERT INTO job(id, kind, status, snippet_id, url, payload,
+                       requested_by, approved_by, created_at, updated_at)
+       VALUES(?,?,'approved',?,?,?,?,?,?,?)`)
+      .run(id, kind, snippetId, url, payload ? JSON.stringify(payload) : null, by, by, t, t);
+    return id;
+  };
+
+  /* What a rescan found, written down.
+   *
+   * Per capture, and only for the captures the worker actually answered for —
+   * a job that could reach one URL and not the other must not silently mark
+   * the second one anything.
+   */
+  const PROBE_INT = ['file_duration_s', 'width', 'height'];
+  const PROBE_TEXT = ['container', 'video_codec', 'audio_codec'];
+
+  function rescanLanded(job, status, result) {
+    if (status !== 'done' || !result || typeof result !== 'object') return;
+    const t = now();
+    const rows = Array.isArray(result.captures) ? result.captures : [];
+    const seen = new Set();
+    for (const r of rows) {
+      const id = String(r?.id ?? '');
+      if (!id) continue;
+      const cap = W.prepare('SELECT id, stream_id FROM capture WHERE id = ?').get(id);
+      if (!cap) continue;
+      const set = [], vals = [];
+      const put = (col, v) => { set.push(`${col} = ?`); vals.push(v); };
+
+      /* Only on a definite answer. `alive` absent, null, or anything that is
+         not 0/1 means the worker could not tell — a network error, a bot
+         check, a timeout — and a probe that failed is not a VOD that died.
+         Leaving the column alone is the whole point of it being nullable. */
+      if (r.alive === 0 || r.alive === 1) { put('alive', r.alive); put('checked_at', t); }
+
+      for (const k of PROBE_INT) {
+        if (Number.isFinite(Number(r[k]))) put(k, Math.trunc(Number(r[k])));
+      }
+      for (const k of PROBE_TEXT) {
+        if (typeof r[k] === 'string' && r[k]) put(k, r[k].slice(0, 60));
+      }
+      if (Number.isFinite(Number(r.fps))) put('fps', Number(r.fps));
+      if (r.has_audio === 0 || r.has_audio === 1) put('has_audio', r.has_audio);
+      // Stamped only when the file itself was read. It is the answer to "when
+      // was this last ffprobed", and a URL probe does not answer it.
+      if (r.file_duration_s !== undefined && r.file_duration_s !== null) put('probed_at', t);
+
+      if (!set.length) continue;
+      vals.push(t, id);
+      W.prepare(`UPDATE capture SET ${set.join(', ')}, updated_at = ? WHERE id = ?`)
+        .run(...vals);
+      seen.add(cap.stream_id);
+    }
+    /* Everything downstream is derived: vod_state, the duration, the watch
+       chain's ordering. Nothing here has to know that a dead Twitch VOD now
+       sorts below the mirror — the ranks have always said so. */
+    for (const sid of seen) {
+      try { recompute(W, sid, { mediaRoot: config.mediaRoot, checkFiles: !!config.mediaRoot }); }
+      catch (e) { console.error(`rescan recompute ${sid}:`, e?.message ?? e); }
+    }
+  }
+
+  /* What a harvest found, written down.
+   *
+   * The worker reads a page and reports a title, a description and — if it
+   * pulled one — an image already sitting in quarantine, named by result_path
+   * the same way a fetch names its download. Nothing here reaches the network;
+   * that is the entire reason this is a job.
+   *
+   * It writes DIRECTLY rather than through a changeset, for the same reason
+   * ingest does: this is an observation of somebody else's page, not a
+   * decision. What makes that safe is `seeded` — the row says out loud that a
+   * machine wrote it and no human has been over it, and the first hand edit
+   * clears the flag in the applier.
+   */
+  function harvestLanded(job, status, result, resultPath) {
+    if (status !== 'done' || !result || typeof result !== 'object') return;
+    const id = String(job.payload ? (JSON.parse(job.payload)?.tag_id ?? '') : '');
+    if (!id) return;
+    const tag = W.prepare('SELECT id, thumb_path FROM tag WHERE id = ?').get(id);
+    if (!tag) return;
+    const t = now();
+
+    const set = [], vals = [];
+    const put = (col, v) => { set.push(`${col} = ?`); vals.push(v); };
+    if (typeof result.summary === 'string' && result.summary.trim()) {
+      put('summary', result.summary.trim().slice(0, 4000));
+    }
+    /* A re-seed replaces the art as well as the words — that is what the
+       button says it does, and half a re-seed would leave a row that is
+       neither what the wiki says nor what you wrote. `posters/` is where a
+       promoted poster lands, and the Pi has already put the file in
+       quarantine under that name. */
+    if (typeof resultPath === 'string' && /^posters\/[0-9A-HJKMNP-TV-Z]{26}\.png$/.test(resultPath)) {
+      put('thumb_path', resultPath);
+    }
+    if (!set.length) return;
+    // Set LAST so the writes above do not have to care about ordering, and so
+    // a harvest that found nothing leaves the flag exactly as it was.
+    put('seeded', 1);
+    vals.push(t, id);
+    W.prepare(`UPDATE tag SET ${set.join(', ')}, updated_at = ? WHERE id = ?`).run(...vals);
+    bumpGeneration(W);
+  }
 
   const jobRow = (r) => ({
     id: r.id, kind: r.kind, status: r.status,
@@ -1147,14 +2537,9 @@ export function makeApp(config = CONFIG) {
     /* Approved on creation because the creator is already an editor and the
        approval IS the editor's yes. The `proposed` state exists for the day a
        suggester can ask for one; nothing writes it yet. */
-    const t = now(), id = ulid();
-    W.prepare(
-      `INSERT INTO job(id, kind, status, snippet_id, url, payload,
-                       requested_by, approved_by, created_at, updated_at)
-       VALUES(?,?,'approved',?,?,?,?,?,?,?)`)
-      .run(id, kind, snippet_id, url ? String(url) : null,
-           payload ? JSON.stringify(payload) : null,
-           req.person?.id ?? null, req.person?.id ?? null, t, t);
+    const id = enqueueJob(kind, {
+      snippetId: snippet_id, url: url ? String(url) : null, payload,
+      by: req.person?.id ?? null });
     res.status(201).json({ job: jobRow(R.prepare('SELECT * FROM job WHERE id = ?').get(id)) });
   });
 
@@ -1174,10 +2559,10 @@ export function makeApp(config = CONFIG) {
   app.post('/api/ingest/jobs/claim', requireIngest, (req, res) => {
     const worker = String(req.body?.worker ?? 'unknown').slice(0, 64);
     const want = Math.min(Math.max(Number(req.body?.limit ?? 1) || 1, 1), 10);
-    const kinds = [].concat(req.body?.kinds ?? JOB_KINDS)
-      .map(String).filter((k) => JOB_KINDS.includes(k));
+    const kinds = [].concat(req.body?.kinds ?? PI_KINDS)
+      .map(String).filter((k) => PI_KINDS.includes(k));
     if (!kinds.length) {
-      return res.status(400).json({ error: `kinds must be some of ${JOB_KINDS}` });
+      return res.status(400).json({ error: `kinds must be some of ${PI_KINDS}` });
     }
     const t = now();
     try {
@@ -1196,7 +2581,27 @@ export function makeApp(config = CONFIG) {
           `UPDATE job SET status = 'claimed', claimed_by = ?, claimed_at = ?,
                           attempts = attempts + 1, updated_at = ?
             WHERE id = ?`);
-        for (const r of found) mark.run(worker, t, t, r.id);
+        /* Older promote and purge jobs carry a snippet id and nothing else —
+           they were made before the payload carried the two names. The worker
+           refuses a job that does not name a file, which is right and also
+           unhelpful, because the archive has both names sitting in the row.
+           So they are filled in here, from that row, and WRITTEN BACK: the job
+           becomes self-contained the way a new one is, rather than being
+           reinterpreted differently on every claim. */
+        const fill = W.prepare('UPDATE job SET payload = ?, updated_at = ? WHERE id = ?');
+        for (const r of found) {
+          mark.run(worker, t, t, r.id);
+          if (r.payload || !r.snippet_id || !['promote', 'purge'].includes(r.kind)) continue;
+          const s = W.prepare(
+            'SELECT quarantine_path, video_path FROM snippet WHERE id = ?').get(r.snippet_id);
+          const p = r.kind === 'promote'
+            ? (s?.quarantine_path && s?.video_path
+                ? { from: s.quarantine_path, to: s.video_path } : null)
+            : (s?.video_path ? { path: s.video_path } : null);
+          if (!p) continue;
+          r.payload = JSON.stringify(p);
+          fill.run(r.payload, t, r.id);
+        }
         return found;
       });
       if (rows.length) bumpGeneration(W);
@@ -1207,9 +2612,79 @@ export function makeApp(config = CONFIG) {
     } catch (e) { return changeError(res, e); }
   });
 
+  /** What a finished job MEANS for the snippet it was about.
+   *
+   *  The report endpoint used to record the job and stop, which left both
+   *  interesting kinds inert: a `fetch` that succeeded had bytes sitting in
+   *  quarantine that no row pointed at, and a `promote` that succeeded left
+   *  `quarantine_path` set on a row whose file the recorder had just moved —
+   *  so the media route went on serving from a path that was now empty.
+   *
+   *  Kept separate from the endpoint because it is the interesting half and
+   *  because it must never throw into it: a worker that did its work and got a
+   *  500 for saying so will do the work again.
+   */
+  function jobLanded(job, status, resultPath, error, result = null) {
+    if (job.kind === 'rescan') return void rescanLanded(job, status, result);
+    if (job.kind === 'harvest') return void harvestLanded(job, status, result, resultPath);
+    if (!job.snippet_id) return;
+    const t = now();
+
+    if (job.kind === 'promote') {
+      if (status !== 'done') return;
+      /* The master is in the media tree now, so the row stops claiming it is
+         in quarantine. `video_path` was written at accept time as the
+         destination it WOULD have — clearing quarantine_path is what finally
+         makes that true, and is why promote never had to rewrite a path
+         everything else reads. */
+      W.prepare('UPDATE snippet SET quarantine_path = NULL, updated_at = ? WHERE id = ?')
+        .run(t, job.snippet_id);
+      return;
+    }
+
+    if (job.kind !== 'fetch') return;
+
+    if (status !== 'done') {
+      W.prepare(
+        `UPDATE snippet SET fetch_status = 'failed', fetch_note = ?, updated_at = ?
+          WHERE id = ?`)
+        .run(String(error ?? 'the recorder could not fetch it').slice(0, 300), t, job.snippet_id);
+      return;
+    }
+
+    /* A filename, not a path. The recorder reports what it called the file and
+       the archive resolves it against its OWN quarantine root — resolveMedia
+       does the containment, so `../../etc/passwd` from a compromised worker
+       resolves to null rather than to a file. */
+    const rel = String(resultPath ?? '').trim();
+    const abs = rel && config.quarantineRoot
+      ? resolveMedia(config.quarantineRoot, rel) : null;
+    if (!abs || !existsSync(abs)) {
+      W.prepare(
+        `UPDATE snippet SET fetch_status = 'failed', fetch_note = ?, updated_at = ?
+          WHERE id = ?`)
+        .run('the recorder reported a file that is not in quarantine', t, job.snippet_id);
+      return;
+    }
+
+    /* Only the cheap facts here. Codecs, duration, the hash and the duplicate
+       check all happen in the normalize worker, which is already probing this
+       exact file a second later and is off the request path — the recorder
+       should not be kept waiting on ffprobe for its own status report. */
+    W.prepare(
+      `UPDATE snippet SET quarantine_path = ?, video_path = ?, fetch_status = 'done',
+                          fetch_note = NULL, normalize_status = 'queued', updated_at = ?
+        WHERE id = ?`)
+      .run(rel, `snippets/${rel}`, t, job.snippet_id);
+    enqueueJob('normalize', { snippetId: job.snippet_id });
+  }
+
   /** How a worker says what happened. `failed` is terminal on purpose. */
   app.post('/api/ingest/jobs/:id', requireIngest, (req, res) => {
-    const { status, result_path = null, error = null } = req.body ?? {};
+    /* `result` is how a job answers with FACTS rather than with a verdict.
+       Only rescan sends one; everything else says done or failed and where it
+       put the file. */
+    const { status, result_path = null, error = null, result = null } = req.body ?? {};
     if (!['done', 'failed'].includes(status)) {
       return res.status(400).json({ error: 'status must be done or failed' });
     }
@@ -1226,9 +2701,995 @@ export function makeApp(config = CONFIG) {
         WHERE id = ?`)
       .run(status, result_path ? String(result_path).slice(0, 2000) : null,
            error ? String(error).slice(0, 4000) : null, t, t, j.id);
+    /* Never let this fail the report. The job IS recorded by the line above;
+       a worker that finished its work and got a 500 for saying so will do the
+       work again, and for a fetch that means downloading it twice. */
+    try { jobLanded(j, status, result_path, error, result); }
+    catch (e) { console.error(`job ${j.id} landed badly:`, e?.message ?? e); }
     bumpGeneration(W);
     res.json({ job: jobRow(R.prepare('SELECT * FROM job WHERE id = ?').get(j.id)) });
   });
+
+  /** Ask for a fresh transcript.
+   *
+   *  Note what this does NOT do: delete the transcript that is there. The
+   *  obvious version clears it first and asks whisper for a new one, and that
+   *  is exactly wrong for this archive — every transcript here has been
+   *  hand-corrected, whisper has never once spelled a VTuber's name right, and
+   *  between the clearing and the arrival there is a window where the clip has
+   *  no transcript at all. If the worker never runs, that window is forever.
+   *
+   *  So the old one stands until a new one lands and replaces it. The confirm
+   *  in the page says so, because "your corrections will be overwritten" is
+   *  the thing worth warning about and "it will be empty for a while" is not
+   *  a thing that should be true.
+   *
+   *  The worker itself does not exist yet. This is deliberately still a real
+   *  endpoint writing a real row: the queue is the interface, and a job
+   *  sitting in it visible from /api/jobs is honest in a way that a button
+   *  wired to nothing is not.
+   */
+  app.post('/api/snippets/:id/retranscribe', requireRole('editor'), (req, res) => {
+    const s = R.prepare(
+      'SELECT id FROM snippet WHERE id = ? AND retracted_at IS NULL').get(req.params.id);
+    if (!s) return res.status(404).json({ error: 'no such snippet' });
+    // One at a time. Pressing it twice should not mean transcribing twice.
+    const open = R.prepare(
+      `SELECT id FROM job WHERE snippet_id = ? AND kind = 'transcribe'
+        AND status IN ('approved', 'claimed')`).get(s.id);
+    if (open) return res.json({ job_id: open.id, already: true });
+    /* `force`, because this is somebody deciding. The automatic pass refuses
+       to touch a transcript a human has corrected; pressing the button IS the
+       decision to replace it, and the log records it as discarding work. */
+    const id = enqueueJob('transcribe',
+      { snippetId: s.id, by: req.person?.id ?? null, payload: { force: true } });
+    /* Worth a line because it DISCARDS: whatever a human corrected is about to
+       be overwritten by a machine's next guess, and "why did my fixes go" has
+       to have an answer. */
+    logEvent(req, 'queued a re-transcribe', 'snippet', s.id, { job_id: id });
+    bumpGeneration(W);
+    res.status(201).json({ job_id: id, already: false });
+  });
+
+  /** Delete the bytes. Admin only, and deliberately not part of rejecting.
+   *
+   *  Rejection is reversible — the review queue has `back to queue`, and a
+   *  reset that pointed at a deleted file would be an undo that does not undo.
+   *  So reject unlists and purge deletes, which is also what the original
+   *  design asked for: "editor or admin can unlist, only admin can actually
+   *  delete it".
+   *
+   *  Split by WHERE the bytes are, and that split is the whole file-safety
+   *  rule restated: quarantine is the server's to write, so it deletes there
+   *  directly; the media tree is mounted read-only and belongs to the Pi, so
+   *  anything living there becomes a job. One of these is a syscall and the
+   *  other is a request — and the second is the only kind of file operation
+   *  this process is allowed to ASK for rather than do.
+   */
+  app.post('/api/snippets/:id/purge', requireRole('admin'), (req, res) => {
+    const s = R.prepare(
+      // `title` is not decoration: this row is about to become a tombstone, and
+      // the log line naming what was destroyed is the only place the name
+      // survives in a form anyone will read.
+      `SELECT id, title, status, quarantine_path, video_path, play_path, poster_path
+         FROM snippet WHERE id = ?`).get(req.params.id);
+    if (!s) return res.status(404).json({ error: 'no such snippet' });
+    /* A published clip has to be unlisted first. Not bureaucracy: this is the
+       one irreversible action in the archive, and requiring the reversible one
+       before it means a slip costs a click rather than a master. */
+    if (s.status === 'confirmed') {
+      return res.status(409).json({
+        error: 'reject or unlist it first — a published clip cannot be purged in one step' });
+    }
+
+    const gone = [];
+    if (s.quarantine_path && config.quarantineRoot) {
+      const abs = resolveMedia(config.quarantineRoot, s.quarantine_path);
+      if (abs) { try { rmSync(abs, { force: true }); gone.push('quarantine'); } catch { /* already */ } }
+    }
+    /* Derivatives are the server's too, and leaving them is how the cache
+       fills with the playable copy of something that no longer exists. */
+    for (const rel of [s.play_path, s.poster_path]) {
+      if (!rel || !config.cacheRoot) continue;
+      const abs = resolveMedia(config.cacheRoot, rel);
+      if (abs) { try { rmSync(abs, { force: true }); gone.push('cache'); } catch { /* already */ } }
+    }
+
+    /* In the media tree, so not ours to delete. `quarantine_path` being null
+       is what says it was promoted — an upload that never got there still has
+       its bytes in quarantine and was handled above. */
+    let job = null;
+    if (!s.quarantine_path && s.video_path) {
+      /* The one name that matters, before the row stops holding it. Two lines
+         below this, `retracted_at` is set and the paths are cleared — a purge
+         job that had to look the row up afterwards would find a tombstone with
+         nothing left to name. */
+      job = enqueueJob('purge', { snippetId: s.id, by: req.person.id,
+                                  payload: { path: s.video_path } });
+    }
+
+    const t = now();
+    W.prepare(
+      `UPDATE snippet SET quarantine_path = NULL, play_path = NULL, poster_path = NULL,
+                          waveform = NULL, retracted_at = ?, updated_at = ?
+        WHERE id = ?`).run(t, t, s.id);
+    /* The line this whole table exists for. The row survives as a tombstone,
+       so this stays readable — but only from the archive-wide log, because a
+       purged snippet is in no list to open a panel from. */
+    logEvent(req, 'purged', 'snippet', s.id,
+             { removed: [...new Set(gone)], master: !!job, title: s.title ?? null });
+    bumpGeneration(W);
+    res.json({ ok: true, removed: [...new Set(gone)], job_id: job });
+  });
+
+  /** The recorder's queue: what has been asked of the Pi, and whether it came.
+   *
+   *  Deliberately not /api/jobs with a filter. That one is the raw table for
+   *  an editor who knows what a job is; this one answers the question an admin
+   *  actually has, which is "did the thing I pressed happen", and most of its
+   *  work is the two derived facts at the bottom rather than the rows.
+   */
+  app.get('/api/recorder', requireRole('admin'), (req, res) => {
+    const t = now();
+    const marks = PI_KINDS.map(() => '?').join(',');
+    const rows = R.prepare(
+      `SELECT j.id, j.kind, j.status, j.snippet_id, j.url, j.attempts, j.error,
+              j.claimed_by, j.claimed_at, j.created_at, j.updated_at, j.finished_at,
+              j.result_path, s.title, s.retracted_at
+         FROM job j LEFT JOIN snippet s ON s.id = j.snippet_id
+        WHERE j.kind IN (${marks})
+          AND (j.status IN ('approved', 'claimed', 'paused') OR j.finished_at > ?)
+        ORDER BY CASE j.status WHEN 'claimed' THEN 0 WHEN 'approved' THEN 1
+                               WHEN 'paused' THEN 2 ELSE 3 END,
+                 j.created_at
+        LIMIT 200`).all(...PI_KINDS, t - 24 * 3600);
+
+    /* Who last took anything, and when. There is no ping from the worker and
+       there should not be one: a heartbeat would say a process is running,
+       and what matters is whether it is running AND can reach this archive
+       AND is pointed at the right roots — all of which a claim proves and a
+       ping does not. The cost is that a quiet day says nothing, which is why
+       the staleness below is measured on the QUEUE and not on this. */
+    const last = R.prepare(
+      `SELECT claimed_by, claimed_at FROM job
+        WHERE kind IN (${marks}) AND claimed_by IS NOT NULL
+        ORDER BY claimed_at DESC LIMIT 1`).get(...PI_KINDS);
+
+    const waiting = rows.filter((r) => r.status === 'approved');
+    /* Published clips whose bytes never moved. Counted rather than listed:
+       what the panel needs is a number and a button, and the rows themselves
+       are the job queue's business once the button has been pressed. */
+    const stranded = R.prepare(strandedSql).all().length;
+    res.json({
+      stranded,
+      failed: rows.filter((r) => r.status === 'failed').length,
+      lease_s: JOB_LEASE_S,
+      kinds: PI_KINDS,
+      worker: last?.claimed_by
+        ? { name: last.claimed_by, last_seen: last.claimed_at } : null,
+      waiting: waiting.length,
+      running: rows.filter((r) => r.status === 'claimed').length,
+      /* The oldest thing nobody has picked up. The worker polls every twenty
+         seconds, so this is the number that says the recorder is not there —
+         and it is the only one that can, because a queue nobody has put
+         anything into looks identical to a queue nobody is reading. */
+      /* When it became AVAILABLE, not when it was created. A job somebody
+         has just pressed Try again on has been waiting for a worker since
+         that press — reporting the original creation would leave the card
+         shouting "nothing has picked this up in 1d" about something four
+         seconds old, immediately after you acted on the alarm, which is how
+         an alarm stops being read. */
+      waiting_since: waiting.length
+        ? Math.min(...waiting.map((r) => r.updated_at ?? r.created_at)) : null,
+      now: t,
+      jobs: rows,
+    });
+  });
+
+  /** Make the queue match what the rows say.
+   *
+   *  Three things, all of them "this should have been asked for and was not":
+   *  work that failed goes back on, clips that are published but whose bytes
+   *  are still in quarantine get the promote nobody made, and a fetch that
+   *  failed stops telling its submitter so while it waits again.
+   *
+   *  Not a migration script, though that is what prompts writing it. A queue
+   *  drifting from the rows is a thing that happens more than once — a Pi off
+   *  for a week, a cancelled job somebody meant to un-cancel, a failure that
+   *  aged out of the panel — and each time the fix is the same reconciliation.
+   */
+  app.post('/api/recorder/sweep', requireRole('admin'), (req, res) => {
+    const t = now();
+    const marks = PI_KINDS.map(() => '?').join(',');
+
+    /* Everything that failed, however long ago. The panel only shows a day of
+       history, and a pile of failures from the week the recorder was off is
+       exactly what this is for. */
+    const failed = R.prepare(
+      `SELECT id, kind, snippet_id FROM job
+        WHERE kind IN (${marks}) AND status = 'failed'`).all(...PI_KINDS);
+    for (const j of failed) {
+      W.prepare(`UPDATE job SET status = 'approved', claimed_by = NULL, claimed_at = NULL,
+                                error = NULL, finished_at = NULL, updated_at = ?
+                  WHERE id = ?`).run(t, j.id);
+      if (j.kind === 'fetch' && j.snippet_id) {
+        W.prepare(`UPDATE snippet SET fetch_status = 'queued', fetch_note = NULL,
+                                      updated_at = ? WHERE id = ?`).run(t, j.snippet_id);
+      }
+    }
+
+    /* Published, and its bytes are in the wrong place. Nothing else in the
+       archive notices this state — the row reads perfectly normal, the clip
+       plays from quarantine, and the master is one directory away from where
+       every backup and every importer expects it. */
+    const stranded = R.prepare(strandedSql).all();
+    for (const s of stranded) {
+      enqueueJob('promote', { snippetId: s.id, by: req.person.id,
+                              payload: { from: s.quarantine_path, to: s.video_path } });
+    }
+
+    if (failed.length || stranded.length) {
+      logEvent(req, 'swept the recorder queue', 'setting', 'recorder', null,
+               { retried: failed.length, queued: stranded.length });
+      bumpGeneration(W);
+    }
+    res.json({ retried: failed.length, queued: stranded.length });
+  });
+
+  /** What is actually sitting in quarantine, and why.
+   *
+   *  A purge button is half a feature without it — nobody purges a clip they
+   *  have forgotten about, and the question that gets asked is "is this
+   *  filling up", which is about the DIRECTORY rather than about any row.
+   *  So this reads the disk and joins the rows to it, which is also the only
+   *  way orphans show up: a file with no row at all, left by a crash between
+   *  the rename and the insert.
+   */
+  app.get('/api/quarantine', requireRole('admin'), (req, res) => {
+    if (!config.quarantineRoot) return res.json({ root: null, files: [] });
+    let names = [];
+    try { names = readdirSync(config.quarantineRoot); } catch { /* unreadable */ }
+    const byPath = new Map(R.prepare(
+      `SELECT id, title, status, quarantine_path, retracted_at FROM snippet
+        WHERE quarantine_path IS NOT NULL`).all().map((r) => [r.quarantine_path, r]));
+
+    let bytes = 0;
+    const files = [];
+    for (const name of names) {
+      let size = 0;
+      try { size = statSync(join(config.quarantineRoot, name)).size; } catch { continue; }
+      bytes += size;
+      const row = byPath.get(name) ?? null;
+      files.push({
+        name, bytes: size,
+        // A dotfile is a transfer that never finished — the accept endpoint
+        // writes `.part-<id>` and renames on success.
+        state: name.startsWith('.part-') ? 'unfinished'
+          : !row ? 'orphan'
+            : row.retracted_at ? 'retracted' : row.status,
+        snippet_id: row?.id ?? null,
+        title: row?.title ?? null,
+      });
+    }
+    files.sort((a, b) => b.bytes - a.bytes);
+    res.json({ root: config.quarantineRoot, bytes, count: files.length, files });
+  });
+
+  // -------------------------------------------------------------------------
+  // the normalize worker — the one thing in here that does real work
+  //
+  // It runs INSIDE this process, and that wants justifying, because "the web
+  // server also transcodes video" is usually a mistake.
+  //
+  // It is not one here for two reasons. ffmpeg is a child process, so the
+  // event loop is free the entire time it runs — Node is waiting on a pipe,
+  // not encoding anything. And the expensive case is rare: an already-H.264
+  // MP4 is a stream copy that finishes before the uploader has typed a title.
+  // What is left is one child process at a time, niced to 19, holding two of
+  // the four threads. That is a machine that feels slightly slower for a few
+  // minutes, not a machine that stops answering.
+  //
+  // What it must never be is a second writer racing the first. It claims out
+  // of the same `job` table the Pi polls, under the same lease, so two
+  // containers pointed at one database cannot both take the same clip — and
+  // every job it runs is visible in /api/jobs like any other.
+  //
+  // ── where the output goes ────────────────────────────────────────────────
+  //
+  // Into /cache, never /media. This is what lets the server do the work at all
+  // while `read_only: true` stays on the media mount: `play_path` has always
+  // resolved against the cache root — that is how the imported .webm clips
+  // play today — so a normalized copy in the cache is a shape the archive
+  // already had, not a new privilege.
+  //
+  // The consequence is worth stating plainly: an approved upload is fully
+  // playable, with a poster, WITHOUT the Pi having done anything. The promote
+  // job stops being on the critical path and becomes what it should be —
+  // filing the master alongside the other 21 TB.
+  // -------------------------------------------------------------------------
+
+  /* Deliberately not `medium`. On a two-core R1600 with no hardware encoder,
+     medium is roughly 3x realtime and veryfast is roughly 10x; at CRF 21 the
+     difference on a clip somebody recorded off a stream is not something you
+     can see, and the difference in how the site feels for the ten minutes is
+     something everybody can. Slower, prettier settings belong in
+     scripts/normalize-media.js, which runs on a PC nobody is browsing. */
+  const NORM = {
+    crf: Number(process.env.TENMA_NORMALIZE_CRF) || 21,
+    preset: process.env.TENMA_NORMALIZE_PRESET || 'veryfast',
+    threads: Number(process.env.TENMA_NORMALIZE_THREADS) || 2,
+    maxW: Number(process.env.TENMA_NORMALIZE_MAX_W) || 1920,
+    maxH: Number(process.env.TENMA_NORMALIZE_MAX_H) || 1080,
+    // Half an hour. Long enough for ten minutes of 1080p on a slow box,
+    // short enough that a wedged ffmpeg frees the queue the same evening.
+    timeoutMs: Number(process.env.TENMA_NORMALIZE_TIMEOUT_MS) || 1_800_000,
+    pollMs: Number(process.env.TENMA_NORMALIZE_POLL_MS) || 4_000,
+    /* Bits per pixel per frame above which a file is worth trying to shrink.
+       Raise it to re-encode less; 0 turns the whole behaviour off. */
+    bpp: Number(process.env.TENMA_NORMALIZE_BPP) || 0.15,
+  };
+
+  /** One child, niced, killed on timeout. Resolves to null or an error line. */
+  const ffmpeg = (args) => new Promise((done) => {
+    const child = execFile('ffmpeg', args,
+      { timeout: NORM.timeoutMs, maxBuffer: 1 << 22, killSignal: 'SIGKILL' },
+      (err, _out, stderr) => {
+        if (!err) return done(null);
+        const last = String(stderr ?? '').trim().split('\n').pop();
+        done(err.killed ? 'ffmpeg timed out' : (last || err.message || 'ffmpeg failed'));
+      });
+    /* Lowering a child's priority never needs privilege; raising one does. In
+       a container without CAP_SYS_NICE this is the difference between the site
+       staying responsive during an encode and not, so it is attempted and its
+       failure is survivable rather than fatal. */
+    try { setPriority(child.pid, 19); } catch { /* not permitted here */ }
+  });
+
+  const normSet = (id, status, note = null) => {
+    W.prepare(`UPDATE snippet SET normalize_status = ?, normalize_note = ?, updated_at = ?
+                WHERE id = ?`).run(status, note, now(), id);
+  };
+
+  /** Claim exactly one normalize job, or null.
+   *
+   *  The same transaction the Pi's claim uses, with its own much longer lease:
+   *  five minutes is right for a fetch and wrong for an encode, and a lease
+   *  that lapses mid-ffmpeg means two workers writing one output file.
+   */
+  const NORM_LEASE_S = Math.ceil(NORM.timeoutMs / 1000) + 120;
+  const claimNormalize = () => {
+    const t = now();
+    return tx(W, () => {
+      const j = W.prepare(
+        `SELECT * FROM job
+          WHERE kind = 'normalize'
+            AND (status = 'approved'
+                 OR (status = 'claimed' AND (claimed_at IS NULL OR claimed_at < ?)))
+          ORDER BY created_at LIMIT 1`).get(t - NORM_LEASE_S);
+      if (!j) return null;
+      W.prepare(`UPDATE job SET status = 'claimed', claimed_by = 'server',
+                                claimed_at = ?, attempts = attempts + 1, updated_at = ?
+                  WHERE id = ?`).run(t, t, j.id);
+      return j;
+    });
+  };
+
+  const finishJob = (id, status, resultPath, error) => {
+    const t = now();
+    W.prepare(`UPDATE job SET status = ?, result_path = ?, error = ?,
+                              updated_at = ?, finished_at = ? WHERE id = ?`)
+      .run(status, resultPath, error ? String(error).slice(0, 4000) : null, t, t, id);
+  };
+
+  /** The still. Off the NORMALIZED copy where there is one, because that is
+   *  the file people will actually watch and a poster taken from anything else
+   *  can disagree with the first frame they see.
+   *
+   *  A sound clip gets a waveform instead. Never fatal either way: a row
+   *  without a picture is worse-looking, not broken.
+   */
+  async function makePoster(s, p, playRel, src, audioOnly) {
+    if (!config.cacheRoot) return s.poster_path ?? null;
+    try {
+      mkdirSync(join(config.cacheRoot, 'snippets'), { recursive: true });
+      const rel = `snippets/${s.id}.jpg`;
+      const from = playRel ? join(config.cacheRoot, playRel) : src;
+      const abs = join(config.cacheRoot, rel);
+      const err = audioOnly
+        ? await ffmpeg(wavePosterArgs(from, abs))
+        : await ffmpeg(posterArgs(from, abs, p.duration_s));
+      if (!err) {
+        W.prepare('UPDATE snippet SET poster_path = ? WHERE id = ?').run(rel, s.id);
+        return rel;
+      }
+    } catch { /* cosmetic */ }
+    return s.poster_path ?? null;
+  }
+
+  /** Measure the shape of the sound and put it on the row.
+   *
+   *  Two steps because ffmpeg does not do arithmetic: dump raw mono PCM to a
+   *  temp file, reduce it to 480 peaks, throw the PCM away. The temp file is
+   *  the reason this is not streamed — 9.6 MB for a ten-minute clip, written
+   *  and deleted inside the same call, against reading a pipe incrementally
+   *  and getting the backpressure wrong.
+   *
+   *  Never fatal. A clip without a waveform falls back to the browser's own
+   *  controls, which is worse-looking and completely functional.
+   */
+  async function makeWaveform(s, playRel, src) {
+    if (!config.cacheRoot) return null;
+    const from = playRel ? join(config.cacheRoot, playRel) : src;
+    const tmp = join(config.cacheRoot, `.pcm-${s.id}.raw`);
+    try {
+      const err = await ffmpeg(pcmArgs(from, tmp));
+      if (err) return null;
+      const peaks = peaksFromPcm(readFileSync(tmp));
+      if (!peaks) return null;
+      const b64 = Buffer.from(peaks).toString('base64');
+      W.prepare('UPDATE snippet SET waveform = ? WHERE id = ?').run(b64, s.id);
+      return b64;
+    } catch { return null; }
+    finally { try { rmSync(tmp, { force: true }); } catch { /* gone */ } }
+  }
+
+  /** sha256 of a file, streamed.
+   *
+   *  Streamed and not readFileSync: this runs on whatever the recorder
+   *  downloaded, which is bounded by nothing the archive controls, and
+   *  reading a 2 GB VOD into a Buffer to hash it is how a 32 GB NAS runs out
+   *  of memory serving a web page.
+   */
+  const sha256Of = (file) => new Promise((done, fail) => {
+    const h = createHash('sha256');
+    const rs = createReadStream(file);
+    rs.on('error', fail);
+    rs.on('data', (c) => h.update(c));
+    rs.on('end', () => done(h.digest('hex')));
+  });
+
+  /** Everything the accept endpoint does to an upload, for a clip that did not
+   *  come through it. Returns an error string, or null when the row is ready
+   *  to normalize.
+   */
+  async function intakeFetched(s, p, src) {
+    const t = now();
+
+    if (p.duration_s && p.duration_s > UP_MAX_S) {
+      return `too long — ${Math.round(p.duration_s / 60)} minutes, the cap is `
+        + `${Math.round(UP_MAX_S / 60)}`;
+    }
+
+    /* The duplicate check the upload path runs before it stores anything. Here
+       the bytes already exist, so a twin means throwing them away rather than
+       refusing to accept them — and the row says so, because the person who
+       submitted the link is owed an explanation better than silence. */
+    const sha = await sha256Of(src);
+    const twin = R.prepare(
+      `SELECT id FROM snippet WHERE sha256 = ? AND id != ? AND retracted_at IS NULL LIMIT 1`)
+      .get(sha, s.id);
+    if (twin) return 'the archive already has this exact file';
+
+    let bytes = null;
+    try { bytes = statSync(src).size; } catch { /* probed fine a moment ago */ }
+    W.prepare(
+      `UPDATE snippet SET duration_s = ?, width = ?, height = ?, bytes = ?,
+                          container = ?, video_codec = ?, audio_codec = ?, sha256 = ?,
+                          updated_at = ?
+        WHERE id = ?`)
+      .run(p.duration_s, p.width, p.height, bytes, p.container, p.video_codec,
+           p.audio_codec, sha, t, s.id);
+    return null;
+  }
+
+  async function runNormalize(job) {
+    const s = R.prepare('SELECT * FROM snippet WHERE id = ?').get(job.snippet_id);
+    if (!s) { finishJob(job.id, 'failed', null, 'the snippet is gone'); return; }
+
+    /* The source is wherever the file actually is. A pending upload is in
+       quarantine; a promoted or imported clip is in the media tree. Reading
+       from /media is fine — it is mounted read-only, not unreadable. */
+    const src = s.quarantine_path
+      ? resolveMedia(config.quarantineRoot, s.quarantine_path)
+      : resolveMedia(config.mediaRoot, s.video_path);
+    if (!src || !existsSync(src)) {
+      normSet(s.id, 'failed', 'the file is not where the row says it is');
+      finishJob(job.id, 'failed', null, `missing source for ${s.id}`);
+      return;
+    }
+    if (!config.cacheRoot) {
+      normSet(s.id, 'failed', 'no cache root configured');
+      finishJob(job.id, 'failed', null, 'TENMA_CACHE_ROOT is unset');
+      return;
+    }
+
+    normSet(s.id, 'running');
+    bumpGeneration(W);
+
+    const p = probeMedia(src);
+    const base = classifyMedia(src, p);
+    if (base === 'broken') {
+      normSet(s.id, 'failed', 'ffmpeg cannot read this file');
+      finishJob(job.id, 'failed', null, 'unreadable');
+      return;
+    }
+
+    /* No sha256 means nothing has ever inspected this file — it arrived from
+       the recorder rather than through /api/uploads, so the caps and the
+       duplicate check happen now. The bytes are deleted on refusal: they are
+       in quarantine, nothing points at them, and leaving them is how a link
+       somebody submitted by mistake becomes a permanent 400 MB. */
+    if (!s.sha256) {
+      const bad = await intakeFetched(s, p, src);
+      if (bad) {
+        try { rmSync(src, { force: true }); } catch { /* already gone */ }
+        W.prepare(
+          `UPDATE snippet SET quarantine_path = NULL, fetch_status = 'failed',
+                              fetch_note = ?, updated_at = ? WHERE id = ?`)
+          .run(bad, now(), s.id);
+        normSet(s.id, 'failed', bad);
+        finishJob(job.id, 'failed', null, bad);
+        bumpGeneration(W);
+        return;
+      }
+    }
+
+    /* An export that is the right shape and the wrong size.
+       classifyMedia would call a 190 MB Premiere export `conformant` and leave
+       it alone, because every question it asks is about format and every
+       answer is correct. So the picture gets re-encoded anyway — same stream
+       decision as `video`, since the soundtrack is already AAC and copying it
+       is free.
+
+       Attempted, not assumed: whether the result is kept is decided by
+       measuring it below. */
+    const heavy = (base === 'conformant' || base === 'remux') && overBitrate(p, { bpp: NORM.bpp });
+    const kind = heavy ? 'video' : base;
+    const audioOnly = base === 'sound' || base === 'sound-encode';
+
+    let playRel = s.play_path ?? null;
+
+    /* `conformant` is the whole point of classifying. The file is already
+       H.264/AAC in an MP4 with the index at the front — copying it into the
+       cache would spend a gigabyte and several seconds to produce a file
+       identical to the one we have. It gets a poster and nothing else. */
+    if (kind !== 'conformant') {
+      mkdirSync(join(config.cacheRoot, 'play'), { recursive: true });
+      // An audio clip is an .m4a. Same bytes an .mp4 would hold, but every
+      // player and every download names it correctly from here on.
+      const ext = audioOnly ? 'm4a' : 'mp4';
+      const rel = `play/${s.id}.${ext}`;
+      const out = join(config.cacheRoot, rel);
+      // Written as a dotfile and renamed. A crash mid-encode leaves a .part
+      // nobody reads, never a half-written file that play_path points at.
+      const tmp = join(config.cacheRoot, `play/.${s.id}.part.${ext}`);
+      rmSync(tmp, { force: true });
+
+      const err = await ffmpeg(normalizeArgs(src, tmp, kind, {
+        ...NORM, hasAudio: !!p.audio_codec }));
+      if (err) {
+        rmSync(tmp, { force: true });
+        normSet(s.id, 'failed', err.slice(0, 300));
+        finishJob(job.id, 'failed', null, err);
+        bumpGeneration(W);
+        return;
+      }
+
+      /* Verify before trusting it. An ffmpeg that exits 0 having produced
+         something that will not probe, or that lost half the runtime to a
+         corrupt input it decoded anyway, is a real outcome — and the failure
+         to catch it is a clip that plays for two seconds and stops. */
+      const p2 = probeMedia(tmp);
+      const drift = p2 ? Math.abs((p2.duration_s ?? 0) - (p.duration_s ?? 0)) : Infinity;
+      /* "Has the stream we were converting" — which for a sound clip is the
+         AUDIO one. Asking for a video codec unconditionally failed every audio
+         upload with "the output will not probe", on output that was perfectly
+         fine and simply had no pictures in it. */
+      const missing = audioOnly ? !p2?.audio_codec : !p2?.video_codec;
+      const bad = !p2 || missing ? 'the output will not probe'
+        : drift > Math.max(0.5, (p.duration_s ?? 0) * 0.02)
+          ? `duration moved ${drift.toFixed(1)}s`
+          : !moovFirst(tmp) ? 'the moov atom is not first'
+            : null;
+      if (bad) {
+        rmSync(tmp, { force: true });
+        normSet(s.id, 'failed', bad);
+        finishJob(job.id, 'failed', null, bad);
+        bumpGeneration(W);
+        return;
+      }
+      /* The whole safety of the bitrate heuristic lives here.
+         `heavy` was a guess that there were bits to save; this measures
+         whether there were. Noise, grain and confetti are genuinely
+         incompressible, and CRF re-encoding them produces a file the same
+         size or bigger — at which point we have spent CPU to make a
+         SECOND copy of something we already had, and lost a generation of
+         quality for it. So: keep it only if it is a real win, and
+         otherwise throw it away and leave the original to be served.
+
+         15% is the bar. A 5% saving is not worth a re-encode of anybody's
+         master; the case this exists for saves 60-80%. */
+      if (heavy) {
+        const was = p.bytes ?? statSync(src).size;
+        const now2 = statSync(tmp).size;
+        if (now2 > was * 0.85) {
+          rmSync(tmp, { force: true });
+          const pct = Math.round((now2 / was) * 100);
+          /* Not a failure. The file is fine, it simply could not be made
+             smaller — so it falls back to exactly what its real
+             classification wanted, which for a conformant file is nothing
+             at all and for a remux is the container swap it already needed. */
+          if (base === 'conformant') {
+            playRel = null;
+          } else {
+            const e2 = await ffmpeg(normalizeArgs(src, tmp, base, {
+              ...NORM, hasAudio: !!p.audio_codec }));
+            if (e2) {
+              normSet(s.id, 'failed', e2.slice(0, 300));
+              finishJob(job.id, 'failed', null, e2);
+              bumpGeneration(W);
+              return;
+            }
+            renameSync(tmp, out);
+            playRel = rel;
+          }
+          W.prepare(`UPDATE snippet SET play_path = ?, normalize_status = 'done',
+                                        normalize_note = ?, updated_at = ?
+                      WHERE id = ?`)
+            .run(playRel, `already efficiently encoded (a re-encode came out ${pct}%)`,
+                 now(), s.id);
+          await makePoster(s, p, playRel, src, audioOnly);
+          if (audioOnly) await makeWaveform(s, playRel, src);
+          finishJob(job.id, 'done', playRel, null);
+          bumpGeneration(W);
+          return;
+        }
+      }
+
+      renameSync(tmp, out);
+      playRel = rel;
+    }
+
+    const posterRel = await makePoster(s, p, playRel, src, audioOnly);
+    if (audioOnly) await makeWaveform(s, playRel, src);
+
+    const t = now();
+    W.prepare(
+      `UPDATE snippet SET play_path = ?, poster_path = ?, normalize_status = 'done',
+                          normalize_note = NULL, updated_at = ?
+        WHERE id = ?`).run(playRel, posterRel, t, s.id);
+    finishJob(job.id, 'done', playRel ?? posterRel, null);
+    bumpGeneration(W);
+  }
+
+  /* One at a time, forever, and never two at once even if a tick is slow —
+     `busy` is what stops a 12-minute encode from having four more stacked
+     behind it by the time it finishes. */
+  let busy = false;
+  async function workerTick() {
+    if (busy) return;
+    busy = true;
+    try {
+      /* Belt and braces for the shape above: any future path that puts a job
+         back instead of finishing it would otherwise be handed the same job
+         again immediately, forever. Once per pass is enough for any job — the
+         next tick is a second away. */
+      const seen = new Set();
+      for (;;) {
+        /* Normalize first, always. Somebody is waiting on an encode — a
+           snippet cannot be watched until it is converted — and nobody is
+           waiting on a transcript, which arrives after approval by design.
+           Draining normalize before touching transcribe is the whole of that
+           priority; it needs no weights. */
+        const job = claimNormalize() ?? claimTranscribe();
+        if (!job || seen.has(job.id)) break;
+        seen.add(job.id);
+        try {
+          if (job.kind === 'normalize') await runNormalize(job);
+          else await runTranscribe(job);
+        } catch (e) { finishJob(job.id, 'failed', null, e?.message ?? String(e)); }
+        /* Whatever way that went — including the early returns that never
+           reach the runner's own finally — this job is over, so its mark goes
+           with it rather than sitting in the set until a restart. */
+        finally { cancelled.delete(job.id); }
+      }
+    } finally { busy = false; }
+  }
+
+  // -------------------------------------------------------------------------
+  // transcription
+  //
+  // whisper.cpp as a subprocess, exactly like ffmpeg: the archive already
+  // shells out to one binary it did not write, and this is a second one. The
+  // binary and the model are PATHS FROM THE ENVIRONMENT, not things baked into
+  // the image — a 500 MB model rebuilt into a container on every deploy is
+  // miserable, and this way the feature ships dark and lights up when the
+  // files are put in place.
+  //
+  // Nothing here runs on its own thread. It takes the same single worker slot
+  // normalize uses, because there are two cores.
+  // -------------------------------------------------------------------------
+
+  const WHISPER = {
+    bin: String(process.env.TENMA_WHISPER_BIN ?? '').trim(),
+    model: String(process.env.TENMA_WHISPER_MODEL ?? '').trim(),
+    /* Two, not four. The box has two cores and is also serving pages; the
+       fourth thread buys a few percent and costs the site its responsiveness
+       while a ten-minute snippet grinds. */
+    threads: Number(process.env.TENMA_WHISPER_THREADS) || 2,
+    lang: String(process.env.TENMA_WHISPER_LANG ?? 'en').trim(),
+    /* Generous, because this is measured in minutes by design. A ten-minute
+       snippet at one-third of realtime is half an hour, and a timeout that
+       fires at twenty minutes turns a slow success into a failure nobody can
+       explain. */
+    timeoutMs: Number(process.env.TENMA_WHISPER_TIMEOUT_MS) || 3 * 3600 * 1000,
+  };
+
+  /** Whether transcription can happen at all, and why not when it cannot. */
+  const whisperReady = () => {
+    if (!WHISPER.bin) return { ok: false, why: 'TENMA_WHISPER_BIN is not set' };
+    if (!WHISPER.model) return { ok: false, why: 'TENMA_WHISPER_MODEL is not set' };
+    if (!existsSync(WHISPER.bin)) return { ok: false, why: `no binary at ${WHISPER.bin}` };
+    if (!existsSync(WHISPER.model)) return { ok: false, why: `no model at ${WHISPER.model}` };
+    return { ok: true, why: null };
+  };
+
+  /* The big switch. In memory on purpose — it is the thing you reach for when
+     the box is busy right now, and "right now" does not survive a restart. It
+     gates the CLAIM rather than the enqueue: jobs still queue while it is off
+     and are taken the moment it is back on, where gating the enqueue would
+     make every request during the pause silently evaporate. */
+  let transcribeOn = true;
+
+  /* The child process of whatever is running, so it can be cancelled. Whisper
+     cannot resume mid-file, so there is no pause here — killing it and
+     requeueing loses exactly what pausing would have saved, which is nothing.
+     Pause lives on QUEUED jobs, where it means something. */
+  let running = null;          // { jobId, child, snippetId }
+  /* Jobs an admin stopped on purpose. Killing the child makes the runner throw
+     the way a crash does, and without this its catch block would overwrite the
+     cancellation the endpoint just recorded — the job would read "Command
+     failed: ffmpeg ..." and the snippet would look broken rather than
+     untouched. */
+  const cancelled = new Set();
+
+  /** Run one binary with a timeout and a handle for cancelling it. */
+  const spawnFor = (jobId, snippetId, bin, args, timeoutMs) => new Promise((done, fail) => {
+    /* A transcribe is two children in a row, and between them there is a
+       moment when there is nothing to kill. Without this the second one would
+       start AFTER an admin stopped the job, run to the end, and write a
+       transcript over a snippet the endpoint has already put back to having
+       none. */
+    if (cancelled.has(jobId)) return void fail(new Error('cancelled'));
+    const child = execFile(bin, args, { timeout: timeoutMs, maxBuffer: 32 << 20 },
+      (err, stdout, stderr) => {
+        /* Only if it is still this one. A later job may have taken the slot. */
+        if (running?.jobId === jobId) running = null;
+        if (err) return fail(new Error(String(stderr || err.message).slice(0, 1500)));
+        done(stdout);
+      });
+    running = { jobId, child, snippetId, at: now() };
+    /* And the same race one notch tighter: the mark can land between the check
+       above and this assignment, in which case the endpoint found no child and
+       this is the only place left that can stop it. */
+    if (cancelled.has(jobId)) { try { child.kill('SIGKILL'); } catch { /* gone */ } }
+  });
+
+  /** whisper.cpp's JSON into the rows the archive keeps.
+   *
+   *  `offsets` are milliseconds — the writer emits `t0 * 10` from
+   *  centiseconds — and they are what the page seeks on, so they are what is
+   *  read rather than the pretty `timestamps` strings beside them.
+   */
+  function parseWhisper(jsonText) {
+    const d = JSON.parse(jsonText);
+    const segs = Array.isArray(d?.transcription) ? d.transcription : [];
+    const out = [];
+    for (const seg of segs) {
+      const text = String(seg?.text ?? '').trim();
+      if (!text) continue;
+      const from = Number(seg?.offsets?.from);
+      const to = Number(seg?.offsets?.to);
+      out.push({
+        start_s: Number.isFinite(from) ? from / 1000 : 0,
+        end_s: Number.isFinite(to) ? to / 1000 : null,
+        text: text.slice(0, 2000),
+      });
+    }
+    return out;
+  }
+
+  /** Claim one transcribe job, or null. Skips paused ones and obeys the switch. */
+  const WHISPER_LEASE_S = Math.ceil(WHISPER.timeoutMs / 1000) + 300;
+  const claimTranscribe = () => {
+    if (!transcribeOn) return null;
+    /* Not claimed while there is nothing to run it with. The runner handles an
+       unconfigured whisper by putting the job back, which is right — but a job
+       put back is a job the loop below can claim again on the same pass, and
+       that is a tight loop with database writes in it that pins a core and
+       stops this process answering anything at all. The jobs sit as queued,
+       the panel says why, and they go the moment the files land. */
+    const ready = whisperReady();
+    if (!ready.ok || !config.cacheRoot) return null;
+    const t = now();
+    return tx(W, () => {
+      const j = W.prepare(
+        `SELECT * FROM job
+          WHERE kind = 'transcribe'
+            AND (status = 'approved'
+                 OR (status = 'claimed' AND (claimed_at IS NULL OR claimed_at < ?)))
+          ORDER BY created_at LIMIT 1`).get(t - WHISPER_LEASE_S);
+      if (!j) return null;
+      W.prepare(`UPDATE job SET status = 'claimed', claimed_by = 'server',
+                                claimed_at = ?, attempts = attempts + 1, updated_at = ?
+                  WHERE id = ?`).run(t, t, j.id);
+      return j;
+    });
+  };
+
+  async function runTranscribe(job) {
+    const ready = whisperReady();
+    if (!ready.ok) {
+      /* Back to the queue rather than failed. Whisper being unconfigured is a
+         fact about the deployment, not about this snippet, and a job that
+         failed for it would need finding and re-queueing by hand the day the
+         files arrive. */
+      W.prepare(`UPDATE job SET status = 'approved', claimed_by = NULL, claimed_at = NULL,
+                                error = ?, updated_at = ? WHERE id = ?`)
+        .run(ready.why, now(), job.id);
+      return;
+    }
+
+    const s = R.prepare('SELECT * FROM snippet WHERE id = ? AND retracted_at IS NULL')
+      .get(job.snippet_id);
+    if (!s) { finishJob(job.id, 'failed', null, 'the snippet is gone'); return; }
+
+    let payload = {};
+    try { payload = JSON.parse(job.payload ?? '{}') ?? {}; } catch { /* none */ }
+
+    /* The one thing this must never do on its own initiative. `edited` means a
+       human has been through the words; an automatic pass would silently
+       replace their corrections with a machine's next guess. An editor asking
+       for it explicitly is a different act, and the log already records that
+       one as discarding work. */
+    if (s.transcript_status === 'edited' && !payload.force) {
+      finishJob(job.id, 'done', null, null);
+      return;
+    }
+
+    /* What to listen to: the normalized copy when there is one, because it is
+       the file that is known to decode. Falls back to the master. */
+    const src = (s.play_path && config.cacheRoot && resolveMedia(config.cacheRoot, s.play_path))
+      || (s.quarantine_path && config.quarantineRoot
+          && resolveMedia(config.quarantineRoot, s.quarantine_path))
+      || (s.video_path && config.mediaRoot && resolveMedia(config.mediaRoot, s.video_path));
+    if (!src || !existsSync(src)) {
+      finishJob(job.id, 'failed', null, 'no file to transcribe');
+      return;
+    }
+
+    W.prepare(`UPDATE snippet SET transcript_status = 'running', transcript_note = NULL,
+                                  updated_at = ? WHERE id = ?`).run(now(), s.id);
+
+    /* The scratch wav and the JSON both land in the cache root, which is the
+       only place this process may write besides quarantine. Without one there
+       is nowhere to put them, and that is a deployment fact rather than a
+       fault in this snippet — so it goes back to the queue like an unset
+       binary does. */
+    if (!config.cacheRoot) {
+      W.prepare(`UPDATE job SET status = 'approved', claimed_by = NULL, claimed_at = NULL,
+                                error = ?, updated_at = ? WHERE id = ?`)
+        .run('no cache root, so there is nowhere to work', now(), job.id);
+      return;
+    }
+    const stem = join(config.cacheRoot, `whisper-${job.id}`);
+    const wav = `${stem}.wav`;
+    try {
+      /* 16 kHz mono, which is what whisper wants and the only rate it will
+         take without resampling internally. The waveform path already does
+         this at 8 kHz for a different reason; same one line, different rate. */
+      await spawnFor(job.id, s.id, 'ffmpeg',
+        ['-nostdin', '-loglevel', 'error', '-y', '-i', src,
+         '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', wav],
+        10 * 60 * 1000);
+
+      await spawnFor(job.id, s.id, WHISPER.bin,
+        ['-m', WHISPER.model, '-f', wav, '-oj', '-of', stem,
+         '-t', String(WHISPER.threads), '-l', WHISPER.lang,
+         /* No progress spam, and no printing the transcript to stdout twice —
+            the JSON file is the output that matters. */
+         '-np', '-nt'],
+        WHISPER.timeoutMs);
+
+      /* One last look before anything is written. A cancel arriving while
+         whisper was on its final segment loses the race with the kill, and the
+         transcript must not come back afterwards. */
+      if (cancelled.has(job.id)) return;
+
+      const lines = parseWhisper(readFileSync(`${stem}.json`, 'utf8'));
+      const t = now();
+      tx(W, () => {
+        W.prepare('DELETE FROM snippet_line WHERE snippet_id = ?').run(s.id);
+        const ins = W.prepare(
+          `INSERT INTO snippet_line(id, snippet_id, seq, start_s, end_s, speaker, text)
+           VALUES(?,?,?,?,?,NULL,?)`);
+        lines.forEach((l, i) => ins.run(ulid(), s.id, i, l.start_s, l.end_s, l.text));
+        /* `empty` is a real answer and not a failure: a snippet can genuinely
+           have no speech in it, and saying so stops it being re-queued
+           forever by anything that looks for missing transcripts. */
+        W.prepare(`UPDATE snippet SET transcript = ?, transcript_status = ?,
+                                      transcript_model = ?, transcript_note = NULL,
+                                      updated_at = ? WHERE id = ?`)
+          .run(lines.length ? lines.map((l) => l.text).join(' ') : null,
+               lines.length ? 'auto' : 'empty',
+               WHISPER.model.split('/').pop() ?? null, t, s.id);
+      });
+      finishJob(job.id, 'done', null, null);
+      logEvent({ person: { id: null, handle: 'the server', role: 'system' } },
+               'transcribed', 'snippet', s.id,
+               { lines: lines.length, model: WHISPER.model.split('/').pop() ?? null });
+      bumpGeneration(W);
+    } catch (e) {
+      /* Somebody pressed cancel. The endpoint has already said so, on both the
+         job and the snippet, and it said it better than this catch can. */
+      if (cancelled.has(job.id)) { cancelled.delete(job.id); return; }
+      const why = String(e?.message ?? e).slice(0, 500);
+      W.prepare(`UPDATE snippet SET transcript_status = 'failed', transcript_note = ?,
+                                    updated_at = ? WHERE id = ?`).run(why, now(), s.id);
+      finishJob(job.id, 'failed', null, why);
+      bumpGeneration(W);
+    } finally {
+      cancelled.delete(job.id);
+      for (const f of [wav, `${stem}.json`]) {
+        try { rmSync(f, { force: true }); } catch { /* already gone */ }
+      }
+    }
+  }
+
+  /** Sound clips that finished normalizing before waveforms were measured.
+   *
+   *  Bounded, and it does not race the queue: a clip that already has a
+   *  normalize job waiting is skipped, so a restart in the middle of the
+   *  backfill does not double it. Audio re-encodes in a couple of seconds, so
+   *  the cost of being wrong here is small — but the LIMIT is there anyway,
+   *  because "queue one job per row in the archive at boot" is a shape that
+   *  should never be written without one.
+   */
+  const backfillWaveforms = () => {
+    const rows = R.prepare(
+      `SELECT s.id FROM snippet s
+        WHERE s.retracted_at IS NULL
+          AND s.video_codec IS NULL AND s.audio_codec IS NOT NULL
+          AND s.waveform IS NULL
+          AND s.normalize_status = 'done'
+          AND NOT EXISTS (SELECT 1 FROM job j
+                           WHERE j.snippet_id = s.id AND j.kind = 'normalize'
+                             AND j.status IN ('approved', 'claimed'))
+        LIMIT 200`).all();
+    for (const r of rows) {
+      W.prepare("UPDATE snippet SET normalize_status = 'queued' WHERE id = ?").run(r.id);
+      enqueueJob('normalize', { snippetId: r.id });
+    }
+    if (rows.length) bumpGeneration(W);
+    return rows.length;
+  };
+
+  app.startNormalizeWorker = () => {
+    if (!config.cacheRoot) {
+      console.log('  worker      off — no cache root, so there is nowhere to write');
+      return null;
+    }
+    const back = backfillWaveforms();
+    if (back) console.log(`  backfill    ${back} sound clip(s) queued for a waveform`);
+    // unref, so the timer never holds the process open on its own. A test that
+    // builds an app and finishes should exit, not hang for four seconds.
+    const timer = setInterval(() => { workerTick().catch(() => {}); }, NORM.pollMs);
+    timer.unref?.();
+    console.log(`  worker      on — ${NORM.preset} crf${NORM.crf}, ${NORM.threads} threads, `
+      + `ceiling ${NORM.maxW}x${NORM.maxH}`);
+    workerTick().catch(() => {});
+    return timer;
+  };
 
   // -------------------------------------------------------------------------
   // snippets
@@ -1238,6 +3699,64 @@ export function makeApp(config = CONFIG) {
   // writes the initial thousand rows directly, the same way the vault import
   // did.
   // -------------------------------------------------------------------------
+
+  /* ── gates ────────────────────────────────────────────────────────────────
+     A taglet may carry a gate; a person may hold grants. A snippet tagged with
+     a gating taglet is invisible to anyone not holding a grant of that name.
+
+     Enforced HERE and only here, in a pair that must agree: one SQL fragment
+     for the list, one row-level check for the four routes that serve a single
+     clip. That pairing already exists for the pending-upload rule immediately
+     below, and for the same reason — the list and the media route disagreeing
+     is how an id that is absent from every page still hands out bytes to
+     anyone who guesses it.
+
+     Editors and admins bypass. A reviewer cannot approve what they cannot
+     watch, and uploads land in the review queue, so a gate that hid clips from
+     staff would mean granting yourself every audience before you could do
+     review at all. Gates are about audience, not staff trust. */
+  const GRANTS_OF = R.prepare('SELECT name FROM person_grant WHERE person_id = ?');
+  const grantsOf = (id) => (id ? GRANTS_OF.all(id).map((r) => r.name) : []);
+
+  /** The WHERE fragment. Empty string when the viewer may see everything. */
+  const gateSql = (req) => {
+    if (atLeast(req.person, 'editor')) return { sql: '', params: [] };
+    const held = grantsOf(req.person?.id ?? null);
+    /* NOT EXISTS and not a join: a snippet can carry several gating taglets and
+       must clear ALL of them, and a join would return it once per gate it does
+       clear. Written as "has a gating taglet this person cannot open". */
+    const inner = held.length
+      ? `AND t.gate NOT IN (${held.map(() => '?').join(',')})`
+      : '';
+    return {
+      sql: `NOT EXISTS (SELECT 1 FROM snippet_taglet st JOIN tag t ON t.id = st.tag_id
+                         WHERE st.snippet_id = s.id AND t.retracted_at IS NULL
+                           AND t.gate IS NOT NULL ${inner})`,
+      params: held,
+    };
+  };
+
+  const GATES_ON = R.prepare(
+    `SELECT DISTINCT t.gate FROM snippet_taglet st JOIN tag t ON t.id = st.tag_id
+      WHERE st.snippet_id = ? AND t.retracted_at IS NULL AND t.gate IS NOT NULL`);
+
+  /** The same question about one row.
+   *
+   *  Fails CLOSED on a missing id. It is reached through snipVisible(), whose
+   *  callers each run their own SELECT, and one of them did not ask for `id` —
+   *  which threw inside the driver and became a 500. A 500 where every other
+   *  refusal is a 404 is itself a disclosure: it says the row exists. Denying
+   *  is the only safe answer to "I cannot tell", and a route that forgets the
+   *  column now returns a wrong-but-safe 404 instead of a leak.
+   */
+  const gateOk = (id, req) => {
+    if (atLeast(req.person, 'editor')) return true;
+    if (typeof id !== 'string' || !id) return false;
+    const need = GATES_ON.all(id).map((r) => r.gate);
+    if (!need.length) return true;
+    const held = new Set(grantsOf(req.person?.id ?? null));
+    return need.every((g) => held.has(g));
+  };
 
   /* Who may see a snippet, in one place because it is asked in four: the
      list, the detail route, the video route and the poster route. Four
@@ -1250,10 +3769,15 @@ export function makeApp(config = CONFIG) {
      else does" — without it somebody uploads a clip, sees nothing happen, and
      uploads it twice more. */
   const snipVisible = (row, req) =>
-    !!row && (row.status === 'confirmed'
-              || atLeast(req.person, 'editor')
-              || (row.status === 'proposed'
-                  && !!row.author_id && row.author_id === req.person?.id));
+    !!row
+    && (row.status === 'confirmed'
+        || atLeast(req.person, 'editor')
+        || (row.status === 'proposed'
+            && !!row.author_id && row.author_id === req.person?.id))
+    /* Second, and separately: publication says whether it is part of the
+       archive, the gate says who the archive is showing it to. A clip can be
+       published and still not yours to see. */
+    && gateOk(row.id, req);
 
   /* The same rule as a WHERE fragment, so the list cannot disagree with the
      routes that serve what the list linked to. A null `me` collapses it back
@@ -1266,17 +3790,26 @@ export function makeApp(config = CONFIG) {
   const TAGLETS_OF = R.prepare(
     // st.id comes back as link_id because detaching deletes the JUNCTION, not
     // the taglet, and the client would otherwise have no way to name it.
-    `SELECT st.snippet_id, st.id AS link_id, t.id, t.name, t.slug, t.kind
-       FROM snippet_taglet st JOIN taglet t ON t.id = st.taglet_id
+    `SELECT st.snippet_id, st.id AS link_id, t.id, t.name, t.slug, t.kind, t.gate
+       FROM snippet_taglet st JOIN tag t ON t.id = st.tag_id
       WHERE st.snippet_id = ? AND t.retracted_at IS NULL
-      ORDER BY CASE t.kind WHEN 'character' THEN 0 WHEN 'copyright' THEN 1
+      -- Who, then what it belongs to, then what it is, then the rest: the
+      -- reading order of a danbooru sidebar. media sits where copyright did;
+      -- naming a kind that no longer exists silently drops the whole group to
+      -- ELSE and reorders every filename the download route builds.
+      ORDER BY CASE t.kind WHEN 'character' THEN 0 WHEN 'media' THEN 1
                            WHEN 'meta' THEN 2 ELSE 3 END, t.name`);
 
   const LINES_OF = R.prepare(
     `SELECT seq, start_s, end_s, speaker, text FROM snippet_line
       WHERE snippet_id = ? ORDER BY seq`);
 
-  const snipRow = (r, { lines = false, me = null } = {}) => ({
+  const snipRow = (r, { lines = false, me = null } = {}) => (
+    /* Read once and used twice — for the strip itself, and for the filter that
+       decides which suggestions are still outstanding. Wrapped rather than
+       rewritten into a block body so the object below keeps its indentation
+       and this stays a diff about suggestions. */
+    ((attached) => ({
     id: r.id,
     slug: r.slug,
     title: r.title,
@@ -1297,13 +3830,57 @@ export function makeApp(config = CONFIG) {
     source_stream_id: r.source_stream_id,
     source_offset_s: r.source_offset_s,
     has_transcript: !!r.transcript,
+    /* So a row can say "converting" rather than rendering a player over a
+       file that is not finished being written. The note rides along because
+       when this is `failed` the reason is the only useful thing on the row. */
+    normalize_status: r.normalize_status ?? 'none',
+    normalize_note: r.normalize_note ?? null,
+    /* Straight from the probe at upload, not guessed from a missing width —
+       plenty of imported rows have no dimensions recorded and are perfectly
+       ordinary video. The page needs this to draw a waveform strip and a
+       label rather than a 16:9 box with nothing in it. */
+    audio_only: !r.video_codec && !!r.audio_codec,
+    /* The ORIGINAL container, which normalize never rewrites — a gif that has
+       been converted to H.264 for playback is still a gif on disk, and both
+       the label and the download depend on knowing that. */
+    is_gif: /gif/i.test(String(r.container ?? '')),
+    /* A clip that came from a link, and how that is going. `fetch_status` is
+       what stops the page drawing a player over a row whose bytes have not
+       been downloaded yet. */
+    source_url: r.source_url ?? null,
+    fetch_status: r.fetch_status ?? 'none',
+    fetch_note: r.fetch_note ?? null,
+    /* 480 base64'd bytes, and only ever on a sound clip. The page draws its
+       own scrubber from this — a still image with transport controls painted
+       over it was what made an audio row read as a broken video. */
+    waveform: r.waveform ?? null,
     transcript_status: r.transcript_status,
     transcript_model: r.transcript_model ?? null,
     transcript_note: r.transcript_note ?? null,
-    taglets: TAGLETS_OF.all(r.id).map((t) => ({
-      id: t.id, link_id: t.link_id, name: t.name, slug: t.slug, kind: t.kind })),
+    taglets: attached.map((t) => ({
+      id: t.id, link_id: t.link_id, name: t.name, slug: t.slug, kind: t.kind,
+      /* Only ever non-null on a row the reader already cleared, so it marks
+         who else can see this rather than advertising something withheld. */
+      gate: t.gate ?? null })),
+    /* Names the submitter asked for that the archive does not have. Shown to
+       them and to reviewers, and to nobody else — they are not vocabulary, so
+       they must not read as tags on a published clip.
+
+       A suggestion the clip has since been GIVEN is dropped here rather than
+       deleted when it is granted. Derived, so it cannot desync: an editor who
+       attaches Selen Tatsuki through the picker, the queue, or a changeset
+       somebody else wrote all retire the request by the same rule, and no
+       code path has to remember to. The column keeps the record of what was
+       asked for; this is the part that is still a question. */
+    taglet_suggestions: (() => {
+      let raw = [];
+      try { raw = r.taglet_suggestions ? JSON.parse(r.taglet_suggestions) : []; }
+      catch { return []; }
+      const have = new Set(attached.map((t) => t.slug));
+      return raw.filter((x) => !have.has(slugify(String(x ?? ''))));
+    })(),
     ...(lines ? { lines: LINES_OF.all(r.id) } : {}),
-  });
+  }))(TAGLETS_OF.all(r.id)));
 
   app.get('/api/snippets', (req, res) => {
     const { q = '', taglet, kind, scope = 'all', include = '' } = req.query;
@@ -1354,7 +3931,13 @@ export function makeApp(config = CONFIG) {
     /* `me` and not just `mayReview`: visibility now varies per PERSON, so a
        role-keyed validator would serve one submitter's pending clip to the
        next one out of cache. The gate would be correct and bypassed. */
-    const etag = etagFor('snips', q, tagAll, tagAny, tagNot, kind, scope, limit,
+    /* Part of the cache key, exactly like `me` above it. Two people with the
+       same id cannot exist, so `me` would in principle be enough — except for
+       the anonymous case, where everyone shares one validator and the held set
+       is empty. Listed explicitly so the reason is on the page rather than in
+       someone's head. */
+    const myGrants = atLeast(req.person, 'editor') ? ['*'] : grantsOf(me).sort();
+    const etag = etagFor('snips', q, tagAll, tagAny, tagNot, kind, scope, limit, myGrants,
                          before, wantLines, req.query.transcript, wantStatus,
                          mayReview, me);
     if (fresh(req, res, etag, { personal: !!me })) return res.status(304).end();
@@ -1368,6 +3951,14 @@ export function makeApp(config = CONFIG) {
       const v = snipVisibleSql(me);
       where.push(v.sql);
       params.push(...v.params);
+    }
+    /* Applied even when an editor asked for a review status, because it is a
+       no-op for them — gateSql returns nothing for anyone who bypasses. Kept
+       outside the else so nobody later adds a status filter that quietly
+       skips the gate. */
+    {
+      const g = gateSql(req);
+      if (g.sql) { where.push(g.sql); params.push(...g.params); }
     }
 
     /* Two search modes, and the default is now the WIDE one.
@@ -1391,7 +3982,7 @@ export function makeApp(config = CONFIG) {
     if (q) {
       const like = `%${String(q).trim().toLowerCase()}%`;
       const clauses = [
-        `EXISTS (SELECT 1 FROM snippet_taglet st JOIN taglet t ON t.id = st.taglet_id
+        `EXISTS (SELECT 1 FROM snippet_taglet st JOIN tag t ON t.id = st.tag_id
                   WHERE st.snippet_id = s.id AND t.retracted_at IS NULL
                     AND (lower(t.name) LIKE ? OR t.slug LIKE ?))`,
         `lower(s.title) LIKE ?`,
@@ -1415,7 +4006,7 @@ export function makeApp(config = CONFIG) {
        so a single clause with an IN list would quietly mean OR. The OR group
        IS that single clause, which is why it gets one. */
     const HAS = (test) =>
-      `SELECT 1 FROM snippet_taglet st JOIN taglet t ON t.id = st.taglet_id
+      `SELECT 1 FROM snippet_taglet st JOIN tag t ON t.id = st.tag_id
         WHERE st.snippet_id = s.id AND t.retracted_at IS NULL AND ${test}`;
     for (const slug of tagAll) {
       where.push(`EXISTS (${HAS('t.slug = ?')})`);
@@ -1430,7 +4021,7 @@ export function makeApp(config = CONFIG) {
       params.push(...tagAny);
     }
     if (kind) {
-      where.push(`EXISTS (SELECT 1 FROM snippet_taglet st JOIN taglet t ON t.id = st.taglet_id
+      where.push(`EXISTS (SELECT 1 FROM snippet_taglet st JOIN tag t ON t.id = st.tag_id
                            WHERE st.snippet_id = s.id AND t.kind = ? AND t.retracted_at IS NULL)`);
       params.push(String(kind));
     }
@@ -1544,6 +4135,7 @@ export function makeApp(config = CONFIG) {
         return flat;
       });
       if (out === null) return res.status(404).json({ error: 'no such line' });
+      logTranscript(req, s.id);
       bumpGeneration(W);
       res.json({ ok: true, seq, text });
     } catch (e) { return changeError(res, e); }
@@ -1627,6 +4219,10 @@ export function makeApp(config = CONFIG) {
             WHERE id = ?`)
           .run(lines.length ? lines.map((l) => l.text).join(' ') : null, now(), s.id);
       });
+      /* Its own verb. Replacing the whole transcript — timings and all — is
+         not the same act as fixing a word, and the two should not fold into
+         one another's window. */
+      logTranscript(req, s.id, 'rewrote the transcript');
       bumpGeneration(W);
       res.json({ ok: true, lines: lines.length });
     } catch (e) { return changeError(res, e); }
@@ -1674,19 +4270,295 @@ export function makeApp(config = CONFIG) {
           base_value: r.status,
         })),
       });
+      /* Approving a clip that is still in quarantine asks the Pi to file the
+         MASTER into the media tree. Note what this is not: it is not what
+         makes the clip playable. The normalized copy in the cache already
+         does that, so the site is correct the moment an editor says yes and
+         stays correct if the recorder is off for a week — promote is
+         archival, and it is the only step in the whole pipeline that moves a
+         file, which is why it is the only step the server does not do.
+
+         Skipped for anything already in the media tree: re-filing an imported
+         clip would be a rename of something that is already where it goes. */
+      let promoted = 0;
+      let queued = 0;
+      if (want === 'confirmed') {
+        for (const r of move) {
+          const q = R.prepare(
+            `SELECT quarantine_path, video_path, transcript_status, audio_codec
+               FROM snippet WHERE id = ?`).get(r.id);
+          if (q?.quarantine_path) {
+            /* Both names, both relative, neither a directory: `from` is the
+               bare filename the accept endpoint minted in quarantine and `to`
+               is the same file as the media tree will refer to it. The
+               recorder joins each to its own root and refuses anything that
+               does not stay inside them — the archive naming a path it does
+               not itself hold a write handle for is a record, not an order.
+
+               Taken now rather than looked up later on purpose: neither
+               column moves after accept, and a job that carries its own facts
+               cannot be made wrong by an edit made while it sat in the queue. */
+            enqueueJob('promote', { snippetId: r.id, by: req.person.id,
+                                    payload: { from: q.quarantine_path,
+                                               to: q.video_path } });
+            promoted++;
+          }
+          /* Transcription happens AFTER approval, which is the whole reason a
+             slow box is acceptable: nothing is spent on a snippet somebody is
+             about to reject, and nobody is waiting on the result.
+
+             `none` is the column's word for "a machine should write one" —
+             set by the auto-transcribe checkbox at upload. An `edited` or
+             `auto` transcript is left alone; something with no audio track at
+             all is not worth a queue slot. */
+          if (q?.transcript_status === 'none' && q?.audio_codec
+              && !R.prepare(`SELECT 1 FROM job WHERE snippet_id = ? AND kind = 'transcribe'
+                              AND status IN ('approved','claimed','paused')`).get(r.id)) {
+            enqueueJob('transcribe', { snippetId: r.id, by: req.person.id });
+            queued++;
+          }
+        }
+      }
+      logChangeset(req, out?.status === 'applied' ? out.id : null);
       res.json({ changed: move.length, skipped: have.length - move.length,
-                 missing: list.length - have.length, changeset: out.id ?? null });
+                 missing: list.length - have.length, changeset: out.id ?? null,
+                 promoted, transcribing: queued });
     } catch (e) { return changeError(res, e); }
+  });
+
+  // -------------------------------------------------------------------------
+  // suggestions — names waiting to become vocabulary
+  //
+  // What is NOT here is minting. A suggestion becomes a taglet through the
+  // taglet picker and the changeset system, exactly like every other taglet:
+  // slug derived from the name, provenance stamped by the applier, and a
+  // same-slug collision resolved to the row that already exists rather than
+  // failing. A canonize endpoint would be a second implementation of all
+  // three, and the second one is always the one that drifts.
+  //
+  // So the archive only needs to answer two questions here: what is waiting,
+  // and this one never will be.
+  // -------------------------------------------------------------------------
+
+  /** Every suggestion nobody has acted on, grouped by the slug it would get.
+   *
+   *  Grouped, because the same name arrives from several people on several
+   *  clips and canonizing it five times is how five spellings of it end up in
+   *  the vocabulary. The group is the unit of work.
+   */
+  app.get('/api/suggestions', requireRole('editor'), (req, res) => {
+    /* Checked before the work rather than after it. The queue is polled every
+       time an editor comes back to the tab and the answer only changes when
+       something in the archive does, so a 304 here should cost a generation
+       read and nothing else. `personal`, because this is editor-only and a
+       shared cache has no business holding it. */
+    const etag = etagFor('sugg', generation());
+    if (fresh(req, res, etag, { personal: true })) return res.status(304).end();
+
+    /* One query rather than a per-row TAGLETS_OF: the honoured-suggestion
+       filter needs each clip's attached slugs, and asking for them a clip at
+       a time is how a queue over a few hundred rows becomes a few hundred
+       queries. */
+    const rows = R.prepare(
+      `SELECT s.id, s.title, s.status, s.taglet_suggestions,
+              (SELECT group_concat(t.slug, char(10))
+                 FROM snippet_taglet st JOIN tag t ON t.id = st.tag_id
+                WHERE st.snippet_id = s.id AND t.retracted_at IS NULL) AS have
+         FROM snippet s
+        WHERE s.taglet_suggestions IS NOT NULL AND s.retracted_at IS NULL`).all();
+
+    const groups = new Map();
+    for (const r of rows) {
+      let names = [];
+      try { names = JSON.parse(r.taglet_suggestions) ?? []; } catch { continue; }
+      const have = new Set(String(r.have ?? '').split('\n').filter(Boolean));
+      for (const raw of names) {
+        const name = String(raw ?? '').trim();
+        if (!name) continue;
+        const slug = slugify(name);
+        /* Already granted, by whatever route. The clip has the taglet, so the
+           suggestion is answered and does not belong in a queue of work. */
+        if (have.has(slug)) continue;
+        let g = groups.get(slug);
+        if (!g) {
+          g = { slug, variants: new Map(), clips: [], total: 0 };
+          groups.set(slug, g);
+        }
+        g.variants.set(name, (g.variants.get(name) ?? 0) + 1);
+        g.total++;
+        /* The LIST is capped and the COUNT is not. A name on four hundred
+           clips does not become more useful for listing all four hundred, and
+           a changeset is capped at 500 changes — but "5 clips" has to be true,
+           so the number and the sample are counted separately. Above the cap
+           the queue offers the sample and says so; the rest come back on the
+           next pass, by which point the taglet exists and the group is an
+           attach rather than a mint. */
+        if (g.clips.length < 50) {
+          g.clips.push({ id: r.id, title: r.title, status: r.status });
+        }
+      }
+    }
+
+    /* The whole vocabulary, once — and whole now means whole. It used to be
+       narrowed to the snippet kinds, which meant a clip whose text matched a
+       `type` or `elements` tag was reported as having no match at all rather
+       than as matching that one. It is a few hundred short rows, every group
+       has to be compared against all of it, and fifty queries that each scan
+       the same small table is the slower way to write that. */
+    const vocab = R.prepare(
+      `SELECT id, name, slug, kind FROM tag WHERE retracted_at IS NULL`).all();
+    const bySlug = new Map(vocab.map((t) => [t.slug, t]));
+
+    /** Levenshtein, asked only "is it within max" and answered lazily.
+     *
+     *  The length check rejects almost every pair before any work happens, and
+     *  the per-row floor bails as soon as every path through the matrix is
+     *  already too far — which for max 2 is nearly always by the third row.
+     */
+    const within = (a, b, max) => {
+      if (Math.abs(a.length - b.length) > max) return false;
+      if (a.length > 40 || b.length > 40) return false;
+      let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+      for (let i = 1; i <= a.length; i++) {
+        const cur = [i];
+        let best = i;
+        for (let j = 1; j <= b.length; j++) {
+          cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1,
+                            prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+          if (cur[j] < best) best = cur[j];
+        }
+        if (best > max) return false;
+        prev = cur;
+      }
+      return prev[b.length] <= max;
+    };
+
+    /** Vocabulary this name might have meant.
+     *
+     *  Two different mistakes, so two different tests, and neither one finds
+     *  the other's.
+     *
+     *  CONTAINMENT is the partial name — `selen` when `selen-tatsuki` was
+     *  meant, or somebody typing the full name onto a clip tagged with the
+     *  short one. Floored at four characters, because a two-letter taglet is
+     *  contained in half the vocabulary and would be offered against
+     *  everything.
+     *
+     *  EDIT DISTANCE is the typo, which containment can never catch: `shork`
+     *  and `shark` share no substring worth matching on and are one character
+     *  apart. A duplicate taglet born from a single mistyped letter is the
+     *  exact thing this queue exists to stop, so it is worth the pass.
+     */
+    const nearTo = (slug) => {
+      const out = [];
+      for (const t of vocab) {
+        if (t.slug === slug) continue;
+        const shorter = Math.min(t.slug.length, slug.length);
+        const contains = shorter >= 4
+          && (t.slug.includes(slug) || slug.includes(t.slug));
+        if (contains || within(slug, t.slug, slug.length <= 5 ? 1 : 2)) out.push(t);
+        if (out.length === 5) break;
+      }
+      return out;
+    };
+
+    const out = [...groups.values()]
+      .map((g) => ({
+        slug: g.slug,
+        /* The most-suggested spelling wins the label, because it is the one
+           most people meant — and on a tie the first one in, which is stable
+           because Map keeps insertion order. The rest ride along so an editor
+           can see that "Selen Tatsuki" and "selen tatsuki" were one request
+           rather than two. */
+        name: [...g.variants.entries()].sort((a, b) => b[1] - a[1])[0][0],
+        variants: [...g.variants.keys()],
+        count: g.total,
+        clips: g.clips,
+        exact: bySlug.get(g.slug) ?? null,
+        near: nearTo(g.slug),
+      }))
+      // Most-asked-for first: the name five people wanted is the one worth
+      // deciding about, and the singleton typo can wait at the bottom.
+      .sort((a, b) => b.count - a.count || a.slug.localeCompare(b.slug));
+
+    res.json({ suggestions: out, count: out.length });
+  });
+
+  /** This name is never going to be vocabulary.
+   *
+   *  The one case the read-time filter cannot cover. A suggestion that gets
+   *  honoured disappears on its own, because the clip then has the taglet it
+   *  asked for; a typo is answered by nothing ever being attached, so it needs
+   *  somebody to say so.
+   *
+   *  Not a changeset. `taglet_suggestions` is a scratch field between upload
+   *  and review, not a curated one, and "who deleted the word funy" is not
+   *  history anybody will ever want.
+   */
+  app.post('/api/suggestions/dismiss', requireRole('editor'), (req, res) => {
+    const name = String(req.body?.name ?? '').trim();
+    if (!name) return res.status(400).json({ error: 'name is required' });
+    const slug = slugify(name);
+    const only = req.body?.snippet_id ? String(req.body.snippet_id) : null;
+
+    const rows = only
+      ? R.prepare(`SELECT id, taglet_suggestions FROM snippet
+                    WHERE id = ? AND taglet_suggestions IS NOT NULL
+                      AND retracted_at IS NULL`).all(only)
+      : R.prepare(`SELECT id, taglet_suggestions FROM snippet
+                    WHERE taglet_suggestions IS NOT NULL
+                      AND retracted_at IS NULL`).all();
+
+    const t = now();
+    let touched = 0;
+    /* Matched by SLUG, not by string. The same request arrives as "Selen
+       Tatsuki", "selen tatsuki" and "Selen  Tatsuki"; dismissing one spelling
+       and leaving the others is not dismissing anything. */
+    tx(W, () => {
+      const upd = W.prepare(
+        'UPDATE snippet SET taglet_suggestions = ?, updated_at = ? WHERE id = ?');
+      for (const r of rows) {
+        let names = [];
+        try { names = JSON.parse(r.taglet_suggestions) ?? []; } catch { continue; }
+        const kept = names.filter((x) => slugify(String(x ?? '')) !== slug);
+        if (kept.length === names.length) continue;
+        upd.run(kept.length ? JSON.stringify(kept) : null, t, r.id);
+        touched++;
+      }
+    });
+    if (touched) bumpGeneration(W);
+    res.json({ ok: true, dismissed: touched, slug });
   });
 
   app.get('/api/taglets', (req, res) => {
     const { q = '', kind } = req.query;
     const limit = Math.min(Math.max(Number(req.query.limit ?? 500) || 500, 1), 2000);
-    const etag = etagFor('taglets', q, kind, limit);
-    if (fresh(req, res, etag)) return res.status(304).end();
+    /* Per-person, because the answer is: a gating taglet is absent for anyone
+       who cannot open it, so one shared validator would hand the full
+       vocabulary to whoever asked next. Same reasoning as the snippet list. */
+    const mayAll = atLeast(req.person, 'editor');
+    const held = mayAll ? ['*'] : grantsOf(req.person?.id ?? null).sort();
+    const etag = etagFor('taglets', q, kind, limit, held);
+    if (fresh(req, res, etag, { personal: !!req.person?.id })) return res.status(304).end();
 
+    /* One vocabulary. This used to serve only the snippet half of it, on the
+       grounds that `type` and `elements` describe a broadcast rather than a
+       clip — true, and not worth a second list to enforce. A clip of the intro
+       tagged Intro is a reasonable thing for an editor to want. */
     const where = ['t.retracted_at IS NULL'];
     const params = [];
+    /* A gating taglet is invisible to anyone it gates. Leaving it in leaks the
+       size of the restricted set through `uses`, and offers a filter that
+       silently returns nothing — the clips behind it are already excluded by
+       the snippet list's own gate. */
+    if (!mayAll) {
+      if (held.length) {
+        where.push(`(t.gate IS NULL OR t.gate IN (${held.map(() => '?').join(',')}))`);
+        params.push(...held);
+      } else {
+        where.push('t.gate IS NULL');
+      }
+    }
     if (q) {
       where.push('(lower(t.name) LIKE ? OR t.slug LIKE ?)');
       const like = `%${String(q).trim().toLowerCase()}%`;
@@ -1697,10 +4569,10 @@ export function makeApp(config = CONFIG) {
     // Count comes back with the row because the picker is useless without it:
     // "funny (214)" and "funny (1)" are different suggestions.
     res.json({ taglets: R.prepare(
-      `SELECT t.id, t.name, t.slug, t.kind, t.status, t.summary,
+      `SELECT t.id, t.name, t.slug, t.kind, t.status, t.summary, t.gate,
               (SELECT count(*) FROM snippet_taglet st JOIN snippet s ON s.id = st.snippet_id
-                WHERE st.taglet_id = t.id AND s.retracted_at IS NULL) AS uses
-         FROM taglet t WHERE ${where.join(' AND ')}
+                WHERE st.tag_id = t.id AND s.retracted_at IS NULL) AS uses
+         FROM tag t WHERE ${where.join(' AND ')}
         ORDER BY uses DESC, t.name LIMIT ?`).all(...params, limit) });
   });
 
@@ -1875,7 +4747,9 @@ export function makeApp(config = CONFIG) {
     if (!W.prepare('SELECT 1 FROM person WHERE id = ?').get(req.params.id)) {
       return res.status(404).json({ error: 'no such person' });
     }
+    const was = R.prepare('SELECT role FROM person WHERE id = ?').get(req.params.id)?.role;
     W.prepare('UPDATE person SET role = ? WHERE id = ?').run(role, req.params.id);
+    logEvent(req, 'changed a role', 'person', req.params.id, { from: was, to: role });
     res.json({ id: req.params.id, role });
   });
 
@@ -1895,15 +4769,80 @@ export function makeApp(config = CONFIG) {
   // resolveMedia() so both routes and statMedia() get it; see the note there.
   // -------------------------------------------------------------------------
 
+  /* `.gif` joins the images for the chat emote tree, and belongs on this list
+     for the same reason the others do: it is a picture format no browser
+     executes. The renderer asks for the .png beside it, so this is for the day
+     it wants the animation — and for the directory not being half-servable in
+     the meantime, which is the kind of gap somebody debugs twice. */
   const MIME = { '.mp4': 'video/mp4', '.webm': 'video/webm', '.mkv': 'video/x-matroska',
                  '.m4a': 'audio/mp4', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
-                 '.png': 'image/png', '.webp': 'image/webp' };
+                 '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif' };
 
   /* `type` overrides the extension table when the caller knows better — which
      for snippets it does, because the row records the codecs the file actually
      holds and the extension is only a claim. `root` likewise: a remuxed clip
      lives under the cache root, not the media root. */
-  function sendMedia(req, res, rel, { type = null, root = null } = {}) {
+  /** What a downloaded clip should be called.
+   *
+   *      Kaneko-Lumi_Nitya-Nil_Stop jorking your peanits.mp4
+   *
+   *  Tags first, hyphenated and underscore-joined, then the title. The tags
+   *  come first because they are what makes the name sortable and greppable in
+   *  a folder of two hundred clips; the title is the part a human reads.
+   *
+   *  Built on the SERVER rather than in the page, so a right-click "save as"
+   *  on the download link gets the same name as the button — and so the page
+   *  does not have to fetch a 40 MB file into a blob just to rename it, which
+   *  is the usual client-side way to do this and costs the whole file twice.
+   *
+   *  Truncated at a word boundary. The obvious version cuts mid-word and
+   *  leaves "...jorking your peanits around l", which reads like a corrupted
+   *  filename rather than a shortened one.
+   */
+  const dlName = (row, taglets, ext) => {
+    // Everything Windows, macOS and Linux disagree about, plus control chars.
+    const clean = (v) => String(v ?? '')
+      .replace(/[\u0000-\u001f<>:"/\\|?*]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const tags = taglets.map((t) => clean(t.name).replace(/ /g, '-'))
+      .filter(Boolean).slice(0, 6);
+    const title = clean(row.title) || 'clip';
+
+    const ROOM = 120 - ext.length;
+
+    /* The tags are trimmed FIRST, by dropping whole ones off the end. Six long
+       character names can fill the budget on their own, and the alternative is
+       a filename that is all tags and two words of title — or, with a blunt
+       slice at the end, a tag cut in half. A dropped tag is still a legible
+       name; "Kaneko-Lu" is not. */
+    const TAGROOM = Math.floor(ROOM * 0.55);
+    let kept = tags;
+    while (kept.length > 1 && kept.join('_').length + 1 > TAGROOM) kept = kept.slice(0, -1);
+    let prefix = kept.length ? `${kept.join('_')}_` : '';
+    if (prefix.length > TAGROOM) prefix = '';   // one tag, longer than the budget
+
+    let name = prefix + title;
+    if (name.length > ROOM) {
+      const room = ROOM - prefix.length;
+      const cut = title.slice(0, room);
+      // Back up to the last space, unless that would leave almost nothing.
+      const sp = cut.lastIndexOf(' ');
+      name = prefix + (sp > room * 0.5 ? cut.slice(0, sp) : cut).trim();
+    }
+    return name + ext;
+  };
+
+  /* Both forms, because neither alone is enough. `filename=` is ASCII-only and
+     every browser understands it; `filename*=` carries the UTF-8 and newer
+     browsers prefer it. A title with a Japanese word in it — which in this
+     archive is most of them — needs the second and must not break the first. */
+  const disposition = (name) => {
+    const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/"/g, "'");
+    return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+  };
+
+  function sendMedia(req, res, rel, { type = null, root = null, filename = null } = {}) {
     const from = root ?? config.mediaRoot;
     if (!from) {
       return res.status(503).json({ error: 'no media root — set TENMA_MEDIA_ROOT' });
@@ -1919,6 +4858,7 @@ export function makeApp(config = CONFIG) {
        is ever removed. */
     res.set('X-Content-Type-Options', 'nosniff');
     res.type(type ?? MIME[extname(path).toLowerCase()] ?? 'application/octet-stream');
+    if (filename) res.set('Content-Disposition', disposition(filename));
     return res.sendFile(path, { acceptRanges: true, cacheControl: true, maxAge: '1h' });
   }
 
@@ -1929,6 +4869,121 @@ export function makeApp(config = CONFIG) {
   });
 
   app.get('/media/thumb/:rest(*)', (req, res) => sendMedia(req, res, req.params.rest));
+
+  /* The merged chat, by stream id.
+   *
+   * `.json` is deliberately NOT in the MIME table above, so this cannot go
+   * through sendMedia and should not: what makes the path-taking thumb route
+   * safe is that every type it can serve is one a browser will not execute,
+   * and JSON on your own origin is not that. So chat is addressed the way
+   * video and snippets are — by id, with the row holding the only path anyone
+   * gets to name — and never by a path off the URL.
+   *
+   * Ungated, matching /media/video: the VODs are open and the chat is the same
+   * broadcast. When a VOD gate arrives this is where chat joins it, and
+   * /media/snippet is the pattern to copy — the lesson there was that gating
+   * the metadata and leaving the bytes open is not gating.
+   */
+  /* What pictures the chat assets tree actually holds.
+   *
+   * ls_assets writes an index beside each tree recording everything it has
+   * fetched — the file, whether an animated twin came with it, and what came
+   * back 404. Without it the page has to find out by asking: one request per
+   * distinct emote per stream, most of them 404s, and a visible flicker while
+   * an emote that was never fetched renders as a broken image before falling
+   * back to its own name.
+   *
+   * Small, static, and the same answer for the whole archive, so it is read
+   * whole and cached. Re-read when either file's mtime moves, which is the
+   * only thing that changes it.
+   */
+  const CHAT_ASSET_MAX = 8 * 1024 * 1024;
+  let chatAssets = null;      // { at: [mtimeMs, mtimeMs], body: string }
+
+  const chatAssetIndex = (tree) => {
+    const p = resolveMedia(config.mediaRoot, `${tree}/index.json`);
+    if (!p) return [0, {}];
+    try {
+      const st = statSync(p);
+      if (st.size > CHAT_ASSET_MAX) return [st.mtimeMs, {}];
+      const got = JSON.parse(readFileSync(p, 'utf8'));
+      return [st.mtimeMs, (got && got.entries) || {}];
+    } catch {
+      // A half-written or hand-edited index is a slower page, not a broken
+      // one: everything falls back to asking for the .png.
+      return [0, {}];
+    }
+  };
+
+  app.get('/media/chat-assets', (req, res) => {
+    if (!config.mediaRoot) {
+      return res.status(503).json({ error: 'no media root — set TENMA_MEDIA_ROOT' });
+    }
+    const [em, emotes] = chatAssetIndex('emotes');
+    const [bm, badges] = chatAssetIndex('badges');
+    if (!chatAssets || chatAssets.at[0] !== em || chatAssets.at[1] !== bm) {
+      chatAssets = { at: [em, bm], body: JSON.stringify({ emotes, badges }) };
+    }
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.set('Cache-Control', 'public, max-age=300');
+    res.type('application/json; charset=utf-8');
+    return res.send(chatAssets.body);
+  });
+
+  app.get('/media/chat/:stream_id', (req, res) => {
+    const s = R.prepare(
+      'SELECT chat_path FROM stream WHERE id = ? AND retracted_at IS NULL')
+      .get(req.params.stream_id);
+    if (!s?.chat_path) return res.status(404).json({ error: 'no chat for this stream' });
+    if (!config.mediaRoot) {
+      return res.status(503).json({ error: 'no media root — set TENMA_MEDIA_ROOT' });
+    }
+    const stored = resolveMedia(config.mediaRoot, s.chat_path);
+    if (!stored) return res.status(404).json({ error: 'not on disk' });
+
+    const ae = String(req.headers['accept-encoding'] ?? '');
+    // `gzip;q=0` is the spelling for "I could, but do not send it". Nothing
+    // real says it, and honouring it costs one more test.
+    const wantsGz = /(^|,)\s*gzip\s*(;|,|$)/.test(ae)
+                    && !/gzip\s*;\s*q=0(\.0*)?(\s|,|$)/.test(ae);
+
+    /* Two spellings, both real. ls-audit writes the merged chat compressed and
+       only compressed now — it is the most compressible file in the archive
+       and nothing in this stack compresses — but every entry merged before
+       that is a plain .json with a .gz written beside it. So: serve whichever
+       the row points at, reach for the twin when there is one, and gunzip on
+       the way out for the rare client that cannot take it. Keeping a plain
+       copy on disk purely for that client would be eight times the bytes for
+       something no browser has asked for in twenty years. */
+    const packed = s.chat_path.endsWith('.gz');
+    const twin = !packed && wantsGz
+      ? resolveMedia(config.mediaRoot, s.chat_path + '.gz') : null;
+
+    // Without this a shared cache can hand the compressed bytes to a client
+    // that just said it cannot read them.
+    res.set('Vary', 'Accept-Encoding');
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.type('application/json; charset=utf-8');
+    // Nothing seeks a chat log, and half a gzip stream is not JSON.
+    res.set('Accept-Ranges', 'none');
+
+    if (packed && !wantsGz) {
+      // Streamed through gunzip rather than read into memory: a merged chat is
+      // a megabyte and this is the path nobody takes.
+      res.set('Cache-Control', 'public, max-age=3600');
+      const gunzip = createGunzip();
+      const src = createReadStream(stored);
+      src.on('error', () => res.destroy());
+      gunzip.on('error', () => res.destroy());
+      return src.pipe(gunzip).pipe(res);
+    }
+    // Set here rather than through sendFile's `headers` option: send() writes
+    // Content-Length from the file it is actually streaming, which for the
+    // .gz is the encoded length, and that is the pair that has to agree.
+    if (packed || twin) res.set('Content-Encoding', 'gzip');
+    return res.sendFile(twin ?? stored,
+                        { acceptRanges: false, cacheControl: true, maxAge: '1h' });
+  });
 
   // By id, never by path. The client is given `/media/snippet/<id>` and the row
   // holds the only path anyone gets to name — the same shape as /media/video,
@@ -1943,19 +4998,76 @@ export function makeApp(config = CONFIG) {
      But "rejected" is a promise about what the archive serves, and a promise
      kept by the metadata and broken by the media is not kept. */
   app.get('/media/snippet/:id', (req, res) => {
-    const s = R.prepare(`SELECT video_path, play_path, container, video_codec, audio_codec,
-                                status, author_id
+    const s = R.prepare(`SELECT id, title, video_path, play_path, quarantine_path,
+                                container, video_codec, audio_codec, status, author_id,
+                                normalize_status, fetch_status
                            FROM snippet WHERE id = ? AND retracted_at IS NULL`).get(req.params.id);
     if (!snipVisible(s, req)) return res.status(404).json({ error: 'no such snippet' });
     if (!s?.video_path) return res.status(404).json({ error: 'no such snippet' });
 
-    /* A remuxed copy wins when one exists: the original is a file no browser
-       will decode, so serving it is a blank player and a console error rather
-       than an honest failure. It lives under the cache root because the media
-       root is read-only and holds the masters. */
+    /* ?dl=1 — the same bytes, offered as a file with a name on it.
+       Handled before the play-path preference below because the answer to
+       "which file" is different: what you WATCH is the normalized copy, and
+       what you SAVE is usually that too, except for a GIF. A gif is converted
+       to H.264 so it can be played at all, and downloading the mp4 of a gif is
+       not what anybody wanting the gif meant — so for those the original is
+       what comes back. */
+    if (req.query.dl) {
+      const isGif = /gif/i.test(String(s.container ?? ''));
+      const src = isGif || !s.play_path
+        ? (s.quarantine_path
+            ? { rel: s.quarantine_path, root: config.quarantineRoot }
+            : { rel: s.video_path, root: config.mediaRoot })
+        : { rel: s.play_path, root: config.cacheRoot };
+      if (!src.rel || !src.root) return res.status(404).json({ error: 'not on disk' });
+      const taglets = TAGLETS_OF.all(s.id);
+      const name = dlName(s, taglets, extname(src.rel).toLowerCase() || '.mp4');
+      return sendMedia(req, res, src.rel, { root: src.root, filename: name });
+    }
+
+    /* A normalized copy wins over EVERYTHING, including a clip still sitting
+       in quarantine. This block used to come second and that was a real bug
+       the moment the worker existed: a VP9 upload would have a perfectly good
+       H.264 copy in the cache and be handed the original anyway, so the one
+       person who has to watch it before it goes anywhere got a 415.
+
+       It lives under the cache root because the media root is read-only and
+       holds the masters — which is also what lets the server do the
+       conversion at all. */
     if (s.play_path && config.cacheRoot) {
-      const t = extname(s.play_path).toLowerCase() === '.webm' ? 'video/webm' : 'video/mp4';
+      const e = extname(s.play_path).toLowerCase();
+      const t = e === '.webm' ? 'video/webm' : e === '.m4a' ? 'audio/mp4' : 'video/mp4';
       return sendMedia(req, res, s.play_path, { type: t, root: config.cacheRoot });
+    }
+
+    /* Nothing has been downloaded yet. Without this the fallthrough below
+       resolves video_path to a file that does not exist and answers "not on
+       disk", which is true and unhelpful — the clip is not missing, it has
+       not arrived. */
+    if (s.fetch_status === 'queued' || s.fetch_status === 'running') {
+      return res.status(415).json({
+        error: 'waiting for the recorder to fetch this one',
+        fetch_status: s.fetch_status });
+    }
+
+    /* No normalized copy, so it is either conformant already or still
+       converting. Either way the bytes are wherever the row says: quarantine
+       while it waits for a human, the media tree once the Pi has filed it.
+       The visibility check above already decided whether this person may look. */
+    if (s.quarantine_path && config.quarantineRoot) {
+      const qt = servedType(s.container, s.video_codec, s.audio_codec);
+      if (!qt) {
+        /* Honest, and specific about which of the two it is. "Come back in a
+           minute" and "this will never play" are different answers and the
+           uploader can act on exactly one of them. */
+        return res.status(415).json({
+          error: s.normalize_status === 'running' || s.normalize_status === 'queued'
+            ? 'still converting — try again in a moment'
+            : `not playable as uploaded: ${s.video_codec}/${s.audio_codec} in ${s.container}`,
+          normalize_status: s.normalize_status ?? null,
+        });
+      }
+      return sendMedia(req, res, s.quarantine_path, { type: qt, root: config.quarantineRoot });
     }
 
     /* Content-Type from the CODECS, not the extension. `.webm` holding H.264
@@ -1987,7 +5099,9 @@ export function makeApp(config = CONFIG) {
      already have opened. */
   app.get('/media/snippet-poster/:id', (req, res) => {
     const s = R.prepare(
-      `SELECT poster_path, status, author_id FROM snippet
+      // `id` is not decoration: snipVisible() asks the gate about this row by
+      // id, and without it the check cannot run.
+      `SELECT id, poster_path, status, author_id FROM snippet
           WHERE id = ? AND retracted_at IS NULL`)
       .get(req.params.id);
     // A still is a frame of the thing, so it is gated with the thing.
@@ -2016,6 +5130,17 @@ export function makeApp(config = CONFIG) {
   const BROWSE_KINDS = {
     video: new Set(['.mp4', '.mkv', '.webm', '.ts', '.flv', '.mov', '.m4v']),
     image: new Set(['.jpg', '.jpeg', '.png', '.webp', '.avif', '.gif']),
+    // The merged chat, so the path to it is picked the same way the video and
+    // the thumbnail are. An unknown kind means NO filter, not an empty list,
+    // so leaving this out would have listed the whole directory.
+    // `.gz` because a merged chat is written compressed: extname of
+    // `007_merged-chat.json.gz` is `.gz`, and without this the picker cannot
+    // see the only file it exists to pick.
+    chat: new Set(['.json', '.jsonl', '.gz']),
+    // Posters, narrower than `image` on purpose: the pickers that use this one
+    // choose a still that goes on a card, and the archive writes those as PNG.
+    // `image` stays for anything that wants the wider set.
+    png: new Set(['.png']),
   };
   const BROWSE_MAX = 300;
 
@@ -2053,21 +5178,205 @@ export function makeApp(config = CONFIG) {
     // Newest first: the file you are looking for is nearly always the one that
     // just landed. The slice before stat() is the backstop — a directory with
     // fifty thousand raws should not stall the page on syscalls.
-    const files = names.slice(0, 4000).map((name) => {
+    const all = names.slice(0, 4000).map((name) => {
       let mtime = 0, bytes = null;
       try { const st = statSync(join(dir, name)); mtime = st.mtimeMs; bytes = st.size; }
       catch { /* vanished between readdir and stat */ }
       return { name, path: rel ? `${rel}/${name}` : name, bytes, mtime };
     });
-    files.sort((a, b) => b.mtime - a.mtime);
+    all.sort((a, b) => b.mtime - a.mtime);
+
+    /* Sorted BEFORE the slice, which is the whole reason paging works: an
+       offset into an unsorted list is a different set of files every request,
+       and a picker scrolling through it would show duplicates and gaps. */
+    const offset = Math.max(Number(req.query.offset ?? 0) || 0, 0);
+    // A page the caller asks for, capped by the one the server is willing to
+    // build. The pickers ask for a screenful at a time so the list stays small
+    // enough to render; anything else gets the old behaviour by not asking.
+    const limit = Math.min(Math.max(Number(req.query.limit ?? BROWSE_MAX) || BROWSE_MAX, 1),
+                           BROWSE_MAX);
+    const files = all.slice(offset, offset + limit);
+    const next = offset + files.length;
 
     res.set('Cache-Control', 'no-store');
     res.json({
       dir: rel, parent: rel ? rel.split('/').slice(0, -1).join('/') : null,
-      dirs: dirs.sort(), files: files.slice(0, BROWSE_MAX),
-      truncated: files.length > BROWSE_MAX, total: names.length,
+      dirs: dirs.sort(), files,
+      // `next` is null at the end, so a caller pages until it stops rather than
+      // arithmetic-ing its way there against a total it might disagree with.
+      next: next < all.length ? next : null,
+      offset,
+      truncated: all.length > BROWSE_MAX, total: names.length,
     });
   });
+
+  /* A poster, uploaded rather than picked.
+   *
+   *  Quarantine, then a promote job — NOT the cache. /cache says of itself
+   *  that everything under it is regenerable from the media and wants no
+   *  backup; a still somebody just chose is the only copy of a decision, and
+   *  quarantine is the root that exists for exactly that. It also means the
+   *  poster ends up in the media tree where /media/thumb already serves from,
+   *  so nothing about serving has to change.
+   *
+   *  The Pi needs no change either: do_promote resolves `to` against its own
+   *  media root and refuses anything that escapes it, and has never cared that
+   *  every destination so far happened to start with `snippets/`.
+   *
+   *  The cost is one round trip of latency: the poster is not on disk in the
+   *  served tree until ls_jobs.py has run, so the card keeps its old still
+   *  until then rather than showing a hole.
+   */
+  /* Go and look at what this stream actually has.
+   *
+   * The archive cannot: the masters are on a read-only mount and the platform
+   * probe needs a network and a cookie jar that live on the recorder. So it
+   * writes the job down, with everything the worker needs to do it in the
+   * payload — the same shape promote and purge use, and for the same reason.
+   *
+   * By hand only, for now. A sweep over everything is what actually wants
+   * doing eventually, and it waits on rate limiting rather than on this.
+   */
+  app.post('/api/streams/:id/rescan', requireRole('editor'), (req, res) => {
+    const s = R.prepare('SELECT id FROM stream WHERE id = ? AND retracted_at IS NULL')
+      .get(req.params.id);
+    if (!s) return res.status(404).json({ error: 'no such stream' });
+    const caps = R.prepare(
+      `SELECT id, platform, remote_id, url, video_path FROM capture WHERE stream_id = ?`)
+      .all(s.id);
+    if (!caps.length) {
+      return res.status(400).json({ error: 'this stream has no captures to look at' });
+    }
+    /* Already queued? Asking twice is how a rate limit gets hit for nothing,
+       and the second answer would be the same as the first. */
+    const open = R.prepare(
+      `SELECT id FROM job WHERE kind = 'rescan' AND status IN ('approved','claimed')
+         AND payload LIKE ?`).get(`%"${s.id}"%`);
+    if (open) return res.json({ job_id: open.id, already: true });
+
+    const id = enqueueJob('rescan', {
+      payload: { stream_id: s.id, captures: caps.map((c) => ({
+        id: c.id, platform: c.platform, remote_id: c.remote_id,
+        url: c.url, video_path: c.video_path })) },
+      by: req.person.id,
+    });
+    bumpGeneration(W);
+    logEvent(req, 're-read a stream from its files and links', 'stream', s.id);
+    res.json({ job_id: id, captures: caps.length });
+  });
+
+  /* Go and read what that link says about this tag.
+   *
+   * The archive cannot: it opens no outbound socket, deliberately, which is
+   * the whole reason the job queue exists. It also should not — a URL an
+   * editor typed, fetched by this process, is a request from inside the NAS's
+   * own network. The recorder already has an allowlist for exactly this.
+   *
+   * Destructive by design: a re-seed replaces the description AND the art, and
+   * the button says so. What makes that recoverable is that the old summary is
+   * in the change log if a human ever wrote one, and `seeded` says whether one
+   * did.
+   */
+  app.post('/api/tags/:id/harvest', requireRole('editor'), (req, res) => {
+    const t = R.prepare('SELECT id, name, seed_url FROM tag WHERE id = ? AND retracted_at IS NULL')
+      .get(req.params.id);
+    if (!t) return res.status(404).json({ error: 'no such tag' });
+    const url = String(req.body?.url ?? t.seed_url ?? '').trim();
+    if (!url) return res.status(400).json({ error: 'no link to read — paste one first' });
+    if (!/^https:\/\//i.test(url)) {
+      return res.status(400).json({ error: 'https only' });
+    }
+    /* Asking twice queues two fetches of the same page and the second answer
+       overwrites the first with itself. */
+    const open = R.prepare(
+      `SELECT id FROM job WHERE kind = 'harvest' AND status IN ('approved','claimed')
+         AND payload LIKE ?`).get(`%"${t.id}"%`);
+    if (open) return res.json({ job_id: open.id, already: true });
+
+    // Stored on the row as well as in the job: it is where a re-seed reads
+    // from next time, and the attribution for whatever comes back.
+    if (url !== t.seed_url) {
+      W.prepare('UPDATE tag SET seed_url = ?, updated_at = ? WHERE id = ?').run(url, now(), t.id);
+    }
+    const id = enqueueJob('harvest', {
+      url, payload: { tag_id: t.id, name: t.name, url }, by: req.person.id });
+    bumpGeneration(W);
+    logEvent(req, 'asked for a description', 'tag', t.id, { url }, null);
+    res.json({ job_id: id });
+  });
+
+  const POSTER_MAX_BYTES = Number(process.env.TENMA_POSTER_MAX_BYTES) || 8 * 1024 * 1024;
+  const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+  /* One handler, two subjects. A stream's poster and a tag's art are the same
+     operation down to the byte: PNG in, quarantine, promote job, and the
+     caller writes `thumb_path` as the destination the file WILL have. Writing
+     it twice is how one of them keeps the magic-number check and the other
+     grows a content-type check instead. */
+  const posterUpload = (table) => async (req, res) => {
+    if (!config.quarantineRoot) {
+      return res.status(503).json({ error: 'uploads are disabled; set TENMA_QUARANTINE_ROOT' });
+    }
+    const s = R.prepare(`SELECT id FROM ${table} WHERE id = ? AND retracted_at IS NULL`)
+      .get(req.params.id);
+    if (!s) return res.status(404).json({ error: `no such ${table}` });
+
+    const id = ulid();
+    // A dotfile while it is arriving, for the same reason /api/uploads uses
+    // one: the importer skips dotfiles, so a half-written poster can never be
+    // read as a whole one.
+    const partAbs = join(config.quarantineRoot, `.part-${id}`);
+    const scrub = () => { try { rmSync(partAbs, { force: true }); } catch { /* gone */ } };
+
+    let bytes = 0, tooBig = false, head = null;
+    const meter = new Transform({
+      transform(chunk, _enc, cb) {
+        // The first bytes decide whether this is a PNG at all, and they are
+        // already in hand — cheaper than reading the file back afterwards, and
+        // it means a wrong file is refused without a second syscall.
+        if (head === null) head = Buffer.from(chunk.subarray(0, 8));
+        bytes += chunk.length;
+        if (bytes > POSTER_MAX_BYTES) { tooBig = true; return cb(new Error('too big')); }
+        cb(null, chunk);
+      },
+    });
+
+    try {
+      await pipeline(req, meter, createWriteStream(partAbs));
+    } catch {
+      scrub();
+      return tooBig
+        ? res.status(413).json({
+            error: `posters are capped at ${Math.round(POSTER_MAX_BYTES / 1048576)} MB`,
+            limit_bytes: POSTER_MAX_BYTES })
+        : res.status(400).json({ error: 'the upload did not finish' });
+    }
+    if (!bytes) { scrub(); return res.status(400).json({ error: 'that was an empty file' }); }
+    /* The signature, not the extension and not the content-type — both of
+       those are things the sender says, and this route names the file itself.
+       Same reasoning as the media allowlist on the way out: a browser that
+       sniffs is how an upload becomes stored XSS on your own origin. */
+    if (!head || head.length < 8 || !head.equals(PNG_MAGIC)) {
+      scrub();
+      return res.status(415).json({ error: 'that is not a PNG' });
+    }
+
+    const rel = `${id}.png`;
+    try { renameSync(partAbs, join(config.quarantineRoot, rel)); }
+    catch (e) { scrub(); return res.status(500).json({ error: `could not store it: ${e.code}` }); }
+
+    // No snippet_id: this promote is about a stream's poster, and the claim
+    // path only fills in a MISSING payload for snippet jobs — an explicit one
+    // travels through untouched, and jobLanded has nothing to do afterwards
+    // because thumb_path is written as the destination it will have.
+    const to = `posters/${rel}`;
+    const job = enqueueJob('promote', { payload: { from: rel, to }, by: req.person.id });
+    bumpGeneration(W);
+    res.json({ path: to, job, pending: true });
+  };
+
+  app.post('/api/streams/:id/poster', requireRole('editor'), posterUpload('stream'));
+  app.post('/api/tags/:id/poster', requireRole('editor'), posterUpload('tag'));
 
   // -------------------------------------------------------------------------
   // frontend
@@ -2076,6 +5385,168 @@ export function makeApp(config = CONFIG) {
   // no CORS or cookie-domain question to answer. Registered last so a file can
   // never shadow a route.
   // -------------------------------------------------------------------------
+
+  // -------------------------------------------------------------------------
+  // /m/:id — a moment, addressably
+  //
+  // Two rules hold this together, and both are about disclosure rather than
+  // about rendering.
+  //
+  //   1. EVERY /m/<anything> answers 200 with the same page. "Never existed",
+  //      "not published yet" and "gated away from you" are one response,
+  //      because anything else is an oracle: a crawler that gets 404 for one
+  //      id and 200 for another has learned which gated clips exist without
+  //      ever being allowed to see one. The client then asks
+  //      /api/snippets/:id, which is gate-aware and already answers this
+  //      correctly for whoever is actually holding the cookie.
+  //
+  //   2. The meta tags are decided ANONYMOUSLY, whoever is asking. A crawler
+  //      arrives with no cookie, so ANON is the honest question to ask on its
+  //      behalf — but the rule is not "because it is a crawler",
+  //      it is that <head> is the least private part of a page. It survives
+  //      into browser history, tab sync, screenshots and whatever the OS
+  //      shares a URL with. An editor opening a gated moment gets the clip,
+  //      because the API gives it to them; they do not get its title welded
+  //      into the document head where it can escape.
+  // -------------------------------------------------------------------------
+
+  const INDEX_HTML = join(HERE, 'public', 'index.html');
+
+  /* Read once and re-read only when it changes. The file is a few hundred KB
+     and this is the route people paste into chat, where several unfurlers hit
+     it at once within a second or two of each other. */
+  let indexCache = { mtime: -1, html: null };
+  const indexHtml = () => {
+    let mtime = -1;
+    try { mtime = statSync(INDEX_HTML).mtimeMs; } catch { return null; }
+    if (mtime !== indexCache.mtime) {
+      try { indexCache = { mtime, html: readFileSync(INDEX_HTML, 'utf8') }; }
+      catch { return null; }
+    }
+    return indexCache.html;
+  };
+
+  /* Attribute-safe. Every string that reaches this went through a title field
+     somebody typed into, and an unescaped quote ends the attribute and turns
+     the rest of the title into markup — in the one part of the page that is
+     handed to third-party servers to render. */
+  const attrEsc = (s) => String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+  /* Absolute, because og:image is fetched by a machine with no page to
+     resolve a relative path against. TENMA_PUBLIC_URL wins when it is set:
+     behind a reverse proxy Host is whatever the proxy chose to pass on, and
+     on a NAS that is as often `192.168.1.4:8080` as it is the name people
+     actually share. Unset, the request's own view is the best guess there
+     is — which is fine on a LAN and is why the variable exists for when it
+     is not. */
+  const publicBase = (req) => {
+    const set = String(process.env.TENMA_PUBLIC_URL ?? '').trim().replace(/\/+$/, '');
+    if (set) return set;
+    const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http')
+      .split(',')[0].trim();
+    return `${proto}://${req.headers.host ?? 'localhost'}`;
+  };
+
+  /* 0:42, 3:07, 1:02:30 — an unfurl is read at a glance and 00:00:42 is not a
+     glance. hms() stays as it is; it answers a different question, about
+     positions on a stream axis where the hours column is load-bearing. */
+  const shortDur = (x) => {
+    if (!(x > 0)) return null;
+    const t = Math.round(x), h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60);
+    const p = (n) => String(n).padStart(2, '0');
+    return h ? `${h}:${p(m)}:${p(t % 60)}` : `${m}:${p(t % 60)}`;
+  };
+
+  const SITE = 'Flatfox';
+  const SITE_BLURB = 'An archive of Tenma Maemi.';
+
+  /** The <head> additions for one moment, or the site's own when there is
+   *  nothing an anonymous reader may be told about it.
+   */
+  function momentMeta(id, req) {
+    const base = publicBase(req);
+    const generic = [
+      ['og:site_name', SITE], ['og:type', 'website'], ['og:title', SITE],
+      ['og:description', SITE_BLURB], ['twitter:card', 'summary'],
+    ];
+
+    const r = R.prepare(
+      `SELECT * FROM snippet WHERE id = ? AND retracted_at IS NULL`).get(id);
+    /* The anonymous question, deliberately — see rule 2 above. ANON is the
+       archive's own word for nobody, and it is what every request carries
+       before a cookie is read; asking with a bare null instead would be a
+       different, subtly weaker question, and `atLeast()` dereferences it. */
+    if (!snipVisible(r, { person: ANON })) return generic;
+
+    const dur = shortDur(r.duration_s);
+    const tags = TAGLETS_OF.all(r.id)
+      .filter((t) => !t.gate)          // a gated taglet names its own gate
+      .slice(0, 6).map((t) => t.name);
+    const desc = [dur, tags.join(', ')].filter(Boolean).join(' · ') || SITE_BLURB;
+
+    const out = [
+      ['og:site_name', SITE],
+      ['og:type', 'video.other'],
+      ['og:title', r.title || 'A moment'],
+      ['og:description', desc],
+      ['og:url', `${base}/m/${r.id}`],
+    ];
+    /* Only when there IS one. An og:image pointing at a 404 is worse than no
+       image: several unfurlers drop the whole card rather than fall back to
+       the text one. */
+    if (r.poster_path) {
+      out.push(['og:image', `${base}/media/snippet-poster/${r.id}`]);
+      if (r.width) out.push(['og:image:width', String(r.width)]);
+      if (r.height) out.push(['og:image:height', String(r.height)]);
+      out.push(['twitter:card', 'summary_large_image']);
+    } else {
+      out.push(['twitter:card', 'summary']);
+    }
+    if (dur) out.push(['og:video:duration', String(Math.round(r.duration_s))]);
+    return out;
+  }
+
+  app.get('/m/:id', (req, res) => {
+    const html = indexHtml();
+    if (html === null) return res.status(500).json({ error: 'the page is missing' });
+
+    let tags = [];
+    /* A malformed id, a database that does not answer, a title with something
+       unusual in it — none of these should cost somebody the page. Fall back
+       to the site's own card and serve it. */
+    try { tags = momentMeta(String(req.params.id ?? ''), req); }
+    catch (e) { console.error('meta for /m:', e?.message ?? e); tags = []; }
+
+    const head = tags
+      .map(([k, v]) => `<meta property="${attrEsc(k)}" content="${attrEsc(v)}">`)
+      .join('\n');
+
+    /* `private`, because a shared proxy holding a page under an id is exactly
+       the kind of thing that outlives a gate being added to a taglet later —
+       the head would go on naming a clip that is no longer public.
+
+       `no-cache` rather than `no-store`, which is the weaker-sounding of the
+       two and the stronger choice here: store it, but ask every time. The page
+       is most of a megabyte and this is the route people paste into chat, so
+       no-store meant re-sending the entire application on every click of every
+       shared link. The ETag below is what makes asking cheap.
+
+       It covers the file's mtime and the injected block, which is precisely
+       what can change: a rebuilt page, or a clip that has been retitled,
+       gated, or published since. Anything else — who is asking, what they
+       hold — the head does not depend on, which is why this needs no Vary. */
+    const body = head ? html.replace('</head>', `${head}\n</head>`) : html;
+    res.set('Cache-Control', 'private, no-cache');
+    res.set('ETag', `W/"m${indexCache.mtime}-${
+      createHash('sha1').update(head).digest('base64url').slice(0, 16)}"`);
+    res.type('html');
+    /* express compares this against If-None-Match for us, but only if we do
+       not hand it a body first. */
+    if (req.fresh) return res.status(304).end();
+    res.send(body);
+  });
 
   app.use(express.static(join(HERE, 'public'), {
     etag: true, maxAge: '5m', index: 'index.html',
@@ -2107,12 +5578,29 @@ if (isMain) {
     console.error(`no database at ${dbPath} — run the import first`);
     process.exit(1);
   }
+  /* Create, write, delete. `existsSync` is not enough and neither is
+     `accessSync(W_OK)`: on a share with Windows ACLs the POSIX bits say yes
+     while an explicit Deny ACE says no, and only an actual write finds out. */
+  const quarantineState = () => {
+    if (!CONFIG.quarantineRoot) return '(unset — uploads are disabled)';
+    const probe = join(CONFIG.quarantineRoot, `.probe-${process.pid}`);
+    try {
+      writeFileSync(probe, 'x');
+      rmSync(probe, { force: true });
+      return `${CONFIG.quarantineRoot} — writable`;
+    } catch (e) {
+      return `${CONFIG.quarantineRoot} — NOT WRITABLE (${e.code}); uploads will fail`;
+    }
+  };
+
   const app = makeApp();
   app.listen(CONFIG.port, CONFIG.host, () => {
     console.log(`flatfox  http://${CONFIG.host}:${CONFIG.port}`);
     console.log(`  db          ${dbPath}`);
     console.log(`  media root  ${CONFIG.mediaRoot ?? '(unset — captures read unverified)'}`);
     console.log(`  cache root  ${CONFIG.cacheRoot ?? '(unset — posters only where the media tree has them)'}`);
+    console.log(`  quarantine  ${quarantineState()}`);
+    app.startNormalizeWorker();
     console.log(`  dev auth    ${CONFIG.devAuth ? 'ON — do not expose this' : 'off'}`);
     console.log(`  ingest      ${CONFIG.ingestToken ? 'enabled' : 'disabled (no token set)'}`);
   });

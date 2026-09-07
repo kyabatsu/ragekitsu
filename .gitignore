@@ -2,6 +2,8 @@
 # is rebuilt by migrate() on boot from whatever vintage it happens to be, and
 # the -wal/-shm files beside it belong to that one .db and nothing else.
 data/
+cache/
+whisper/
 
 # Scratch databases the scripts and tests leave behind.
 *.try.db

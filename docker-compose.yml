@@ -69,6 +69,11 @@ services:
       - type: bind
         source: /volume1/Volume01/edit-video_library/Tenma Maemi/quarantine
         target: /quarantine
+
+      - type: bind
+        source: /volume2/docker/ragekitsu/whisper
+        target: /whisper
+        read_only: true
     environment:
       TENMA_DB: /data/archive.db
       TENMA_MEDIA_ROOT: /media
@@ -83,11 +88,15 @@ services:
       PORT: "8000"
       TENMA_HOST: "0.0.0.0"
 
+      TENMA_WHISPER_BIN: /usr/local/bin/whisper-cli
+      TENMA_WHISPER_MODEL: /whisper/ggml-small.en-q5_1.bin
+      TENMA_WHISPER_THREADS: "2"
+      TENMA_WHISPER_LANG: en
+
       # Must match archive_token in the Pi's config.json.
       # `openssl rand -hex 32` over SSH. Unset disables ingest entirely, which
       # is the safe failure rather than an open one.
       TENMA_INGEST_TOKEN: "ecd474f2b1dbe607f849ad9542b81195757bdb251b346b3f62f02902b2e4a3fd"
-
       # ─────────────────────────────────────────────────────────────────────
       # DELETE THIS LINE BEFORE THE ROUTER EVER FORWARDS A PORT HERE.
       #

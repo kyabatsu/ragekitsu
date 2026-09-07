@@ -10,8 +10,9 @@
 // applies on submission; that is the only difference between a staff edit and a
 // viewer's suggestion, and it is what keeps the history complete.
 
-import { statSync } from 'node:fs';
-import { resolve, sep } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { closeSync, openSync, readSync, statSync } from 'node:fs';
+import { extname, resolve, sep } from 'node:path';
 import { bit, bumpGeneration, isUlid, now, slugify, tx, ulid } from './db.js';
 
 // ===========================================================================
@@ -108,6 +109,335 @@ const TRUNCATE_RATIO = 0.97;
  *  means the next route to be added inherits it instead of forgetting it.
  *  statMedia() is a caller too, and its paths come from ingest, which builds
  *  them from a config-supplied prefix. */
+/** What ffprobe says is inside a file, or null if it is not media at all.
+ *
+ *  The scripts each carry their own copy of this and each swallows the error
+ *  into an empty record, which is right for a bulk pass over files that are
+ *  already in the archive: one unreadable clip should not stop fifteen hundred.
+ *  It is wrong at the front door. Here "ffprobe could not read it" is the
+ *  answer — a cheap, early rejection before anything expensive runs — so this
+ *  one returns null and the caller refuses.
+ *
+ *  Reproduced in review.md: the lazy polyglot, HTML prepended to a real webm,
+ *  dies here with `EBML header parsing failed`. A serious polyglot is still
+ *  craftable, so this is a cost imposed on an attacker rather than a proof.
+ */
+export function probeMedia(file) {
+  try {
+    const out = execFileSync('ffprobe', [
+      '-v', 'error',
+      '-show_entries',
+      // pix_fmt and profile are not curiosities: 10-bit H.264 and HE-AAC are
+      // both legal, both common out of a phone or yt-dlp, and neither plays in
+      // Safari. A probe that stops at the codec name calls those conformant.
+      'format=duration,size,format_name'
+      + ':stream=codec_type,codec_name,width,height,pix_fmt,profile,avg_frame_rate',
+      '-of', 'json', file],
+      { encoding: 'utf8', timeout: 20_000, maxBuffer: 4 << 20 });
+    const j = JSON.parse(out);
+    const streams = j.streams ?? [];
+    const v = streams.find((s) => s.codec_type === 'video') ?? {};
+    const a = streams.find((s) => s.codec_type === 'audio') ?? {};
+    // No format block means ffprobe read the file and found nothing it knew.
+    if (!j.format) return null;
+    return {
+      duration_s: Number(j.format.duration) || null,
+      bytes: Number(j.format.size) || null,
+      width: v.width ?? null,
+      height: v.height ?? null,
+      container: j.format.format_name ?? null,
+      video_codec: v.codec_name ?? null,
+      audio_codec: a.codec_name ?? null,
+      // Not columns on `snippet` — nothing stores these. They exist for
+      // classifyMedia(), which is asked the question once per upload.
+      pix_fmt: v.pix_fmt ?? null,
+      profile: v.profile ?? null,
+      audio_profile: a.profile ?? null,
+      /* "30000/1001" and friends. Needed to reason about bitrate at all: bits
+         per second means nothing without knowing how many pixels a second it
+         is buying. A rate of 0/0 is what ffprobe says for a still or a stream
+         it could not measure, and null is the honest answer there. */
+      fps: (() => {
+        const [n, d] = String(v.avg_frame_rate ?? '').split('/').map(Number);
+        return n > 0 && d > 0 ? n / d : null;
+      })(),
+    };
+  } catch { return null; }
+}
+
+
+/* ── what a file needs doing to it ─────────────────────────────────────────
+ *
+ * The target, and every part of it earns its place:
+ *
+ *   H.264 High, yuv420p, + AAC-LC, in MP4, moov atom first.
+ *
+ * yuv420p because 4:2:2, 4:4:4 and 10-bit H.264 are all legal and none of them
+ * play in Safari. AAC-LC rather than HE-AAC for the same reason. moov first
+ * because otherwise the whole file must arrive before the first frame shows,
+ * which breaks progressive playback and makes a link preview hang. MP4 rather
+ * than WebM because a Discord embed is a requirement with one answer.
+ *
+ * The rules were worked out in scripts/normalize-media.js against the real
+ * collection; this is the server's copy of them, and the duplication is
+ * deliberate rather than lazy. That script runs on a PC against the NAS over
+ * SMB and deliberately takes NO database — importing this module would drag
+ * db.js and node:sqlite in behind it, which is the one dependency it exists
+ * without. So they are two copies ON PURPOSE, and the cost is real: change the
+ * target here and scripts/normalize-media.js keeps the old one until somebody
+ * changes it too. Both say so, in both files.
+ */
+const OK_PIX = new Set(['yuv420p', 'yuvj420p']);
+const OK_PROFILE = new Set(['baseline', 'constrained baseline', 'main', 'high']);
+
+/** Is the moov atom before the mdat?
+ *
+ *  Walking the top-level boxes is exact and costs one 16-byte read per box;
+ *  the alternative is guessing from the extension, and a file that needs
+ *  faststart looks identical to one that already has it.
+ */
+export function moovFirst(file) {
+  let fd;
+  try {
+    fd = openSync(file, 'r');
+    const buf = Buffer.alloc(16);
+    let off = 0;
+    for (let i = 0; i < 24; i++) {
+      if (readSync(fd, buf, 0, 16, off) < 8) return false;
+      let size = buf.readUInt32BE(0);
+      const type = buf.toString('latin1', 4, 8);
+      if (type === 'moov') return true;
+      if (type === 'mdat') return false;
+      if (size === 1) size = Number(buf.readBigUInt64BE(8));   // 64-bit extended
+      else if (size === 0) return false;                        // runs to EOF
+      if (size < 8) return false;
+      off += size;
+    }
+    return false;
+  } catch { return false; }
+  finally { if (fd !== undefined) closeSync(fd); }
+}
+
+/** conformant | remux | audio | video | encode | broken
+ *
+ *  Six outcomes rather than four, because the real collection showed that
+ *  "needs re-encoding" hides three very different jobs. A clip with good H.264
+ *  and uncompressed PCM audio needs its AUDIO encoded and its picture copied
+ *  byte for byte — fast, and lossless where it counts. Collapsing that into
+ *  `encode` would re-compress a perfectly good picture to fix a soundtrack.
+ *
+ *  Takes a probeMedia() record plus the file's own path, because two of the
+ *  six answers depend on things no probe reports: the extension, and where the
+ *  moov atom sits.
+ */
+export function classifyMedia(file, p) {
+  if (!p || !(p.duration_s > 0)) return 'broken';
+
+  /* Audio with no picture. A clip of somebody saying something is a perfectly
+     good archive entry — arguably the PUREST one, since the transcript is what
+     most of these are searched by — and it was being refused at the door
+     because the classifier began by insisting on a video stream.
+
+     Two outcomes, matching the video ones: already-AAC copies, everything else
+     encodes. Both produce an .m4a, so what gets served is one format whatever
+     arrived. scripts/normalize-media.js never returns these: it walks a folder
+     with a video-extension filter and will not see an audio file. */
+  if (!p.video_codec) {
+    if (!p.audio_codec) return 'broken';
+    const aOk = p.audio_codec === 'aac'
+      && !/he-aac|hev2|sbr/.test(String(p.audio_profile ?? '').toLowerCase());
+    return aOk ? 'sound' : 'sound-encode';
+  }
+  const container = String(p.container ?? '');
+  const isMp4 = /mp4|mov|m4v/.test(container);
+  const vOk = p.video_codec === 'h264'
+    && (!p.pix_fmt || OK_PIX.has(p.pix_fmt))
+    && (!p.profile || OK_PROFILE.has(String(p.profile).toLowerCase()));
+  const aOk = !p.audio_codec
+    || (p.audio_codec === 'aac' && !/he-aac|hev2|sbr/.test(String(p.audio_profile ?? '').toLowerCase()));
+  if (vOk && aOk) {
+    if (isMp4 && extname(file).toLowerCase() === '.mp4' && moovFirst(file)) return 'conformant';
+    return 'remux';
+  }
+  if (vOk && !aOk) return 'audio';    // picture copied byte for byte
+  if (!vOk && aOk) return 'video';    // soundtrack copied
+  return 'encode';
+}
+
+/** Is this file carrying far more bits than the target encode would?
+ *
+ *  classifyMedia only ever asks about FORMAT, and a Premiere export is a
+ *  perfectly formed H.264/AAC MP4 that happens to be four times the size it
+ *  needs to be. Editors export at "match source" or a fixed 40-50 Mbps by
+ *  default, and nothing about the file says so — the codec is right, the
+ *  pixel format is right, the moov atom is in front.
+ *
+ *  Bits per pixel per frame, because bitrate alone is meaningless across
+ *  resolutions: 8 Mbps is generous for 720p30 and thin for 4K60. For real
+ *  content x264 at CRF 21 lands around 0.03-0.10; a high-motion 1080p60 game
+ *  capture at 12 Mbps is about 0.10. The 0.15 default is therefore roughly
+ *  double a generous honest encode, which is a threshold only an over-fat
+ *  export clears.
+ *
+ *  It only decides whether re-encoding is worth ATTEMPTING. Whether the
+ *  attempt is kept is decided afterwards by measuring the result, which is
+ *  what makes a wrong answer here cost CPU rather than quality: an incompress-
+ *  ible source simply fails to shrink and the original is kept.
+ */
+export function overBitrate(p, { bpp = 0.15, minBytes = 8 << 20 } = {}) {
+  if (!p || !p.bytes || !(p.duration_s > 0)) return false;
+  if (!p.width || !p.height || !p.fps) return false;
+  /* A floor in absolute bytes, and it is not a micro-optimisation — it is what
+     makes the ratio safe to use at all. Bits per pixel is resolution-dependent
+     in a way the threshold cannot capture: per-frame overhead is a much larger
+     share of a 320x240 frame than a 1080p one, so a perfectly ordinary small
+     clip sits around 0.25 while an honest 1080p encode sits at 0.05. Measured
+     on the fixtures, every one of the small ones read as over-fat.
+
+     Gating on size instead of arguing about the ratio is also the honest
+     framing of what this feature is for: reclaiming real disk and real
+     bandwidth. Shaving 40 KB off a 300 KB clip is not worth an encode, and the
+     case this exists for is a 190 MB export. */
+  if (p.bytes < minBytes) return false;
+  const bits = (p.bytes * 8) / p.duration_s;
+  return bits / (p.width * p.height * p.fps) > bpp;
+}
+
+/** The ffmpeg arguments for one clip, given what classifyMedia said.
+ *
+ *  Per STREAM, always: deciding file by file is what puts a good picture
+ *  through the encoder to fix a soundtrack. `-map_metadata -1` because an
+ *  uploaded file's metadata is somebody else's — camera model, GPS, the
+ *  original filename, occasionally their real name — and none of it should
+ *  survive into something the archive serves.
+ */
+export function normalizeArgs(input, output, kind, {
+  crf = 21, preset = 'veryfast', threads = 2, maxW = 1920, maxH = 1080, hasAudio = true,
+} = {}) {
+  const args = ['-nostdin', '-loglevel', 'error', '-y', '-i', input];
+
+  /* No picture at all. `-vn` and not merely "copy no video stream": an mp3
+     with embedded cover art has a video stream of one still frame, and left
+     alone ffmpeg will faithfully carry it into the m4a as a video track,
+     which makes every downstream `is this audio` check wrong. */
+  if (kind === 'sound' || kind === 'sound-encode') {
+    args.push('-vn');
+    if (kind === 'sound') args.push('-c:a', 'copy');
+    else args.push('-c:a', 'aac', '-b:a', '192k');
+    args.push('-map_metadata', '-1', '-movflags', '+faststart', output);
+    return args;
+  }
+
+  const encV = kind === 'video' || kind === 'encode';
+  const encA = kind === 'audio' || kind === 'encode';
+  if (encV) {
+    args.push(
+      '-c:v', 'libx264', '-preset', preset, '-crf', String(crf),
+      '-pix_fmt', 'yuv420p', '-profile:v', 'high', '-level', '4.1',
+      '-threads', String(threads),
+      /* A ceiling, not a resize. `min(iw,W)` keeps a 640x480 clip at 640x480
+         rather than blowing it up to fill the box, which plain
+         force_original_aspect_ratio=decrease would do. The second scale
+         rounds to even numbers: odd dimensions are legal in VP9 and rejected
+         outright by H.264, and losing one row is the difference between a clip
+         converting and a clip failing. Written as two filters rather than
+         force_divisible_by so it works on ffmpeg before 4.4. */
+      '-vf', `scale='min(iw,${maxW})':'min(ih,${maxH})':force_original_aspect_ratio=decrease`
+           + `,scale=trunc(iw/2)*2:trunc(ih/2)*2`);
+  } else args.push('-c:v', 'copy');
+  if (!hasAudio) args.push('-an');
+  else if (encA) args.push('-c:a', 'aac', '-b:a', '160k', '-ac', '2');
+  else args.push('-c:a', 'copy');
+  args.push('-map_metadata', '-1', '-movflags', '+faststart', output);
+  return args;
+}
+
+/** One frame, as a JPEG. A second in, because frame 0 of a clip cut from a
+ *  stream is very often a hard cut or a black frame — the worst available
+ *  choice for a thumbnail. Clamped for clips shorter than that.
+ */
+
+/** ffmpeg arguments that dump a clip as raw mono PCM.
+ *
+ *  8 kHz is deliberate and deliberately low: this is measured to draw about
+ *  480 bars, so anything above a few hundred samples per bar is thrown away
+ *  immediately. It makes ten minutes of audio 9.6 MB instead of 106, which is
+ *  the difference between a temp file nobody notices and one that matters.
+ */
+export function pcmArgs(input, output) {
+  return ['-nostdin', '-loglevel', 'error', '-y', '-i', input,
+          '-vn', '-ac', '1', '-ar', '8000', '-f', 's16le', output];
+}
+
+/** Signed 16-bit mono PCM -> one 0-255 amplitude per bar.
+ *
+ *  The peak of each bucket, not the mean. A mean turns speech into a flat
+ *  sausage, because silence between words drags every bucket down; the peak is
+ *  what the eye reads as "this is where the loud bit is", and it is what every
+ *  audio editor draws.
+ *
+ *  Normalised so the loudest bar is full height. A quiet phone recording and a
+ *  hot Discord clip both want to look like a waveform rather than one looking
+ *  like a flat line — absolute loudness is not what anybody is scrubbing by.
+ */
+export function peaksFromPcm(buf, buckets = 480) {
+  const n = Math.floor(buf.length / 2);
+  if (!n) return null;
+  const per = Math.max(1, Math.floor(n / buckets));
+  /* Int32Array and not the Uint8Array we return. A 16-bit sample peaks at
+     32767, so writing it into a byte array before normalising truncates it mod
+     256 — which silently turns the loudest bar into whatever 32767 & 255
+     happens to be, and then scales everything against that. The output is a
+     waveform of noise that looks almost plausible. */
+  const raw = new Int32Array(buckets);
+  let max = 1;
+  for (let b = 0; b < buckets; b++) {
+    const start = b * per;
+    if (start >= n) break;
+    const end = Math.min(start + per, n);
+    let peak = 0;
+    /* Stride, rather than reading every sample. At 8 kHz a ten-minute clip is
+       4.8 million samples for 480 bars; sampling about 400 per bar finds the
+       same peak to within a hair and costs a hundredth of the work. */
+    const step = Math.max(1, Math.floor((end - start) / 400));
+    for (let i = start; i < end; i += step) {
+      const v = Math.abs(buf.readInt16LE(i * 2));
+      if (v > peak) peak = v;
+    }
+    raw[b] = peak;
+    if (peak > max) max = peak;
+  }
+  const out = new Uint8Array(buckets);
+  for (let b = 0; b < buckets; b++) out[b] = Math.round((raw[b] / max) * 255);
+  return out;
+}
+
+/** A waveform, for a clip that has no frames to take a still from.
+ *
+ *  Not decoration. Every row in the list is a rectangle with a picture in it,
+ *  and an audio clip with no poster is a black hole in the grid that reads as
+ *  a broken thumbnail rather than as "this one is sound". A waveform also says
+ *  something true about the clip — where the loud part is.
+ */
+export function wavePosterArgs(input, output) {
+  return ['-nostdin', '-loglevel', 'error', '-y', '-i', input,
+          '-filter_complex',
+          /* One band, edge to edge. An earlier version padded to add margins
+             and the pad colour did not match showwavespic's own transparent
+             background once flattened, so the still came out as a black box
+             inside a slightly-less-black box. Full bleed has no seam to
+             mismatch. */
+          'showwavespic=s=960x280:colors=0xff4d94|0x8a7fff,format=yuv420p',
+          '-frames:v', '1', output];
+}
+
+export function posterArgs(input, output, durationS) {
+  const at = (durationS ?? 0) > 2.5 ? 2 : 0;
+  return ['-nostdin', '-loglevel', 'error', '-y', '-ss', String(at), '-i', input,
+          '-frames:v', '1', '-q:v', '4',
+          '-vf', "scale='min(iw,960)':-2", output];
+}
+
 export function resolveMedia(root, rel) {
   if (!root || !rel) return null;
   const base = resolve(root);
@@ -272,38 +602,61 @@ export function recompute(db, streamId, { mediaRoot = null, checkFiles = true } 
 //  segments and the projected timeline
 // ===========================================================================
 
-// The one vocabulary. A tag is filed under one of these and a block of time is
-// coloured by one of these, and they are the same list because "what is this
-// tag" and "what is this block" are the same question asked twice.
+/* The one vocabulary — DEFINED IN db.js, re-exported here.
+ *
+ * It reads backwards and it is deliberate. The two BACKFILLS in db.js have to
+ * name the whole vocabulary literally, they run on every boot with no ran-once
+ * guard, and a word missing from one of those lists is not "left alone" — it
+ * is rewritten to 'unknown'. That has now happened twice. db.js cannot import
+ * this file (this file imports db.js, and the lists are needed at module
+ * scope, so the cycle is a TDZ ReferenceError during boot), so the definition
+ * lives upstream of both and there is exactly one of it.
+ *
+ * The prose that used to be here — what each word means, why `media` was
+ * `game`, why `elements` was carved out of `meta` — moved with it.
+ */
 //
-//   game    a specific title being played
-//   person  a guest, a member, a character the block is about
-//   type    what kind of stream this stretch is — collab, karaoke, zatsudan,
-//           superchat reading, a creative or event block
-//   meta    the scaffolding around it — intro, outro, break, waiting screen
+//   media      what it belongs to — a game, a franchise, an agency, an event
+//   character  a guest, a member, a person the block is about
+//   type       what kind of stream this stretch is — collab, watchalong,
+//              karaoke, zatsudan, event
+//   elements   the scaffolding around it — intro, outro, break, waiting screen
 //
 // Closed, because it is a colour and a colour has to mean the same thing in
 // every stream in the archive. Extending it is a deliberate edit to this line,
 // not a typo in a text field.
-export const KINDS = ['game', 'person', 'type', 'meta'];
-
-// ...plus the sentinel. 'unknown' is NOT 'meta': "nobody has labelled this" and
-// "this is a break" are different claims, and only one of them tells a viewer
-// to skip. It gets a hatch rather than a swatch for the same reason.
-export const SEGMENT_KINDS = [...KINDS, 'unknown'];
-
-// The snippet vocabulary, and a separate list on purpose — see the block
-// comment on `taglet` in schema.sql. Danbooru's namespaces, because they are
-// the ones that survive a thousand short clips:
 //
-//   character   who is in it        blue
-//   copyright   what it belongs to  violet
-//   meta        what it is like     yellow
-//   general     everything else     grey
+// `media` was `game` and `character` was `person`. Both were renamed rather
+// than kept as synonyms, because the snippet vocabulary already called the same
+// two things `copyright` and `character` and the archive was carrying one idea
+// under two names in two tables. `elements` was carved out of the old `meta`,
+// which held two disjoint populations: Collab and Zatsudan, which are formats a
+// whole stream can be, and Intro/Break/Outro, which are only ever drawn on a
+// timeline and are grey because grey means skippable.
+//   meta       what a snippet IS rather than what it is about — reviewed,
+//              duplicate, animated, audio only, restricted
+//   general    everything else about a snippet
 //
-// 'general' is the default rather than a sentinel like segment's 'unknown':
-// an untyped taglet is a perfectly ordinary taglet, not a gap in the record.
-export const TAGLET_KINDS = ['character', 'copyright', 'meta', 'general'];
+// The last two are snippet-only, and that is the only thing `taglet` was ever
+// for. There is one table now: `media` and `character` name the same subjects
+// on both surfaces, so tagging a clip and tagging a broadcast draw from one
+// vocabulary and a rename is one edit rather than two that can diverge.
+export { KINDS, ALL_KINDS } from './db.js';
+// ...and imported AGAIN for this module's own use. `export ... from` re-exports
+// without binding the name locally, so both of these are read below — ENUMS
+// names KINDS at module scope, projectSegments() reads ALL_KINDS on every
+// strip — and without this line the first is a ReferenceError during import
+// and the second on the first timeline the archive draws.
+import { KINDS, ALL_KINDS } from './db.js';
+
+// `TAGLET_KINDS` was here — character, copyright, meta, general — a second
+// vocabulary for the snippet side. It is gone, and the merge that removed it
+// was mostly a rename: `copyright` and `character` were already naming the same
+// two subjects that `game` and `person` named over here, in a second table,
+// with a second autocomplete and a second row to rename. What genuinely only
+// belongs to a clip — `meta` and `general` — stayed, and is scoped by
+// re-exported from db.js with everything else rather than living somewhere
+// else. The surface gating that scoped them was retired with it.
 
 /* ── what a browser will actually play ───────────────────────────────────
  *
@@ -341,6 +694,10 @@ export function servedType(container, vcodec, acodec) {
     return WEBM_VIDEO.has(v) && aOk(WEBM_AUDIO) ? 'video/webm' : null;
   }
   if (c.includes('mp4') || c.includes('mov') || c.includes('m4v')) {
+    /* No video track means an .m4a, and the type has to say audio — a browser
+       handed `video/mp4` for an audio file plays it, but every player, embed
+       and download names it wrong from then on. */
+    if (!vcodec) return MP4_AUDIO.has(String(acodec ?? '').toLowerCase()) ? 'audio/mp4' : null;
     return MP4_VIDEO.has(v) && aOk(MP4_AUDIO) ? 'video/mp4' : null;
   }
   return null;
@@ -399,7 +756,7 @@ export function projectSegments(rows, capsById, startedAt, domain) {
   const placed = rows.map((r) => ({
     id: r.id,
     lane: r.lane === 1 ? 1 : 0,
-    kind: SEGMENT_KINDS.includes(r.kind) ? r.kind : 'unknown',
+    kind: ALL_KINDS.includes(r.kind) ? r.kind : 'unknown',
     // `label ?? tag.name` — write "Mario Kart (200cc)" on one block and still
     // link the entity. The colour is NOT read through the tag: it was copied
     // onto the segment when a human picked it, so re-categorising a game never
@@ -414,6 +771,11 @@ export function projectSegments(rows, capsById, startedAt, domain) {
     start_s: axisOf(r, capsById, startedAt, 'start_s'),
     end_s: axisOf(r, capsById, startedAt, 'end_s'),
     exact: isExact(r),
+    /* Started and not stopped. A fact about the ROW, set here rather than in
+       the tiling below, because the tiling only runs when there is a domain —
+       and a stream that is still on air has none. That is exactly when this
+       needs to be true. */
+    open: r.end_s === null || r.end_s === undefined,
     synthetic: false,
   })).filter((x) => x.start_s !== null)
     .sort((a, b) => a.start_s - b.start_s || String(a.id).localeCompare(String(b.id)));
@@ -446,14 +808,25 @@ export function projectSegments(rows, capsById, startedAt, domain) {
   for (const s of lane1) s.under = under(s);
 
   if (domain === null || domain === undefined) {
-    return { tiled: false, segments: placed };
+    return { tiled: false, segments: placed, past: [] };
   }
 
   const out = [];
+  /* Blocks that landed entirely outside the domain. They are NOT drawn — there
+     is nowhere on a strip that ends at `domain` to draw them — but they are
+     carried, because the alternative is a row that exists, cost somebody the
+     work of making it, and appears nowhere at all.
+     Only total disappearance counts. A block that merely reaches past the end
+     is clamped, and a clamped block is visible: you can see it run to the edge
+     and go looking for why. */
+  const past = [];
   const push = (start, end, seg) => {
     const a = Math.max(0, Math.min(start, domain));
     const b = Math.max(a, Math.min(end, domain));
-    if (b - a <= 0) return;
+    if (b - a <= 0) {
+      if (seg) past.push(seg);
+      return;
+    }
     // Filler is 'unknown', NOT 'meta'. Nobody said this stretch was a break —
     // they just have not labelled it yet, and those are different claims. A
     // strip with no segments at all would otherwise render as one grey bar
@@ -478,17 +851,27 @@ export function projectSegments(rows, capsById, startedAt, domain) {
   });
   if (cursor < domain) push(cursor, domain, null);
 
-  /* Clamped to the domain like everything else, but never filled and never
-     merged. A lane-1 block with no end runs nowhere — unlike lane 0, where a
-     missing end means "until the next one", because there is no continuity to
-     inherit from inside a game. */
-  for (const s of lane1) {
+  /* Clamped to the domain like everything else, but never FILLED and never
+     merged: the gaps between sub-chapters stay gaps, because the last forty
+     minutes of a two-hour game are simply not called anything and painting a
+     hatch there would invent an obligation.
+     A missing end is a different question from a gap, and it now means here
+     what it means in lane 0 and what the schema has always said it means:
+     runs to the next one. That is what makes `>>` a boundary — you say where
+     a thing starts and the next mark says where it stopped. Nothing that
+     existed before this can be affected: the form has always demanded both
+     ends, so every lane-1 row ever written has one. */
+  for (let i = 0; i < lane1.length; i++) {
+    const s = lane1[i];
+    const nxt = lane1[i + 1];
+    const rawEnd = s.end_s ?? (nxt ? nxt.start_s : domain);
     const a = Math.max(0, Math.min(s.start_s, domain));
-    const b = Math.max(a, Math.min(s.end_s ?? s.start_s, domain));
+    const b = Math.max(a, Math.min(rawEnd, domain));
     if (b - a > 0) out.push({ ...s, start_s: a, end_s: b });
+    else past.push(s);
   }
 
-  return { tiled: true, segments: out };
+  return { tiled: true, segments: out, past };
 }
 
 /** Segments that overlap once projected. Checked at apply time, not stored as a
@@ -578,7 +961,7 @@ export function buildTimeline(db, streamId, { durationSource = undefined } = {})
      LEFT JOIN tag pt   ON pt.id = t.parent_id
      WHERE g.stream_id = ? AND g.retracted_at IS NULL`).all(streamId);
 
-  const { tiled, segments } = projectSegments(segRows, capsById, started, domain);
+  const { tiled, segments, past } = projectSegments(segRows, capsById, started, domain);
 
   // Deep links are built against whichever source leads the chain, converted
   // through that source's own clock. `lead` is a capture id, so a duplicate
@@ -614,12 +997,20 @@ export function buildTimeline(db, streamId, { durationSource = undefined } = {})
     tiled,
     lead: lead?.capture_id ?? null,
     segments,
+    /* Unclamped, because the whole point of them is the number that does not
+       fit. A reader has to be able to see 2:00:12 against a stream the archive
+       believes is 2:00:00 long and decide which of the two is wrong. */
+    segments_past: past,
     notes: notes.map((n) => projectNote(n, capsById, started, leadCap)),
     coverage,
     counts: {
       notes: notes.length,
       notes_unknown_frame: notes.filter((n) => n.frame === 'unknown').length,
       segments: segRows.length,
+      // Counted beside the notes' own count, and for the same reason: a number
+      // in the footer is what turns "something is missing" into "two things
+      // are missing and here is where to look".
+      segments_past: past.length,
       captures: caps.length,
     },
   };
@@ -814,6 +1205,14 @@ export const WRITABLE = {
     // directly would desync it from the wall times it is derived from.
     remote_start_wall: 'int', local_start_wall: 'int',
     local_start_precision_s: 'int',
+    /* Measured by the rescan job, and correctable by hand — which it has to
+       be, because the thing that measures it can be fooled. A YouTube bot
+       check and a deleted video arrive as the same failure unless something
+       reads the wording, and if a probe is ever wrong about a takedown there
+       has to be a way to say so. `0` is dead, `1` is there, NULL is nobody has
+       looked — and `bool` rather than `int` so there is no fourth thing it can
+       be set to. */
+    alive: 'bool',
     file_duration_s: 'int', video_path: 'text', chat_path: 'text',
     thumb_path: 'text', mirror_url: 'text', mirror_platform: 'text',
   },
@@ -835,6 +1234,13 @@ export const WRITABLE = {
   tag: {
     name: 'text', slug: 'text', kind: 'text', parent_id: 'text',
     thumb_path: 'text', summary: 'text', status: 'text',
+    /* Where a harvest reads from, and the record of where a description came
+       from. Writable because you paste it.
+       `seeded` is deliberately NOT here: it is a fact about whether a human
+       has been over this row, and a human claiming it by hand would be the
+       one thing it must never say. The harvest sets it; the loop below clears
+       it. */
+    seed_url: 'text',
   },
   // The junction is a write target in its own right — attaching a tag to a
   // stream is a decision like any other, and it needs a row in the log saying
@@ -851,8 +1257,11 @@ export const WRITABLE = {
     // Making it writable would let an edit survive as the search index while
     // the lines under it said something else.
   },
-  taglet: { name: 'text', slug: 'text', kind: 'text', summary: 'text', status: 'text' },
-  snippet_taglet: { snippet_id: 'text', taglet_id: 'text' },
+  // `taglet` is gone: one table, so a snippet's tag is written as a `tag`.
+  // It stays READABLE as a target_type in the history — change rows written
+  // before the merge name it, and a log that cannot resolve its own past is
+  // not a log. See the vocab lookup in `summary()`.
+  snippet_taglet: { snippet_id: 'text', tag_id: 'text' },
 };
 
 // Fields that must be present to create one of these from nothing.
@@ -867,23 +1276,38 @@ const REQUIRED = {
   // filename stem, and a clip with a bad title is recoverable where a clip with
   // no file is not.
   snippet: ['title', 'video_path'],
-  taglet: ['name'],
-  snippet_taglet: ['snippet_id', 'taglet_id'],
+  snippet_taglet: ['snippet_id', 'tag_id'],
 };
 
 // Streams, notes and segments are tombstoned; captures and tags are genuinely
 // removable because nothing external points at them.
 // stream_tag is genuinely removable — untagging is not a claim worth a
 // tombstone, and the changeset that did it is already the record.
-// A snippet is content and tombstones like a stream. A taglet tombstones like
-// a tag; snippet_taglet is a junction and removes cleanly, same as stream_tag.
-const TOMBSTONED = new Set(['stream', 'note', 'segment', 'tag', 'snippet', 'taglet']);
+// A snippet is content and tombstones like a stream. snippet_taglet is a
+// junction and removes cleanly, same as stream_tag.
+const TOMBSTONED = new Set(['stream', 'note', 'segment', 'tag', 'snippet']);
+
+// What a hard delete has to write down before it happens.
+//
+// A tombstoned row keeps its own columns, so the change row naming it is
+// enough to reconstruct what was removed. A junction is different: it is
+// DELETEd outright — a tombstoned link would still read as joined — and the
+// change row for a delete carries `field: null, value: null` and the link's
+// own id. Once the row is gone that id resolves to nothing, so "who took
+// Selen Tatsuki off this snippet" had no answer anywhere, ever.
+//
+// The pair, not the whole row: created_at and updated_at are the same
+// information as the changeset's own timestamp, twice.
+const REMEMBER_ON_DELETE = {
+  snippet_taglet: ['snippet_id', 'tag_id'],
+  stream_tag: ['stream_id', 'tag_id'],
+};
 const OPS = new Set(['create', 'update', 'delete']);
 
 // Closed vocabularies, checked at validate time so a typo cannot become a
 // colour nobody has a swatch for.
 const ENUMS = {
-  'segment.kind': SEGMENT_KINDS,
+  'segment.kind': ALL_KINDS,
   /* Numbers, deliberately, and not a range check. `cast('int', …)` has already
      run by the time ENUMS is consulted, so [0, 1].includes(value) does the job
      the existing machinery was built for and the refusal reads
@@ -896,13 +1320,15 @@ const ENUMS = {
   'segment.anchor_clock': ['remote', 'local'],
   'note.frame': ['capture', 'stream', 'unknown'],
   'note.anchor_clock': ['remote', 'local'],
-  // Same list as segment.kind, and that is the point — see KINDS. A tag may be
-  // 'unknown' too: minting one from the autocomplete miss should not force a
-  // category out of somebody who was in the middle of doing something else.
-  'tag.kind': SEGMENT_KINDS,
+  /* The SAME list as segment.kind, and now literally the same constant. It used to say
+     SEGMENT_KINDS, which was right for exactly as long as the two were the
+     same list and wrong the moment they were not — meta and general tags
+     started being refused with "tag.kind must be one of media, character,
+     type, elements, unknown". There is one list again, so there is nothing
+     left to diverge. */
+  'tag.kind': ALL_KINDS,
   'tag.status': ['proposed', 'confirmed'],
-  'taglet.kind': TAGLET_KINDS,
-  'taglet.status': ['proposed', 'confirmed'],
+
   /* The publication gate.
        proposed   imported, not yet looked at — invisible to the public
        confirmed  someone combed through it and said yes
@@ -949,6 +1375,15 @@ function cast(kind, value) {
     const n = Number(value);
     if (!Number.isFinite(n)) throw new ChangeError(`${value} is not a number`);
     return Math.trunc(n);
+  }
+  /* A three-state flag: 0, 1, or NULL for "nobody has looked". `int` would
+     take a 7, and a 7 is not a fourth state — every reader compares against 0
+     and 1 exactly, so it would read as unverified while sitting in the column
+     looking like an answer. */
+  if (kind === 'bool') {
+    if (value === true || value === 1 || value === '1' || value === 'true') return 1;
+    if (value === false || value === 0 || value === '0' || value === 'false') return 0;
+    throw new ChangeError(`${value} is not yes or no`);
   }
   return String(value);
 }
@@ -1186,11 +1621,11 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
     // over a race. Resolve instead: point the rest of the changeset at the row
     // that already exists, and write down that it happened.
     //
-    // Written once over both vocabularies rather than twice: `tag` and `taglet`
-    // are different lists answering different questions, but they collide in
-    // exactly the same way and a second copy of this is a second place for the
-    // pending-INSERT rewrite below to be forgotten.
-    for (const vocab of ['tag', 'taglet']) {
+    // One vocabulary now, so this runs once. It used to loop over `tag` and
+    // `taglet` — two lists that collided in exactly the same way, which was
+    // itself an argument for there being one of them.
+    {
+      const vocab = 'tag';
       for (const [tid, c] of [...creates]) {
         if (c.type !== vocab || !c.fields.name) continue;
         const slug = slugify(c.fields.name);
@@ -1223,7 +1658,7 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
     // failing the UNIQUE and rolling back everything else in it.
     for (const [jt, [a, b]] of Object.entries({
       stream_tag: ['stream_id', 'tag_id'],
-      snippet_taglet: ['snippet_id', 'taglet_id'],
+      snippet_taglet: ['snippet_id', 'tag_id'],
     })) {
       for (const [tid, c] of [...creates]) {
         if (c.type !== jt) continue;
@@ -1240,7 +1675,7 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
       // Provenance is stamped by the applier, never taken from the payload —
       // otherwise anyone could submit a note attributed to someone else, or one
       // that claims to have come from the vault.
-      if (tt === 'tag' || tt === 'taglet') {
+      if (tt === 'tag') {
         // slug is DERIVED. Letting a client send both is how a tag ends up
         // named one thing and matched by another.
         fields.slug = slugify(fields.name);
@@ -1254,10 +1689,10 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
         // No guess at a category. A row minted from an autocomplete miss has
         // none until someone gives it one, and picking the most common one for
         // them is inference from a name — the same move as reading a game off a
-        // stream title. The two vocabularies spell "uncategorised" differently:
-        // a segment kind is a colour and 'unknown' earns a hatch, while an
-        // untyped taglet is an ordinary taglet.
-        if (!fields.kind) fields.kind = tt === 'taglet' ? 'general' : 'unknown';
+        // stream title. 'unknown' is shared, so an unfiled row shows up in both
+        // pickers rather than hiding on the surface it was not minted from;
+        // whoever files it decides which surfaces it belongs to.
+        if (!fields.kind) fields.kind = 'unknown';
       } else if (tt === 'snippet') {
         fields.origin = 'user';
         fields.author_id = cs.author_id;
@@ -1281,14 +1716,24 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
       for (const s of streamsOf(db, tt, tid)) touched.add(s);
     }
 
+    /* Editing any of these on a tag means a human has been over the row, so it
+       is no longer what the harvest wrote. One bit for the whole tag — see the
+       block on `seeded` in db.js. `seed_url` is absent on purpose: pasting a
+       link is not editing the description, and clearing the flag there would
+       make the sprout button mark its own input as hand-written. */
+    const UNSEEDS = new Set(['name', 'summary', 'thumb_path']);
+
     for (const c of changes) {
       if (c.op === 'create') continue;
       if (c.op === 'update') {
         db.prepare(`UPDATE ${c.target_type} SET ${c.field} = ?, updated_at = ? WHERE id = ?`)
           .run(c.value, t, c.target_id);
+        if (c.target_type === 'tag' && UNSEEDS.has(c.field)) {
+          db.prepare(`UPDATE tag SET seeded = 0 WHERE id = ? AND seeded = 1`).run(c.target_id);
+        }
         // A rename that leaves the slug behind means the row answers to its old
         // URL and matches on its old spelling forever.
-        if ((c.target_type === 'tag' || c.target_type === 'taglet') && c.field === 'name') {
+        if (c.target_type === 'tag' && c.field === 'name') {
           const tbl = c.target_type;
           const slug = slugify(c.value);
           const was = db.prepare(`SELECT slug FROM ${tbl} WHERE id = ?`).get(c.target_id)?.slug;
@@ -1308,6 +1753,16 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
               .run(cs.reason, c.target_id);
           }
         } else {
+          /* Written as ordinary update rows in the same changeset, the way
+             detachAnchor already writes down the moves it makes: the pair went
+             from something to nothing. It reads correctly as history and it is
+             what a revert would need, if one is ever written. */
+          const keep = REMEMBER_ON_DELETE[c.target_type];
+          if (keep) {
+            const was = db.prepare(
+              `SELECT * FROM ${c.target_type} WHERE id = ?`).get(c.target_id);
+            if (was) for (const f of keep) record(c.target_type, c.target_id, f, was[f], null);
+          }
           for (const s of streamsOf(db, c.target_type, c.target_id)) touched.add(s);
           db.prepare(`DELETE FROM ${c.target_type} WHERE id = ?`).run(c.target_id);
           continue;

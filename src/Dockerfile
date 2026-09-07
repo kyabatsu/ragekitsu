@@ -9,10 +9,18 @@
 # codecs and local clocks it writes are what the theater scales its timeline
 # to. It is a one-off you run by hand, but wanting it and not having it means
 # rebuilding the image at the worst moment.
+FROM node:22-alpine AS whisper
+RUN apk add --no-cache build-base cmake git
+RUN git clone --depth 1 --branch v1.9.3 https://github.com/ggml-org/whisper.cpp /w
+WORKDIR /w
+RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+      -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF \
+ && cmake --build build -j2 --config Release
+
 FROM node:22-alpine
 
-RUN apk add --no-cache ffmpeg tini
-
+RUN apk add --no-cache ffmpeg tini libstdc++ libgomp
+COPY --from=whisper /w/build/bin/whisper-cli /usr/local/bin/whisper-cli
 WORKDIR /app
 
 # Copied first and separately so `npm ci` is cached against dependency changes
