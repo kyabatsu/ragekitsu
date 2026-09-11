@@ -1,8 +1,21 @@
 -- ===========================================================================
 -- Tenma archive — schema.
 --
--- Nine tables. Every fact in the archive sorts into one of three kinds, and
--- knowing which kind a fact is tells you who is allowed to write it:
+-- THE COMPLETE DEFINITION. Everything the archive needs is declared here, in
+-- one file, and db.js adds nothing to it. That was not true for most of this
+-- project's life: the schema was whatever this file said PLUS sixty-eight
+-- forward migrations, so the only way to know a database's real shape was to
+-- read both and replay one of them in your head. Three tables and eight
+-- columns had drifted out of this file entirely and existed only as ALTERs.
+--
+-- Keep it true. A new column goes HERE first, and then into MIGRATIONS in
+-- db.js so that existing databases catch up — both, always, because this file
+-- is what a fresh database is built from and MIGRATIONS is what an old one
+-- moves through. schema_version below is bumped when the two are collapsed
+-- together again; see the dated note over MIGRATIONS.
+--
+-- Every fact in the archive sorts into one of three kinds, and knowing which
+-- kind a fact is tells you who is allowed to write it:
 --
 --   OBSERVATION   a machine measured it. This file is 19,914s long. This path
 --                 exists. This video id is Mgv62FpvhPA. Re-derivable; if it is
@@ -30,7 +43,7 @@ CREATE TABLE IF NOT EXISTS meta (
   value TEXT NOT NULL
 ) WITHOUT ROWID;
 
-INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '3');
+INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '4');
 INSERT OR IGNORE INTO meta(key, value) VALUES ('generation', '0');
 
 -- ---------------------------------------------------------------------------
@@ -61,6 +74,25 @@ CREATE TABLE IF NOT EXISTS session (
   user_agent TEXT
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS ix_session_expiry ON session(expires_at);
+
+-- What a person is allowed past. One row per grant held, rather than a list on
+-- `person`, because the interesting questions are "who can see the restricted
+-- set" and "when was this given, and by whom" — both a scan of a column here,
+-- and neither of them a question a JSON blob answers.
+--
+-- The gate itself lives on `tag`: a tag with a gate restricts whatever carries
+-- it, and a viewer needs a grant of that name to see it.
+CREATE TABLE IF NOT EXISTS person_grant (
+  id         TEXT PRIMARY KEY,                -- ULID
+  person_id  TEXT NOT NULL REFERENCES person(id) ON DELETE CASCADE,
+  name       TEXT NOT NULL,
+  granted_by TEXT REFERENCES person(id) ON DELETE SET NULL,
+  created_at INTEGER NOT NULL
+);
+-- Holding a grant twice is not a different state from holding it once, and the
+-- UNIQUE is what lets the grant endpoint be idempotent rather than having to
+-- read-then-write.
+CREATE UNIQUE INDEX IF NOT EXISTS person_grant_one ON person_grant(person_id, name);
 
 -- ---------------------------------------------------------------------------
 -- stream — the broadcast. The archive's unit of meaning.
@@ -391,9 +423,13 @@ CREATE TABLE IF NOT EXISTS segment (
 );
 CREATE INDEX IF NOT EXISTS ix_segment_stream ON segment(stream_id, start_s)
   WHERE retracted_at IS NULL;
--- ix_segment_tag ("every block of Mario Kart in the archive" — the payoff for
--- linking the entity rather than retyping its name) is likewise created in
--- db.js, after segment.tag_id exists.
+-- "Every block of Mario Kart in the archive" — the payoff for linking the
+-- entity rather than retyping its name.
+CREATE INDEX IF NOT EXISTS ix_segment_tag ON segment(tag_id, start_s)
+  WHERE tag_id IS NOT NULL AND retracted_at IS NULL;
+-- No index on `lane`. It is filtered in memory alongside the axis conversion
+-- that already has to happen per row, and a stream has tens of segments rather
+-- than thousands — ix_segment_stream is still the one that matters.
 
 -- ---------------------------------------------------------------------------
 -- Anchors are load-bearing: a note measured inside a capture becomes a note
@@ -491,9 +527,12 @@ CREATE TABLE IF NOT EXISTS tag (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
--- ix_tag_parent / ix_tag_live are created by POST_MIGRATION in db.js, not here:
--- create() execs this file BEFORE the ALTERs run, so an index naming a column
--- an older `tag` table does not have yet would abort the whole startup.
+CREATE INDEX IF NOT EXISTS ix_tag_parent ON tag(parent_id) WHERE parent_id IS NOT NULL;
+-- The autocomplete's own query: confirmed tags, in slug order, tombstones out.
+CREATE INDEX IF NOT EXISTS ix_tag_live ON tag(status, slug) WHERE retracted_at IS NULL;
+-- Gated tags are a handful out of hundreds, so the partial index IS the list —
+-- and the list is what every visibility check starts from.
+CREATE INDEX IF NOT EXISTS tag_gate ON tag(gate) WHERE gate IS NOT NULL;
 
 -- The junction carries a surrogate id for one reason: `change.target_id` points
 -- at a single value, so a composite primary key cannot be addressed by a
@@ -555,6 +594,41 @@ CREATE TABLE IF NOT EXISTS change (
   UNIQUE(changeset_id, seq)
 );
 CREATE INDEX IF NOT EXISTS ix_change_target ON change(target_type, target_id);
+
+-- ---------------------------------------------------------------------------
+-- event — what happened, in order, in the words a person would use.
+--
+-- Deliberately NOT more changesets. A changeset answers "what field went from
+-- what to what, and can it be undone"; this answers "who did what". They
+-- overlap and are not the same question — approving is both, editing a
+-- transcript is only the second, and a changeset that has not been applied yet
+-- is only the first.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS event (
+  id           TEXT PRIMARY KEY,              -- ULID
+  at           INTEGER NOT NULL,
+  actor_id     TEXT REFERENCES person(id) ON DELETE SET NULL,
+  -- Denormalised on purpose. A log that said "admin kyabatsu removed this" and
+  -- then rendered as "removed by (deleted user)" a year later has lost the part
+  -- worth keeping — and the role is the role AT THE TIME, which is a fact about
+  -- the event rather than about the person, and would otherwise quietly rewrite
+  -- itself every time somebody was promoted.
+  actor_handle TEXT,
+  actor_role   TEXT,
+  verb         TEXT NOT NULL,
+  target_type  TEXT NOT NULL,
+  target_id    TEXT NOT NULL,
+  -- JSON, because the interesting part differs per verb: a submission carries a
+  -- title and its tags, a rename carries two strings, a purge carries what was
+  -- destroyed. Read-only, rendered, never queried on.
+  detail       TEXT,
+  changeset_id TEXT REFERENCES changeset(id) ON DELETE SET NULL
+);
+-- The two questions the log is ever asked, and they want different orders: one
+-- snippet's story, and the archive's.
+CREATE INDEX IF NOT EXISTS ix_event_target ON event(target_id, at DESC);
+CREATE INDEX IF NOT EXISTS ix_event_at ON event(at DESC);
 
 -- ---------------------------------------------------------------------------
 -- search
@@ -646,11 +720,79 @@ CREATE TABLE IF NOT EXISTS snippet (
   -- root -- never the media root, which is read-only and holds the masters.
   -- NULL is the normal case and means "serve video_path directly".
   play_path     TEXT,
-  -- Content hash. Written by scripts/check-media.js, not by the importer:
-  -- hashing the whole collection costs minutes and answers a question the
-  -- import does not ask. Finds the same clip filed twice under two names, and
-  -- is what a future upload checks to know it already holds this file.
+  -- Content hash. Written by the audit rather than by the importer: hashing the
+  -- whole collection costs minutes and answers a question the import does not
+  -- ask. Finds the same clip filed twice under two names, and is what a future
+  -- upload checks to know it already holds this file.
   sha256        TEXT,
+  -- The shape of the sound: 480 amplitude buckets, base64'd, about 640 bytes.
+  -- Only ever set for a clip with no picture, where it IS the picture — a
+  -- waveform the page can draw, fill as it plays, and accept a click on.
+  --
+  -- A column rather than a file with a route: it is smaller than the request
+  -- headers needed to fetch it separately, and it rides along with the row the
+  -- page already asked for, so the player has it before it needs it.
+  waveform      TEXT,
+
+  -- Where the file is RIGHT NOW, relative to the quarantine root, while it
+  -- waits for a human. `video_path` is the destination it will have once an
+  -- editor approves and the Pi renames it into the media tree — so the row
+  -- knows both its current and its eventual home, and promote is "clear this
+  -- column", not "rewrite the path everything else reads".
+  --
+  -- NULL for every clip the importer wrote, which is what makes it safe:
+  -- `quarantine_path IS NOT NULL` is exactly the set of files living outside
+  -- the served tree.
+  quarantine_path TEXT,
+
+  -- Where a clip came from, when it came from a link rather than a file. Kept
+  -- even after the bytes arrive: it is the only record of what was fetched, it
+  -- is what stops the same link being submitted twice, and it is what an editor
+  -- looks at when a clip turns out to be somebody's reupload.
+  source_url    TEXT,
+
+  -- How the fetch is going, mirroring normalize_status and transcript_status
+  -- because it answers the same shape of question about the same row.
+  --   none     nothing to fetch — every uploaded and every imported clip
+  --   queued   a fetch job exists and the recorder has not taken it
+  --   running  the recorder holds it
+  --   done     the bytes landed in quarantine; normalize takes over
+  --   failed   fetch_note says why, and the row has no bytes at all
+  -- A row can sit at `queued` for as long as the recorder is off, which is the
+  -- whole reason this is a column and not an inference: the page has to be able
+  -- to say "waiting for the recorder" rather than draw a player over a file
+  -- that does not exist yet.
+  fetch_status  TEXT NOT NULL DEFAULT 'none',
+  fetch_note    TEXT,
+
+  -- How far the conversion has got, mirroring transcript_status deliberately:
+  -- the two answer the same shape of question about the same row, and a reader
+  -- who has understood one has understood the other.
+  --   none     nothing to do, or nothing has asked yet. Every imported clip.
+  --   queued   a normalize job exists and no worker has taken it
+  --   running  a worker holds it — the state the UI calls "converting"
+  --   done     play_path and poster_path are what the worker left
+  --   failed   normalize_note says why; the clip still plays if it ever could
+  -- `none` and not `queued` as the default, because fifteen hundred imported
+  -- rows were normalized years before this column existed and marking them all
+  -- as waiting would invent a backlog.
+  normalize_status TEXT NOT NULL DEFAULT 'none',
+  normalize_note   TEXT,
+
+  -- Names a submitter typed that are not in the vocabulary. A JSON array of raw
+  -- strings — deliberately NOT tag rows.
+  --
+  -- A proposed tag in the tag table would be autocompleted, which means the
+  -- second person to want "Selen Tatsuki" gets it offered to them before
+  -- anybody has agreed it should exist, and a typo becomes permanent vocabulary
+  -- the moment a second clip picks it up. Kept as loose text, these stay
+  -- attached to the clip that suggested them and go nowhere else until an
+  -- editor mints the real tag. Somebody suggesting the same name on a second
+  -- upload types it again, which is the intended cost.
+  --
+  -- The column keeps its old name, like `snippet_taglet` does, so history rows
+  -- that address it by field name can still resolve their own past.
+  taglet_suggestions TEXT,
 
   -- The flat join of snippet_line.text. Denormalised because FTS5 indexes one
   -- column on one row, and a child table would need its own index and its own
@@ -677,6 +819,20 @@ CREATE TABLE IF NOT EXISTS snippet (
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL
 );
+-- The list's actual sort, so it is an index scan rather than a sort of the
+-- whole table. id breaks ties, and does so deterministically — several clips
+-- copied in one go share an mtime to the second.
+CREATE INDEX IF NOT EXISTS ix_snippet_live ON snippet(added_at DESC, id DESC)
+  WHERE retracted_at IS NULL;
+-- The same-link check runs on every submission, and it is the only query that
+-- reads this column.
+CREATE INDEX IF NOT EXISTS ix_snippet_source_url ON snippet(source_url)
+  WHERE source_url IS NOT NULL;
+-- Partial, because the answer is almost always "none of them": suggestions
+-- exist on clips between upload and review, and the queue that reads this wants
+-- exactly that handful out of the whole archive.
+CREATE INDEX IF NOT EXISTS ix_snippet_suggestions
+  ON snippet(id) WHERE taglet_suggestions IS NOT NULL;
 
 -- One row per transcript line, carrying the timing WhisperX already produced.
 -- Not tombstoned and not changeset-managed: a transcript is replaced whole by
@@ -692,6 +848,7 @@ CREATE TABLE IF NOT EXISTS snippet_line (
   text       TEXT NOT NULL,
   UNIQUE(snippet_id, seq)
 );
+CREATE INDEX IF NOT EXISTS ix_snippet_line ON snippet_line(snippet_id, seq);
 
 -- ---------------------------------------------------------------------------
 -- the snippet half of the vocabulary
@@ -743,6 +900,10 @@ CREATE TABLE IF NOT EXISTS snippet_taglet (
   updated_at INTEGER NOT NULL,
   UNIQUE(snippet_id, tag_id)
 );
+-- Both directions: "what is on this snippet" renders every row, and "what is
+-- tagged X" is the whole point of the filter.
+CREATE INDEX IF NOT EXISTS ix_sniptag_snip ON snippet_taglet(snippet_id);
+CREATE INDEX IF NOT EXISTS ix_sniptag_tag ON snippet_taglet(tag_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS snippet_fts USING fts5(
   title, summary, transcript,
@@ -765,3 +926,153 @@ CREATE TRIGGER IF NOT EXISTS snippet_au AFTER UPDATE ON snippet BEGIN
   INSERT INTO snippet_fts(rowid, title, summary, transcript)
     VALUES (new.rowid, new.title, new.summary, new.transcript);
 END;
+
+-- ---------------------------------------------------------------------------
+-- job — the work queue, and the reason the archive opens no outbound socket.
+--
+-- The archive never fetches, never writes to the media tree and never deletes
+-- from it. It publishes INTENT here and ls-rec subscribes: the Pi asks for work
+-- on a tick it already runs. See `File management` in review.md.
+--
+-- The one rule the shape enforces: a job names an ID and a VERB. `url` is the
+-- single exception and it is inert here — the host allowlist lives in ls-rec's
+-- config, so a compromised archive still cannot make the recorder fetch from an
+-- attacker's host. Nothing in this table is a path the worker is told to trust;
+-- roots and filenames come from the worker's own config.
+--
+-- status
+--   proposed  somebody asked for it; no worker will see it
+--   approved  an editor said yes — this is what the poll claims
+--   claimed   a worker holds a lease; another poll skips it until it lapses
+--   done      finished, result_path recorded
+--   failed    terminal, and `error` says why. NOT re-queued automatically: a
+--             job that fails ffmpeg and returns to the queue is an infinite
+--             loop with a 74-second period. An editor re-approves.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS job (
+  id           TEXT PRIMARY KEY,              -- ULID
+  kind         TEXT NOT NULL,                 -- fetch | promote | purge
+  status       TEXT NOT NULL DEFAULT 'proposed',
+  snippet_id   TEXT REFERENCES snippet(id) ON DELETE CASCADE,
+  url          TEXT,
+  payload      TEXT,                          -- JSON; kind-specific, never a path
+  requested_by TEXT REFERENCES person(id) ON DELETE SET NULL,
+  approved_by  TEXT REFERENCES person(id) ON DELETE SET NULL,
+  claimed_by   TEXT,                          -- the worker's own name for itself
+  claimed_at   INTEGER,
+  attempts     INTEGER NOT NULL DEFAULT 0,
+  result_path  TEXT,
+  error        TEXT,
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL,
+  finished_at  INTEGER
+);
+-- The claim query's index: status first because it is the selective one — a
+-- queue is nearly all `done`.
+CREATE INDEX IF NOT EXISTS ix_job_claim ON job(status, kind, created_at);
+CREATE INDEX IF NOT EXISTS ix_job_snippet ON job(snippet_id)
+  WHERE snippet_id IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- music — somebody else's music video, kept because it will not always be
+-- there.
+--
+-- Phase Connect songs, two to three minutes each, filed under the SAME `tag`
+-- vocabulary as everything else: `character` for who is singing, `media` for
+-- what it belongs to. There is no second list — a singer is the same row here
+-- as she is on a stream, which is the whole point of having one vocabulary.
+--
+-- IT IS NEVER SERVED FROM THIS ARCHIVE. Viewing is always the YouTube embed,
+-- and the downloaded file exists only so that the thing survives the video
+-- being taken down. That inverts a snippet's relationship to its bytes: a
+-- snippet with no playable file is broken, and a music row with no file is
+-- merely un-preserved.
+--
+-- Which is why the columns a snippet needs are deliberately absent here, and
+-- should stay absent: no play_path, no normalize_status, no waveform, no
+-- container or codec columns, no transcript. Nothing rewraps this file,
+-- nothing probes it, nothing range-requests it, and no route resolves it for
+-- a browser. Adding a player later means adding all of that back, so the
+-- decision to have one is a decision to make this a different kind of object.
+--
+-- TWO INDEPENDENT PROGRESS COLUMNS, and they answer different questions:
+--   status        the editorial verdict — proposed | confirmed | rejected
+--   probe_status  how far the metadata lookup got
+--   fetch_status  how far the download got, which only starts after approval
+-- Collapsing them is how "waiting for a human" and "waiting for the recorder"
+-- become the same unreadable spinner.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS music (
+  id            TEXT PRIMARY KEY,           -- ULID
+  -- THE natural key, and the reason duplicate submission is answerable at all:
+  -- youtu.be/X, watch?v=X and watch?v=X&t=30 are one video and one row.
+  video_id      TEXT NOT NULL UNIQUE,
+  url           TEXT NOT NULL,              -- canonical watch URL, as remembered
+
+  -- What the probe found. All NULL until it lands, which is what the pending
+  -- card reads to say "waiting for the recorder" rather than drawing an empty
+  -- title over a video nobody has looked at yet.
+  title         TEXT,
+  channel       TEXT,
+  channel_id    TEXT,                       -- survives a channel rename
+  uploaded_at   INTEGER,                    -- the VIDEO's publish date, not the row's
+  duration_s    INTEGER,
+
+  -- Preservation, and nothing else. NULL until an approval has been fetched.
+  -- Relative to the media root, under `music/`.
+  video_path    TEXT,
+  thumb_path    TEXT,
+  bytes         INTEGER,
+
+  --   queued   a probe job exists and the recorder has not taken it
+  --   running  the recorder holds it
+  --   done     the facts above are filled in
+  --   failed   probe_note says why; the row still has its link and its tags
+  probe_status  TEXT NOT NULL DEFAULT 'queued',
+  probe_note    TEXT,
+  --   none     not approved yet, so nothing has been asked for
+  --   queued   approved; the recorder has not taken it
+  --   running  downloading
+  --   done     video_path is what the recorder left
+  --   failed   fetch_note says why. The entry is still published — it is the
+  --            PRESERVATION that failed, and the embed still plays.
+  fetch_status  TEXT NOT NULL DEFAULT 'none',
+  fetch_note    TEXT,
+
+  status        TEXT NOT NULL DEFAULT 'proposed',  -- proposed|confirmed|rejected
+  note          TEXT,                       -- the submitter's own words, if any
+
+  origin        TEXT NOT NULL DEFAULT 'link',
+  author_id     TEXT REFERENCES person(id) ON DELETE SET NULL,
+  -- Tombstone. Retracting is the reversible verb every role above viewer can
+  -- reach; destroying the row is a separate admin act.
+  retracted_at  INTEGER,
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+-- The list's own sort.
+CREATE INDEX IF NOT EXISTS ix_music_live ON music(status, created_at DESC)
+  WHERE retracted_at IS NULL;
+-- The pending quota counts a person's own unreviewed submissions, and that
+-- count runs on every submit.
+CREATE INDEX IF NOT EXISTS ix_music_author ON music(author_id, status)
+  WHERE retracted_at IS NULL;
+
+-- The third junction onto the one vocabulary, alongside stream_tag and
+-- snippet_taglet. It carries a surrogate id for the same reason they do:
+-- `change.target_id` holds ONE value, so a composite key cannot be addressed
+-- by a changeset — and attaching a tag has to be a decision with an author
+-- like any other.
+CREATE TABLE IF NOT EXISTS music_tag (
+  id         TEXT PRIMARY KEY,
+  music_id   TEXT NOT NULL REFERENCES music(id) ON DELETE CASCADE,
+  tag_id     TEXT NOT NULL REFERENCES tag(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(music_id, tag_id)
+);
+-- Both directions: what is on this song, and what is tagged with her.
+CREATE INDEX IF NOT EXISTS ix_musictag_music ON music_tag(music_id);
+CREATE INDEX IF NOT EXISTS ix_musictag_tag ON music_tag(tag_id);

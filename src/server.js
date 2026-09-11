@@ -25,16 +25,22 @@ import {
 } from './db.js';
 import {
   ALL_KINDS, ChangeError, KINDS,
-  apply, axisToPosition, buildTimeline, clocksOf,
+  apply, axisToPosition, buildTimeline, clocksOf, pinned,
   classifyMedia, deepLink, hms, moovFirst, normalizeArgs, overBitrate, pcmArgs,
   peaksFromPcm, posterArgs, probeMedia, projectNote, propose, recompute, reject,
   resolveMedia, wavePosterArgs,
   servedType, sourcesFor, stale, summary, thumbFor, watchSources,
 } from './archive.js';
 import {
-  ANON, COOKIE, ROLES, TTL, atLeast, capabilities, identify, issueSession,
-  requireRole, revokeSession, sessionToken, upsertPerson,
+  ANON, COOKIE, ROLES, TTL, assertCapabilities, atLeast, can, capabilities,
+  identify, issueSession, requireCap, requireRole, revokeSession, sessionToken,
+  upsertPerson,
 } from './auth.js';
+
+/* A capability granted to nobody, or granted under a name that does not exist,
+   is a permission that silently never applies — which from the outside looks
+   exactly like the feature not having been built. Fail here instead. */
+assertCapabilities();
 
 // ---------------------------------------------------------------------------
 // config
@@ -683,7 +689,7 @@ export function makeApp(config = CONFIG) {
         ORDER BY s.started_at DESC LIMIT ?`).all(t.id, lim);
 
     const me = req.person?.id ?? null;
-    const vis = snipVisibleSql(me);
+    const vis = snipVisibleSql(req);
     const gate = gateSql(req);
     const snippets = R.prepare(
       `SELECT s.id, s.title, s.duration_s, s.status
@@ -907,14 +913,17 @@ export function makeApp(config = CONFIG) {
   }
 
   app.post('/api/changesets', requireRole('suggester'), (req, res) => {
-    // An editor's own applies on submission; everyone else's queues. This is
-    // the only way any decision in the archive changes.
+    /* The only way any decision in the archive changes — and therefore the
+       only place per-change authorisation has to happen. `person` carries both
+       questions into propose(): whether these particular changes are theirs to
+       make, and whether the result waits for review. Neither is asked here,
+       because a rule written at a route is a rule the next route forgets. */
     try {
       const out = propose(W, {
         authorId: req.person.id,
+        person: req.person,
         reason: req.body?.reason ?? null,
         changes: req.body?.changes ?? [],
-        autoApply: atLeast(req.person, 'editor'),
         mediaRoot: config.mediaRoot,
       });
       /* Only once it has actually landed. A suggester's changeset is queued
@@ -929,7 +938,7 @@ export function makeApp(config = CONFIG) {
     } catch (e) { return changeError(res, e); }
   });
 
-  app.get('/api/changesets', requireRole('editor'), (req, res) => {
+  app.get('/api/changesets', requireCap('review.read'), (req, res) => {
     const { status = 'open', target_id } = req.query;
     const sql = [`SELECT cs.*, p.handle AS author FROM changeset cs
                   LEFT JOIN person p ON p.id = cs.author_id WHERE 1=1`];
@@ -954,15 +963,52 @@ export function makeApp(config = CONFIG) {
       if (r.status === 'open') out.conflicts = stale(R, r.id);
       return out;
     });
-    res.json({ changesets: rows, count: rows.length });
+
+    /* What every id in those rows is CALLED.
+     *
+     * A queue that renders "create stream_tag 01K3F… with tag_id 01K9R…" is a
+     * queue nobody can review — the reviewer would have to open three other
+     * screens to find out what they are being asked about. Resolved here, in
+     * one pass over one set of ids, rather than by the client fetching each
+     * one: the rows are already in hand and the names are three indexed
+     * lookups.
+     *
+     * A tag minted INSIDE one of these changesets has no row yet, so it will
+     * not be found — that is correct and the client fills it from the change
+     * rows themselves, which are the only place that name exists so far. */
+    const want = { tag: new Set(), stream: new Set(), snippet: new Set() };
+    for (const cs of rows) {
+      for (const c of cs.changes) {
+        if (want[c.target_type]) want[c.target_type].add(c.target_id);
+        // A junction says which thing and which tag in two separate rows.
+        if (c.field === 'tag_id') for (const v of [c.value, c.base_value]) if (v) want.tag.add(v);
+        if (c.field === 'stream_id') for (const v of [c.value, c.base_value]) if (v) want.stream.add(v);
+        if (c.field === 'snippet_id') for (const v of [c.value, c.base_value]) if (v) want.snippet.add(v);
+      }
+    }
+    const names = {};
+    const fill = (table, ids, sql) => {
+      if (!ids.size) return;
+      const list = [...ids];
+      for (const r of R.prepare(
+        `${sql} WHERE id IN (${list.map(() => '?').join(',')})`).all(...list)) {
+        names[r.id] = r.label;
+      }
+    };
+    fill('tag', want.tag, 'SELECT id, name AS label FROM tag');
+    fill('stream', want.stream,
+         `SELECT id, COALESCE('#' || idx || ' ' || title, title) AS label FROM stream`);
+    fill('snippet', want.snippet, 'SELECT id, title AS label FROM snippet');
+
+    res.json({ changesets: rows, count: rows.length, names });
   });
 
-  app.get('/api/changesets/:id', requireRole('editor'), (req, res) => {
+  app.get('/api/changesets/:id', requireCap('review.read'), (req, res) => {
     try { res.json(summary(R, req.params.id)); }
     catch (e) { return changeError(res, e); }
   });
 
-  app.post('/api/changesets/:id/review', requireRole('editor'), (req, res) => {
+  app.post('/api/changesets/:id/review', requireCap('review.decide'), (req, res) => {
     const { decision, note = null, force = false } = req.body ?? {};
     if (!['approve', 'reject'].includes(decision)) {
       return res.status(400).json({ error: 'decision must be approve or reject' });
@@ -973,6 +1019,11 @@ export function makeApp(config = CONFIG) {
       }
       const out = apply(W, req.params.id, { reviewerId: req.person.id, note, force: !!force,
                                             mediaRoot: config.mediaRoot });
+      /* Narrated here too. It was not, and the gap showed: a change an editor
+         made themselves appeared in the log, while the same change arriving as
+         somebody's accepted suggestion did not — so the log quietly recorded
+         only the half of the archive's decisions that skipped review. */
+      logChangeset(req, req.params.id);
       // The second apply site. A suggester's clear reaches disk HERE and
       // nowhere else, which is the whole point of doing this on apply.
       posterAftercare(req.params.id, req.person.id);
@@ -1198,12 +1249,80 @@ export function makeApp(config = CONFIG) {
     // the broadcast's start *and* the capture's remote clock, because for it
     // they are one event. A stream-level correction from ls-audit is not: it
     // moves the entry's date without claiming anything about the player's t=0.
+    /* Everything the packet claims about the merged chat, validated HERE —
+       before a single row is written — rather than two hundred lines below
+       where it used to be. These read `b.stream` and touch no table, so being
+       late was an accident of where they were typed; and being late is exactly
+       what let a 400 leave a written capture row behind it. */
+    const sPre = b.stream ?? {};
+    let chatSources;
+    if (sPre.chat_sources !== undefined && sPre.chat_sources !== null) {
+      const list = [...new Set([].concat(sPre.chat_sources).join(',').split(',')
+        .map((x) => x.trim().toUpperCase()).filter(Boolean))].sort();
+      const badP = list.filter((x) => !['YT', 'TW'].includes(x));
+      if (badP.length) {
+        return res.status(400).json({ error: 'chat_sources must be YT and/or TW', fields: badP });
+      }
+      chatSources = list.join(',') || null;
+    }
+
+    /* The file's description of itself. Rejected rather than coerced: a
+       negative message count and the string "lots" are the same bug seen from
+       here, and storing either would put a number on the panel that nobody
+       can trace back to anything. */
+    const chatNums = {};
+    const chatBad = [];
+    for (const [k, min] of [['chat_version', 1], ['chat_messages', 0],
+                            ['chat_first_ms', 0], ['chat_last_ms', 0]]) {
+      if (sPre[k] === undefined || sPre[k] === null) continue;
+      const n = Number(sPre[k]);
+      if (!Number.isInteger(n) || n < min) chatBad.push(k);
+      else chatNums[k] = n;
+    }
+    if (chatNums.chat_first_ms != null && chatNums.chat_last_ms != null
+        && chatNums.chat_first_ms > chatNums.chat_last_ms) {
+      chatBad.push('chat_first_ms');
+    }
+    let chatMod;
+    if (sPre.chat_moderation !== undefined && sPre.chat_moderation !== null) {
+      const mod = canonModeration(sPre.chat_moderation);
+      if (mod === null) chatBad.push('chat_moderation');
+      else chatMod = mod;
+    }
+    if (chatBad.length) {
+      return res.status(400).json({
+        error: 'chat metadata must be whole numbers, a first no later than a '
+             + 'last, and moderation of YT/TW to complete|none|unknown',
+        fields: chatBad });
+    }
+
     const started = Number(b.started_at ?? b.stream?.started_at ?? t);
     const tz = Number(b.tz_offset_min ?? b.stream?.tz_offset_min ?? 0);
     const title = String(b.title ?? b.stream?.title ?? '').trim()
       || `${platform} ${remoteId}`;
     let streamId, captureId = null, created = false, pairedWith = null;
 
+    /* ── one transaction, from the first read to the last write ──────────
+     *
+     * This handler spans ~260 lines and writes `stream`, `capture` and the
+     * chat columns. It ran none of it in a transaction — `tx()` is used ten
+     * times elsewhere in this file and was not used once here — so a failure
+     * partway left a half-applied packet: a capture row written, a stream row
+     * not, and no way to tell from the outside.
+     *
+     * BEGIN IMMEDIATE also makes the upsert actually an upsert. The
+     * read-then-write below ("is there already a capture with this
+     * remote_id", "is there a mate to pair with") is the whole identity
+     * decision of the ingest path, and two packets arriving together could
+     * both read "no" and both create a stream.
+     *
+     * Refusals inside throw and are turned back into their status codes
+     * outside, so a rejected packet rolls back rather than committing whatever
+     * it had managed first. */
+    const refuse = (status, body) => { const e = new Error('refused'); e.refuse = { status, body }; throw e; };
+    let idx, state, refused = [];
+    try {
+    tx(W, () => {
     // Upsert on (platform, remote_id): retries are free and a crashed daemon
     // can simply re-post.
     const existing = W.prepare(
@@ -1216,12 +1335,12 @@ export function makeApp(config = CONFIG) {
     // here would only be able to reach a worse answer than the one it was told.
     const wantStream = b.stream_id ? String(b.stream_id) : null;
     if (wantStream && !W.prepare('SELECT 1 FROM stream WHERE id = ?').get(wantStream)) {
-      return res.status(404).json({ error: `no stream ${wantStream}` });
+      refuse(404, { error: `no stream ${wantStream}` });
     }
     if (wantStream && existing && existing.stream_id !== wantStream) {
       // Moving a capture between streams is a repair, not an observation. It
       // has to go through a changeset so it lands in the history with a reason.
-      return res.status(409).json({
+      refuse(409, {
         error: 'this capture is already on a different stream',
         capture_id: existing.id, on_stream: existing.stream_id, wanted: wantStream,
       });
@@ -1343,12 +1462,28 @@ export function makeApp(config = CONFIG) {
     // stream is recorded as starting at 09:00 or 09:05.
     const sIn = b.stream ?? {};
     const sCols = {};
-    if (sIn.title !== undefined && sIn.title !== null) sCols.title = String(sIn.title);
+
+    /* `pinned()` answers "did a PERSON decide this, or did a machine measure
+       it" — and until now server.js never asked it. It exists in archive.js
+       and is called three times, all about duration_s, none of them here.
+       So an editor corrected a title by hand, the next packet from ls-audit
+       put the recorder's back, and the applied change row survived: the log
+       and pinned() both went on reporting the human's value while the row held
+       the machine's. That is the archive contradicting its own history, which
+       is the one thing the changeset design exists to prevent.
+       Only these three. The chat columns below describe a file the recorder
+       made and nobody edits by hand, and duration_s is refused outright a few
+       lines up because recompute() derives it. */
+    const observe = (field, value) => {
+      if (created || !pinned(W, streamId, field)) { sCols[field] = value; return; }
+      refused.push(field);
+    };
+    if (sIn.title !== undefined && sIn.title !== null) observe('title', String(sIn.title));
     if (sIn.started_at !== undefined && sIn.started_at !== null) {
-      sCols.started_at = Number(sIn.started_at);
+      observe('started_at', Number(sIn.started_at));
     }
     if (sIn.tz_offset_min !== undefined && sIn.tz_offset_min !== null) {
-      sCols.tz_offset_min = Number(sIn.tz_offset_min);
+      observe('tz_offset_min', Number(sIn.tz_offset_min));
     }
     // The merged chat, and the record of which platforms are inside it. Written
     // together on purpose: the sources list is only meaningful as a description
@@ -1357,43 +1492,10 @@ export function makeApp(config = CONFIG) {
     if (sIn.chat_path !== undefined && sIn.chat_path !== null) {
       sCols.chat_path = String(sIn.chat_path);
     }
-    if (sIn.chat_sources !== undefined && sIn.chat_sources !== null) {
-      const list = [...new Set([].concat(sIn.chat_sources).join(',').split(',')
-        .map((p) => p.trim().toUpperCase()).filter(Boolean))].sort();
-      const bad = list.filter((p) => !['YT', 'TW'].includes(p));
-      if (bad.length) {
-        return res.status(400).json({ error: 'chat_sources must be YT and/or TW', fields: bad });
-      }
-      sCols.chat_sources = list.join(',') || null;
-    }
-
-    /* The file's description of itself. Rejected rather than coerced: a
-       negative message count and the string "lots" are the same bug seen from
-       here, and storing either would put a number on the panel that nobody
-       can trace back to anything. */
-    const chatBad = [];
-    for (const [k, min] of [['chat_version', 1], ['chat_messages', 0],
-                            ['chat_first_ms', 0], ['chat_last_ms', 0]]) {
-      if (sIn[k] === undefined || sIn[k] === null) continue;
-      const n = Number(sIn[k]);
-      if (!Number.isInteger(n) || n < min) chatBad.push(k);
-      else sCols[k] = n;
-    }
-    if (sCols.chat_first_ms != null && sCols.chat_last_ms != null
-        && sCols.chat_first_ms > sCols.chat_last_ms) {
-      chatBad.push('chat_first_ms');
-    }
-    if (sIn.chat_moderation !== undefined && sIn.chat_moderation !== null) {
-      const mod = canonModeration(sIn.chat_moderation);
-      if (mod === null) chatBad.push('chat_moderation');
-      else sCols.chat_moderation = mod;
-    }
-    if (chatBad.length) {
-      return res.status(400).json({
-        error: 'chat metadata must be whole numbers, a first no later than a '
-             + 'last, and moderation of YT/TW to complete|none|unknown',
-        fields: chatBad });
-    }
+    // Already validated at the top of the handler, before any write.
+    if (chatSources !== undefined) sCols.chat_sources = chatSources;
+    Object.assign(sCols, chatNums);
+    if (chatMod !== undefined) sCols.chat_moderation = chatMod;
     /* Which file all of that describes. Taken from this same packet when it
        carries a path, and otherwise from the row — never from the caller,
        because a description and the claim about what it describes arriving
@@ -1420,12 +1522,29 @@ export function makeApp(config = CONFIG) {
                  updated_at=? WHERE id=?`).run(...Object.values(sCols), t, streamId);
     }
 
-    const state = recompute(W, streamId, { mediaRoot: config.mediaRoot });
+    idx = W.prepare('SELECT idx FROM stream WHERE id = ?').get(streamId).idx;
+    });
+    } catch (e) {
+      if (e?.refuse) return res.status(e.refuse.status).json(e.refuse.body);
+      throw e;
+    }
+
+    /* AFTER the commit, and deliberately. recompute() stats every capture file
+       when mediaRoot is set, and holding the write lock across filesystem IO
+       would make contention worse than the problem it is solving. Its failure
+       is logged rather than returned, for the same reason as in apply(): the
+       packet HAS landed, and answering a landed write with a 500 is what makes
+       a recorder retry into a duplicate. */
+    try { state = recompute(W, streamId, { mediaRoot: config.mediaRoot }); }
+    catch (e) { console.error(`ingest ${streamId}: recompute failed:`, e?.message ?? e); }
     bumpGeneration(W);
-    const idx = W.prepare('SELECT idx FROM stream WHERE id = ?').get(streamId).idx;
     res.json({ id: streamId, index: idx, capture_id: captureId, created,
-               paired_with: pairedWith, vod_state: state.vod_state,
-               chat_state: state.chat_state });
+               paired_with: pairedWith, vod_state: state?.vod_state ?? null,
+               chat_state: state?.chat_state ?? null,
+               /* Said out loud rather than silently dropped. A recorder that
+                  keeps reporting a title somebody has corrected should be able
+                  to see that it is being ignored, and why. */
+               ...(refused.length ? { pinned: refused } : {}) });
   });
 
   // -------------------------------------------------------------------------
@@ -1897,6 +2016,19 @@ export function makeApp(config = CONFIG) {
           logEvent(req, verb, 'snippet', c.target_id, null, csId);
         } else if (c.target_type === 'tag' && c.op === 'create' && c.field === 'name') {
           logEvent(req, 'minted', 'tag', c.target_id, { name: c.value }, csId);
+        } else if (c.target_type === 'music' && c.op === 'delete') {
+          logEvent(req, 'retracted', 'music', c.target_id,
+                   { title: R.prepare('SELECT title FROM music WHERE id = ?')
+                     .get(c.target_id)?.title ?? null }, csId);
+        } else if (c.target_type === 'tag' && c.op === 'delete') {
+          /* The tombstone, which the log never used to mention — so a tag
+             could vanish from every picker in the archive and the only record
+             was a changeset nobody opens. `name` is read now because the row
+             survives a retraction; after a purge it would not. */
+          logEvent(req, 'retracted', 'tag', c.target_id, { name: name(c.target_id) }, csId);
+        } else if (c.target_type === 'tag' && c.op === 'update' && c.field === 'name') {
+          logEvent(req, 'renamed', 'tag', c.target_id,
+                   { from: c.base_value, to: c.value }, csId);
         }
       }
     } catch (e) { console.error('log changeset:', e?.message ?? e); }
@@ -2369,7 +2501,8 @@ export function makeApp(config = CONFIG) {
      choosing, and a rescan payload names URLs for the recorder to go and
      probe. The one route that makes them builds the payload out of capture
      rows instead, so the URLs are always ones the archive already recorded. */
-  const JOB_KINDS = ['fetch', 'promote', 'purge', 'normalize', 'transcribe'];
+  const JOB_KINDS = ['fetch', 'promote', 'purge', 'normalize', 'transcribe',
+                     'music_probe', 'music_fetch'];
   /* What the RECORDER may claim. `normalize` is missing on purpose: it runs in
      this process, against the cache mount, and a Pi that claimed one would
      hold a lease on work it cannot do and cannot see the files for. Kept as a
@@ -2382,7 +2515,12 @@ export function makeApp(config = CONFIG) {
   /* `rescan` is the Pi's for the same reason promote is: the masters are on a
      mount this process can only read, and the platform probe wants a network
      and a cookie jar that live on the recorder. */
-  const PI_KINDS = ['fetch', 'promote', 'purge', 'rescan', 'harvest'];
+  /* Both music kinds are the Pi's: each one opens an outbound socket, and
+     the archive opening one is the thing this whole arrangement exists to
+     avoid. `music_probe` reads facts off a page; `music_fetch` downloads a
+     video that an editor has already said yes to. */
+  const PI_KINDS = ['fetch', 'promote', 'purge', 'rescan', 'harvest',
+                    'music_probe', 'music_fetch'];
   /* A clip that is published and whose master is still in quarantine. Written
      once because two things ask it — the panel, to say how many, and the sweep,
      to do something about them — and a count that disagreed with what the
@@ -2510,6 +2648,93 @@ export function makeApp(config = CONFIG) {
     bumpGeneration(W);
   }
 
+  /* ── what the two music jobs report ──────────────────────────────────────
+   *
+   * Both write DIRECTLY rather than through a changeset, for the same reason
+   * `harvest` does: this is an OBSERVATION of somebody else's page, not a
+   * decision the archive is taking. Nobody has to answer for what YouTube says
+   * the upload date is. The editorial decisions around it — approving it,
+   * retracting it, correcting a title — all still go through changesets and
+   * still have an author.
+   */
+  const musicById = (id) => R.prepare('SELECT * FROM music WHERE id = ?').get(id);
+  const musicJobTarget = (job) => {
+    try { return String(JSON.parse(job.payload ?? '{}')?.music_id ?? '') || null; }
+    catch { return null; }
+  };
+
+  /** Facts only: what the video is called, who uploaded it, when, how long. */
+  function musicProbeLanded(job, status, result, error) {
+    const id = musicJobTarget(job);
+    if (!id || !musicById(id)) return;
+    const t = now();
+    if (status !== 'done' || !result || typeof result !== 'object') {
+      /* A failed probe is not a failed submission. The row keeps its link and
+         its tags and stays reviewable — an editor can watch the embed, which
+         is where the title was going to come from anyway. */
+      W.prepare(`UPDATE music SET probe_status = 'failed', probe_note = ?, updated_at = ?
+                  WHERE id = ?`)
+        .run(String(error ?? 'the recorder could not read it').slice(0, 300), t, id);
+      bumpGeneration(W);
+      return;
+    }
+    const str = (v, n) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, n) : null);
+    const int = (v) => (Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : null);
+    W.prepare(
+      `UPDATE music SET title = COALESCE(?, title), channel = COALESCE(?, channel),
+                        channel_id = COALESCE(?, channel_id),
+                        uploaded_at = COALESCE(?, uploaded_at),
+                        duration_s = COALESCE(?, duration_s),
+                        probe_status = 'done', probe_note = NULL, updated_at = ?
+        WHERE id = ?`)
+      .run(str(result.title, 300), str(result.channel, 200), str(result.channel_id, 64),
+           int(result.uploaded_at), int(result.duration_s), t, id);
+    bumpGeneration(W);
+  }
+
+  /** The preservation copy. Only ever queued after an approval. */
+  function musicFetchLanded(job, status, resultPath, error, result) {
+    const id = musicJobTarget(job);
+    if (!id || !musicById(id)) return;
+    const t = now();
+    if (status !== 'done') {
+      /* The entry stays published. It is the PRESERVATION that failed, not the
+         song — the embed still plays, and a retry is an editor's call. */
+      W.prepare(`UPDATE music SET fetch_status = 'failed', fetch_note = ?, updated_at = ?
+                  WHERE id = ?`)
+        .run(String(error ?? 'the recorder could not fetch it').slice(0, 300), t, id);
+      bumpGeneration(W);
+      return;
+    }
+    /* A path relative to the MEDIA root, not to quarantine. Music skips the
+       quarantine-then-promote dance that an upload needs, because the approval
+       already happened — the bytes are only ever asked for once a human has
+       said yes, so there is nothing left to hold them for.
+       Still resolved rather than trusted: resolveMedia does the containment,
+       so `../../etc/passwd` from a compromised worker resolves to null. */
+    const rel = String(resultPath ?? '').trim();
+    const abs = rel && config.mediaRoot ? resolveMedia(config.mediaRoot, rel) : null;
+    if (!abs || !existsSync(abs)) {
+      W.prepare(`UPDATE music SET fetch_status = 'failed', fetch_note = ?, updated_at = ?
+                  WHERE id = ?`)
+        .run('the recorder reported a file that is not under the media root', t, id);
+      bumpGeneration(W);
+      return;
+    }
+    const thumb = (() => {
+      const p = String(result?.thumb_path ?? '').trim();
+      if (!p) return null;
+      return config.mediaRoot && resolveMedia(config.mediaRoot, p) ? p : null;
+    })();
+    W.prepare(
+      `UPDATE music SET video_path = ?, thumb_path = COALESCE(?, thumb_path),
+                        bytes = ?, fetch_status = 'done', fetch_note = NULL, updated_at = ?
+        WHERE id = ?`)
+      .run(rel, thumb, Number.isFinite(Number(result?.bytes)) ? Math.trunc(result.bytes) : null,
+           t, id);
+    bumpGeneration(W);
+  }
+
   const jobRow = (r) => ({
     id: r.id, kind: r.kind, status: r.status,
     snippet_id: r.snippet_id, url: r.url,
@@ -2627,6 +2852,10 @@ export function makeApp(config = CONFIG) {
   function jobLanded(job, status, resultPath, error, result = null) {
     if (job.kind === 'rescan') return void rescanLanded(job, status, result);
     if (job.kind === 'harvest') return void harvestLanded(job, status, result, resultPath);
+    if (job.kind === 'music_probe') return void musicProbeLanded(job, status, result, error);
+    if (job.kind === 'music_fetch') {
+      return void musicFetchLanded(job, status, resultPath, error, result);
+    }
     if (!job.snippet_id) return;
     const t = now();
 
@@ -3719,18 +3948,24 @@ export function makeApp(config = CONFIG) {
   const grantsOf = (id) => (id ? GRANTS_OF.all(id).map((r) => r.name) : []);
 
   /** The WHERE fragment. Empty string when the viewer may see everything. */
-  const gateSql = (req) => {
+  /* Parameterised over the junction, because the RULE is the subtle part and
+     there is now more than one thing wearing a tag. A second copy of this for
+     music would be a second place for "must clear ALL of them" to be got
+     wrong, and the two would drift the first time a gate rule changed. The
+     defaults are the snippet case, so every existing caller reads the same. */
+  const gateSql = (req, { junction = 'snippet_taglet', fk = 'snippet_id',
+                          alias = 's' } = {}) => {
     if (atLeast(req.person, 'editor')) return { sql: '', params: [] };
     const held = grantsOf(req.person?.id ?? null);
-    /* NOT EXISTS and not a join: a snippet can carry several gating taglets and
-       must clear ALL of them, and a join would return it once per gate it does
-       clear. Written as "has a gating taglet this person cannot open". */
+    /* NOT EXISTS and not a join: a row can carry several gating tags and must
+       clear ALL of them, and a join would return it once per gate it does
+       clear. Written as "has a gating tag this person cannot open". */
     const inner = held.length
       ? `AND t.gate NOT IN (${held.map(() => '?').join(',')})`
       : '';
     return {
-      sql: `NOT EXISTS (SELECT 1 FROM snippet_taglet st JOIN tag t ON t.id = st.tag_id
-                         WHERE st.snippet_id = s.id AND t.retracted_at IS NULL
+      sql: `NOT EXISTS (SELECT 1 FROM ${junction} st JOIN tag t ON t.id = st.tag_id
+                         WHERE st.${fk} = ${alias}.id AND t.retracted_at IS NULL
                            AND t.gate IS NOT NULL ${inner})`,
       params: held,
     };
@@ -3771,7 +4006,10 @@ export function makeApp(config = CONFIG) {
   const snipVisible = (row, req) =>
     !!row
     && (row.status === 'confirmed'
-        || atLeast(req.person, 'editor')
+        /* The capability, not the role. Whoever may read the queue may read
+           what is in it — asked here the same way `?status=` asks it, so the
+           list and the single row cannot drift apart. */
+        || can(req.person, 'review.read')
         || (row.status === 'proposed'
             && !!row.author_id && row.author_id === req.person?.id))
     /* Second, and separately: publication says whether it is part of the
@@ -3781,11 +4019,20 @@ export function makeApp(config = CONFIG) {
 
   /* The same rule as a WHERE fragment, so the list cannot disagree with the
      routes that serve what the list linked to. A null `me` collapses it back
-     to the published-only clause the archive has always had. */
-  const snipVisibleSql = (me) => (me
-    ? { sql: `(s.status = 'confirmed' OR (s.status = 'proposed' AND s.author_id = ?))`,
-        params: [me] }
-    : { sql: `s.status = 'confirmed'`, params: [] });
+     to the published-only clause the archive has always had.
+     Takes the REQUEST and not just an id, because the rule now has three
+     branches rather than two: whoever may read the queue sees every status
+     inline — the Snippets panel draws a waiting clip in yellow and a removed
+     one in red rather than sending them to a separate pile — and that is the
+     same question `snipVisible()` above answers for one row. */
+  const snipVisibleSql = (req) => {
+    if (can(req?.person, 'review.read')) return { sql: '1=1', params: [] };
+    const me = req?.person?.id ?? null;
+    return me
+      ? { sql: `(s.status = 'confirmed' OR (s.status = 'proposed' AND s.author_id = ?))`,
+          params: [me] }
+      : { sql: `s.status = 'confirmed'`, params: [] };
+  };
 
   const TAGLETS_OF = R.prepare(
     // st.id comes back as link_id because detaching deletes the JUNCTION, not
@@ -3902,11 +4149,15 @@ export function makeApp(config = CONFIG) {
        URL legitimately answers differently for an editor and for everyone
        else, and a shared ETag would let one of them be served the other's
        page. */
-    const mayReview = atLeast(req.person, 'editor');
+    /* Asked as a capability, not as a role: the Queued and Removed piles are
+       now reachable from the Snippets panel as well as from Review, and both
+       arrive here as `?status=`. Whoever may READ the queue may read it from
+       either place — that is one question, and this is where it is answered. */
+    const mayReview = can(req.person, 'review.read');
     const me = req.person?.id ?? null;
     const wantStatus = req.query.status ? String(req.query.status) : null;
     if (wantStatus && !mayReview) {
-      return res.status(403).json({ error: 'only editors may filter by review status' });
+      return res.status(403).json({ error: 'filtering by review status requires review.read' });
     }
 
     /* Tag filtering is a small boolean expression now, not one slug.
@@ -3948,7 +4199,7 @@ export function makeApp(config = CONFIG) {
     if (wantStatus === 'all') { /* every status; editors only, checked above */ }
     else if (wantStatus) { where.push('s.status = ?'); params.push(wantStatus); }
     else {
-      const v = snipVisibleSql(me);
+      const v = snipVisibleSql(req);
       where.push(v.sql);
       params.push(...v.params);
     }
@@ -4064,7 +4315,9 @@ export function makeApp(config = CONFIG) {
   });
 
   app.get('/api/snippets/:id', (req, res) => {
-    const mayReview = atLeast(req.person, 'editor');
+    // Same capability as the list above, so one row and a page of rows cannot
+    // disagree about who is allowed to see an unpublished clip.
+    const mayReview = can(req.person, 'review.read');
     const me = req.person?.id ?? null;
     const etag = etagFor('snip', req.params.id, mayReview, me);
     if (fresh(req, res, etag, { personal: !!me })) return res.status(304).end();
@@ -4234,7 +4487,7 @@ export function makeApp(config = CONFIG) {
      past whoever reads it later. propose() with fifty change rows gives an
      editor auto-apply, provenance stamped by the applier, and a single
      reversible unit — which is also what makes Undo in the panel honest. */
-  app.post('/api/snippets/review', requireRole('editor'), (req, res) => {
+  app.post('/api/snippets/review', requireCap('review.decide'), (req, res) => {
     const { ids, decision, note = null } = req.body ?? {};
     const list = [...new Set([].concat(ids ?? []).map(String).filter(Boolean))];
     if (!list.length) return res.status(400).json({ error: 'ids is required' });
@@ -4258,6 +4511,11 @@ export function makeApp(config = CONFIG) {
     try {
       const out = propose(W, {
         authorId: req.person.id,
+        /* The route has already decided, at `requireRole('editor')` above, and
+           the changes it builds are its own rather than the caller's. Saying so
+           is what keeps propose()'s missing-person error meaningful everywhere
+           else. */
+        trusted: true,
         reason: note ?? `${decision} ${move.length} snippet${move.length === 1 ? '' : 's'}`,
         autoApply: true,
         mediaRoot: config.mediaRoot,
@@ -4737,7 +4995,7 @@ export function makeApp(config = CONFIG) {
        FROM person ORDER BY created_at DESC LIMIT 500`).all() });
   });
 
-  app.post('/api/admin/people/:id/role', requireRole('admin'), (req, res) => {
+  app.post('/api/admin/people/:id/role', requireCap('people.manage'), (req, res) => {
     const { role } = req.body ?? {};
     if (!ROLES.includes(role)) return res.status(400).json({ error: `role must be one of ${ROLES}` });
     if (req.params.id === req.person.id && role !== 'admin') {
@@ -5277,6 +5535,495 @@ export function makeApp(config = CONFIG) {
    * in the change log if a human ever wrote one, and `seeded` says whether one
    * did.
    */
+  /** Destroy a tag and every link to it. The archive's second irreversible
+   *  action, and the first that can take editorial work with it.
+   *
+   *  TWO CALLS, ALWAYS. The first returns what would be destroyed and changes
+   *  nothing; the second has to name the same counts back. That is not
+   *  ceremony — retracting is the reversible verb and every surface offers it,
+   *  so the only reason to reach this one is to remove a tag that should never
+   *  have existed, and the difference between that and a tag with forty
+   *  chapters on it is exactly the number this hands back. A confirm dialog
+   *  that cannot say how much it is about to take is not a confirmation.
+   *
+   *  Deliberately NOT a changeset. A changeset's `delete` op tombstones — that
+   *  is `tag.retract`, and it is what an editor is trusted with. This removes
+   *  rows, and rows that are gone cannot be reviewed, reverted or explained
+   *  later. It gets its own capability and its own log line instead.
+   *
+   *  `segment.tag_id` and `snippet.taglet_suggestions` are left alone on
+   *  purpose: ON DELETE SET NULL takes the block's link and leaves the block,
+   *  which is right — somebody drew that chapter, and the tag being wrong is
+   *  not a reason for the hour of stream it marks to disappear.
+   */
+  // =========================================================================
+  // music — somebody else's video, kept because it will not always be there
+  //
+  // The whole module is four routes, and that is the point of building it now:
+  // submission reuses the link canonicaliser the snippet uploader already has,
+  // retraction is a changeset like any other decision, and the capability
+  // table decides who may do what. Only the verdict needed a route of its own.
+  // =========================================================================
+
+  /** The YouTube id out of a canonical watch URL. linkUrl() has already
+   *  folded youtu.be and stripped everything but `v`, so this is a lookup and
+   *  not a parse — and it is the identity the row is keyed on, because the
+   *  same video reaches the archive as three different strings. */
+  const videoIdOf = (url) => {
+    try { return new URL(url).searchParams.get('v') || null; } catch { return null; }
+  };
+
+  /** One row, as the page reads it.
+   *
+   *  `embed` rather than a media path, because that is the only way this is
+   *  ever watched. `thumb` prefers the preserved copy and falls back to
+   *  YouTube's own — before approval there IS no preserved copy, and the
+   *  viewer's browser is talking to YouTube for the embed regardless. */
+  const musicRow = (r, tags = []) => ({
+    id: r.id, video_id: r.video_id, url: r.url,
+    title: r.title, channel: r.channel, channel_id: r.channel_id,
+    uploaded_at: r.uploaded_at, duration_s: r.duration_s,
+    status: r.status, note: r.note ?? null,
+    probe_status: r.probe_status, probe_note: r.probe_note ?? null,
+    fetch_status: r.fetch_status, fetch_note: r.fetch_note ?? null,
+    // Whether the archive actually holds a copy. The point of the module.
+    preserved: !!r.video_path,
+    /* Two different removals, and the panel shows them in one pile — so the
+       card has to be able to say which one happened to it. `rejected` is a
+       verdict on whether the song belongs; this is a tombstone on the row. */
+    retracted: !!r.retracted_at,
+    thumb: r.thumb_path ? `/media/thumb/${r.thumb_path}`
+                        : `https://i.ytimg.com/vi/${r.video_id}/hqdefault.jpg`,
+    embed: `https://www.youtube-nocookie.com/embed/${r.video_id}`,
+    author_id: r.author_id,
+    /* Present only where the query asked for it — the list joins it in, the
+       single-row reads do not. `?? null` rather than leaving it undefined so
+       the field is always in the JSON and the page has one thing to test. */
+    author: r.author_handle ?? null,
+    created_at: r.created_at, updated_at: r.updated_at,
+    tags,
+  });
+
+  const musicTagsFor = (ids) => {
+    const out = new Map(ids.map((id) => [id, []]));
+    if (!ids.length) return out;
+    for (const r of R.prepare(
+      /* `link_id` is the JUNCTION row, which is what a detach deletes — the tag
+         itself survives being taken off a song. It rides along here because
+         the alternative is what the snippet strip does: a second request per
+         removal just to ask which row joins these two. Same column, same
+         query, no round trip. */
+      `SELECT mt.music_id, mt.id AS link_id, t.id, t.name, t.slug, t.kind
+         FROM music_tag mt JOIN tag t ON t.id = mt.tag_id
+        WHERE mt.music_id IN (${ids.map(() => '?').join(',')})
+          AND t.retracted_at IS NULL
+        ORDER BY t.kind, t.name`).all(...ids)) {
+      out.get(r.music_id)?.push({ id: r.id, link_id: r.link_id,
+                                  name: r.name, slug: r.slug, kind: r.kind });
+    }
+    return out;
+  };
+
+  /** Who may see a row that is not published.
+   *
+   *  Same rule as snippets: a proposed entry is visible to the person who
+   *  submitted it and to anyone who may decide on it, and to nobody else. */
+  const musicVisibleSql = (req) => {
+    if (can(req.person, 'music.decide')) return { sql: '1=1', params: [] };
+    const me = req.person?.id ?? null;
+    return me
+      ? { sql: `(m.status = 'confirmed' OR m.author_id = ?)`, params: [me] }
+      : { sql: `m.status = 'confirmed'`, params: [] };
+  };
+
+  app.get('/api/music', (req, res) => {
+    const limit = Math.min(Math.max(Number(req.query.limit ?? 200) || 200, 1), 500);
+    const vis = musicVisibleSql(req);
+    const gate = gateSql(req, { junction: 'music_tag', fk: 'music_id', alias: 'm' });
+    const where = [vis.sql];
+    const params = [...vis.params];
+    if (gate.sql) { where.push(gate.sql); params.push(...gate.params); }
+
+    /* `?status=` picks a pile. It narrows what the two clauses above allow and
+       can never widen it.
+     *
+     * `rejected` is the odd one and it is the point of this shape: the removed
+     * pile holds BOTH ways a song leaves the collection — turned down, which
+     * is a verdict on whether it belongs, and retracted, which is a tombstone
+     * on the row. They arrive by different routes and they mean different
+     * things, but from the shelf they are one answer: it is not here any more.
+     *
+     * Retracted rows used to be filtered out unconditionally, everywhere, so a
+     * retraction removed a song from every view with no screen that could
+     * bring it back — while its own confirm dialog promised it could be. This
+     * is where they go now, and where an admin can finish the job.
+     */
+    const want = String(req.query.status ?? '');
+    if (want === 'rejected') {
+      where.push(`(m.status = 'rejected' OR m.retracted_at IS NOT NULL)`);
+    } else if (['proposed', 'confirmed'].includes(want)) {
+      where.push('m.retracted_at IS NULL');
+      where.push('m.status = ?'); params.push(want);
+    } else if (can(req.person, 'music.decide')) {
+      /* No pile asked for, and somebody who may decide: the whole collection,
+         every status, tombstones included. The panel has no pile switcher any
+         more — a waiting song is drawn in yellow and a removed one in red,
+         where the songs are — so the ONE list has to be able to contain them.
+         Tombstones especially: they are reversible, and a reversible thing
+         nothing can show you is a thing nobody will ever reverse. */
+    } else {
+      /* Everyone else gets the collection: published songs, plus their own
+         submission so that pasting a link visibly does something. A song
+         somebody turned down is not part of the collection, and a tombstoned
+         row is not either. */
+      where.push('m.retracted_at IS NULL');
+      where.push(`m.status <> 'rejected'`);
+    }
+
+    /* Search, and it is the snippet search's LIKE half and nothing else.
+       There is no music_fts and there should not be: FTS earns its place over
+       there because a transcript is thousands of words, and everything
+       searchable here — a title, a channel, a tag's name — is a handful. A
+       porter-stemmed index over those would be slower to maintain than the
+       scan it replaced AND worse at the job, because it cannot match
+       mid-word: `fuura` would stop finding "Fuura Yuri". The snippet route
+       says the same thing about its own two LIKEs, for the same reason.
+
+       Tags are searched alongside the text rather than through a separate
+       control. On this collection they are how you look for anything — the
+       question is nearly always "what has she sung" — and one box that
+       answers it needs no explaining. */
+    const q = String(req.query.q ?? '').trim().toLowerCase();
+    if (q) {
+      const like = `%${q}%`;
+      where.push(`(lower(m.title) LIKE ? OR lower(m.channel) LIKE ?
+                   OR EXISTS (SELECT 1 FROM music_tag mt JOIN tag t ON t.id = mt.tag_id
+                               WHERE mt.music_id = m.id AND t.retracted_at IS NULL
+                                 AND (lower(t.name) LIKE ? OR t.slug LIKE ?)))`);
+      params.push(like, like, like, like);
+    }
+    /* Shelved by when the SONG came out, not by when somebody got round to
+       pasting it. This is a collection stitched together from a dozen channels
+       and the question it answers is "what is there", so the natural order is
+       the catalogue's, not the queue's.
+
+       COALESCE, and it does two jobs. A row whose probe has not landed has no
+       upload date at all, and a bare `uploaded_at DESC` would sort those FIRST
+       in SQLite — NULL is the smallest value, so descending puts it on top,
+       and the shelf would open with a row of songs nothing is known about.
+       Falling back to `created_at` puts a just-submitted entry where the person
+       who submitted it will look for it, and moves it to its real place the
+       moment the probe answers.
+
+       Not indexed, deliberately: an expression index for a few hundred rows
+       would cost more to maintain than the sort it saves. */
+    /* The submitter's handle rides along. Only the review queue reads it — "who
+       put this forward" is part of judging a submission — and it is a LEFT
+       JOIN on a column already indexed, so the shelf pays nothing for it. */
+    /* Three bands, then the catalogue order inside each.
+     *
+     * The shelf sorts by RELEASE date, which is right for a catalogue and
+     * wrong for a submission: a 2019 song pasted this morning would land in
+     * the middle of two hundred cards, and the panel no longer has a Queued
+     * pile to catch it. So anything still waiting is pinned to the top, where
+     * whoever can decide will trip over it, and anything removed sinks to the
+     * bottom, where it is out of the way but still reachable — which is the
+     * whole reason it is in this list at all.
+     *
+     * Both flags are no-ops for a reader without `music.decide`: the visibility
+     * clause has already left them with published songs and their own, so the
+     * first band holds their submission and the third is empty.
+     *
+     * No cursor to keep in step, unlike the snippet list — this endpoint pages
+     * by `limit` alone, which is what makes reordering it free. */
+    const rows = R.prepare(
+      `SELECT m.*, p.handle AS author_handle
+         FROM music m LEFT JOIN person p ON p.id = m.author_id
+        WHERE ${where.join(' AND ')}
+        ORDER BY (m.status = 'proposed' AND m.retracted_at IS NULL) DESC,
+                 (m.status = 'rejected' OR m.retracted_at IS NOT NULL) ASC,
+                 COALESCE(m.uploaded_at, m.created_at) DESC, m.id DESC LIMIT ?`)
+      .all(...params, limit);
+    const tags = musicTagsFor(rows.map((r) => r.id));
+    res.json({ music: rows.map((r) => musicRow(r, tags.get(r.id) ?? [])),
+               count: rows.length });
+  });
+
+  /** One song, by id.
+   *
+   *  Here so that a card can repaint itself after a tag write instead of the
+   *  panel reloading the whole grid and throwing away your scroll position —
+   *  the same job `/api/snippets/:id` does for a clip row, answered the same
+   *  way, including the 404-not-403 for something you may not see. */
+  app.get('/api/music/:id', (req, res) => {
+    const vis = musicVisibleSql(req);
+    const gate = gateSql(req, { junction: 'music_tag', fk: 'music_id', alias: 'm' });
+    const r = R.prepare(
+      `SELECT m.*, p.handle AS author_handle
+         FROM music m LEFT JOIN person p ON p.id = m.author_id
+        WHERE m.id = ? AND ${vis.sql}${gate.sql ? ` AND ${gate.sql}` : ''}`)
+      .get(req.params.id, ...vis.params, ...gate.params);
+    if (!r) return res.status(404).json({ error: 'no such entry' });
+    res.json({ music: musicRow(r, musicTagsFor([r.id]).get(r.id) ?? []) });
+  });
+
+  /** Put a link forward.
+   *
+   *  Everything expensive here was already solved for snippet links and is
+   *  reused rather than rewritten: linkUrl() canonicalises and enforces the
+   *  host allowlist, and the pending quota is the same number so there is one
+   *  figure to remember rather than two.
+   */
+  app.post('/api/music', requireCap('music.submit'), (req, res) => {
+    const me = req.person?.id ?? null;
+    if (!me) return res.status(401).json({ error: 'sign in first' });
+
+    const url = linkUrl(req.body?.url);
+    const videoId = url ? videoIdOf(url) : null;
+    if (!url || !videoId) {
+      return res.status(400).json({ error: 'a YouTube video link, please' });
+    }
+
+    /* The natural key, so the same song pasted from the share button and from
+       the address bar is one row. Named openly: unlike a snippet, nothing here
+       is gated at submission time, so there is nothing to disclose. */
+    const twin = R.prepare('SELECT id, title, status FROM music WHERE video_id = ?')
+      .get(videoId);
+    if (twin) {
+      return res.status(409).json({ error: 'that video is already in the archive',
+                                    music: { id: twin.id, title: twin.title, status: twin.status } });
+    }
+
+    const pending = R.prepare(
+      `SELECT COUNT(*) c FROM music
+        WHERE author_id = ? AND status = 'proposed' AND retracted_at IS NULL`).get(me).c;
+    if (pending >= UP_MAX_PENDING) {
+      return res.status(429).json({
+        error: `you already have ${pending} submissions waiting for review`,
+        pending, limit: UP_MAX_PENDING });
+    }
+
+    /* Tags come with the submission because that is when the person knows
+       them — they are pasting a song because they know who is singing it.
+       Written straight in rather than as a changeset: the ENTRY is what is
+       under review, and a tag on an unapproved row has decided nothing yet.
+       Unknown ids are dropped rather than refused; a mistyped tag should not
+       cost somebody their submission. */
+    const wanted = [...new Set((req.body?.tags ?? []).map(String).filter(Boolean))].slice(0, 40);
+    const known = wanted.length
+      ? R.prepare(`SELECT id FROM tag WHERE retracted_at IS NULL
+                    AND id IN (${wanted.map(() => '?').join(',')})`).all(...wanted).map((r) => r.id)
+      : [];
+
+    const t = now(), id = ulid();
+    tx(W, () => {
+      W.prepare(
+        `INSERT INTO music(id, video_id, url, note, probe_status, fetch_status,
+                           status, origin, author_id, created_at, updated_at)
+         VALUES(?,?,?,?,'queued','none','proposed','link',?,?,?)`)
+        .run(id, videoId, url, String(req.body?.note ?? '').trim().slice(0, 500) || null,
+             me, t, t);
+      const ins = W.prepare(
+        `INSERT INTO music_tag(id, music_id, tag_id, created_at, updated_at) VALUES(?,?,?,?,?)`);
+      for (const tagId of known) ins.run(ulid(), id, tagId, t, t);
+    });
+
+    /* An id and a verb. Where the file goes and what format it is are the
+       recorder's own config — the archive has never told a worker either.
+
+       This one is approved on creation even though a suggester asked for it,
+       which is a departure from the rule over enqueueJob ("the creator is
+       already an editor and the approval IS the editor's yes"). It is the
+       right departure: a probe is one metadata read of a public page, and
+       holding it for review would show the reviewer a card with no title —
+       so the thing they need in order to decide would be waiting on their
+       decision. The EXPENSIVE half keeps the rule: `music_fetch` spends disk
+       and the recorder's time, and it is queued in the review route below,
+       after a human has said yes. */
+    const jobId = enqueueJob('music_probe', { url, by: me,
+                                              payload: { music_id: id, video_id: videoId } });
+    logEvent(req, 'linked', 'music', id, { url, video_id: videoId, tags: known.length });
+    bumpGeneration(W);
+    res.status(201).json({
+      music: musicRow(R.prepare('SELECT * FROM music WHERE id = ?').get(id),
+                      musicTagsFor([id]).get(id) ?? []),
+      job_id: jobId, next: 'probe',
+    });
+  });
+
+  /** The verdict.
+   *
+   *  Through propose() rather than a direct UPDATE, and that is deliberate:
+   *  the archive's claim is that no value exists without a row saying who put
+   *  it there. `trusted` because this route has already asked the capability
+   *  question at the door and is writing its own change rather than relaying
+   *  the caller's.
+   */
+  app.post('/api/music/:id/review', requireCap('music.decide'), (req, res) => {
+    const STATUS = { approve: 'confirmed', reject: 'rejected', reset: 'proposed' };
+    const want = STATUS[String(req.body?.decision ?? '')];
+    if (!want) {
+      return res.status(400).json({ error: `decision must be one of ${Object.keys(STATUS)}` });
+    }
+    const m = R.prepare('SELECT * FROM music WHERE id = ? AND retracted_at IS NULL')
+      .get(req.params.id);
+    if (!m) return res.status(404).json({ error: 'no such entry' });
+    if (m.status === want) return res.json({ music: musicRow(m), changed: 0 });
+
+    try {
+      propose(W, {
+        authorId: req.person.id, trusted: true, autoApply: true,
+        reason: req.body?.note ?? `${req.body.decision} ${m.title ?? m.video_id}`,
+        changes: [{ target_type: 'music', target_id: m.id, op: 'update',
+                    field: 'status', value: want, base_value: m.status }],
+      });
+    } catch (e) { return changeError(res, e); }
+
+    const t = now();
+    let jobId = null;
+    if (want === 'confirmed' && m.fetch_status === 'none') {
+      /* The download starts HERE and nowhere else. Fetching at submission time
+         would mean the archive holds the bytes of things it has turned down —
+         and deciding afterwards whether to keep them is a question nobody
+         should have to answer twice. */
+      W.prepare(`UPDATE music SET fetch_status = 'queued', updated_at = ? WHERE id = ?`)
+        .run(t, m.id);
+      jobId = enqueueJob('music_fetch', { url: m.url, by: req.person.id,
+                                          payload: { music_id: m.id, video_id: m.video_id } });
+    }
+    if (want !== 'confirmed') {
+      /* Nothing is left running for something nobody wants. The same move
+         posterAftercare makes when a poster is cleared before it moves.
+
+         `!== 'confirmed'` and not `=== 'rejected'`, because Undo in the review
+         panel sends `reset`: approving queued a download, and taking the
+         approval back a second later has to take the download with it or the
+         archive keeps fetching something no longer approved. Un-rejecting is
+         the same clause reached from the other side and cancels nothing,
+         because a rejected row has no job left to cancel. */
+      W.prepare(
+        `UPDATE job SET status = 'cancelled', error = 'the entry was turned down',
+                        finished_at = ?, updated_at = ?
+          WHERE kind IN ('music_probe','music_fetch') AND status IN ('proposed','approved','claimed')
+            AND payload LIKE ?`).run(t, t, `%"${m.id}"%`);
+      W.prepare(`UPDATE music SET fetch_status = 'none', updated_at = ? WHERE id = ?`)
+        .run(t, m.id);
+    }
+    logEvent(req, want === 'confirmed' ? 'approved'
+      : want === 'rejected' ? 'rejected' : 'returned to the queue', 'music', m.id,
+      { title: m.title ?? null });
+    bumpGeneration(W);
+    res.json({ music: musicRow(R.prepare('SELECT * FROM music WHERE id = ?').get(m.id),
+                               musicTagsFor([m.id]).get(m.id) ?? []),
+               job_id: jobId, changed: 1 });
+  });
+
+  /** Destroy the row. Two calls, and the reversible step has to have happened
+   *  first — the same shape as the tag and snippet purges, for the same
+   *  reason: this is the one action nobody can undo. */
+  app.post('/api/music/:id/purge', requireCap('music.purge'), (req, res) => {
+    const m = R.prepare('SELECT * FROM music WHERE id = ?').get(req.params.id);
+    if (!m) return res.status(404).json({ error: 'no such entry' });
+    if (m.status === 'confirmed' && !m.retracted_at) {
+      return res.status(409).json({
+        error: 'turn it down or retract it first — a published entry cannot be purged in one step' });
+    }
+    const counts = {
+      tags: R.prepare('SELECT COUNT(*) c FROM music_tag WHERE music_id = ?').get(m.id).c,
+    };
+    if (!req.body?.confirm) {
+      return res.json({ preview: true, retracted: !!m.retracted_at,
+                        music: { id: m.id, title: m.title, video_id: m.video_id },
+                        counts, preserved: !!m.video_path, confirm: counts });
+    }
+    if (req.body.confirm.tags !== counts.tags) {
+      return res.status(409).json({ error: 'this entry changed since you looked — nothing was destroyed',
+                                    counts, you_saw: req.body.confirm });
+    }
+    /* The FILES are not ours to delete: they live under the media root, which
+       is mounted read-only for exactly this reason. The recorder is asked.
+
+       Both of them. Asking only for the video leaves the cover behind as an
+       orphan nothing points at — the same trap the snippet purge names when it
+       clears the cache derivatives, and a directory that fills with the
+       artwork of songs that no longer exist is worse than either. */
+    const jobs = [];
+    for (const path of [m.video_path, m.thumb_path]) {
+      if (path) jobs.push(enqueueJob('purge', { by: req.person.id, payload: { path } }));
+    }
+    const job = jobs[0] ?? null;
+    tx(W, () => {
+      W.prepare('DELETE FROM music_tag WHERE music_id = ?').run(m.id);
+      W.prepare('DELETE FROM music WHERE id = ?').run(m.id);
+    });
+    // The row is gone; this line is the only place its name still exists.
+    logEvent(req, 'destroyed', 'music', m.id,
+             { title: m.title, video_id: m.video_id, ...counts, master: !!job });
+    bumpGeneration(W);
+    res.json({ ok: true, destroyed: { id: m.id, title: m.title }, counts,
+               job_id: job, job_ids: jobs });
+  });
+
+  const tagPurgeCounts = (id) => ({
+    streams: R.prepare('SELECT COUNT(*) c FROM stream_tag WHERE tag_id = ?').get(id).c,
+    snippets: R.prepare('SELECT COUNT(*) c FROM snippet_taglet WHERE tag_id = ?').get(id).c,
+    blocks: R.prepare('SELECT COUNT(*) c FROM segment WHERE tag_id = ?').get(id).c,
+    children: R.prepare('SELECT COUNT(*) c FROM tag WHERE parent_id = ?').get(id).c,
+  });
+
+  app.post('/api/tags/:id/purge', requireCap('tag.purge'), (req, res) => {
+    const t = R.prepare('SELECT id, name, slug, retracted_at FROM tag WHERE id = ?')
+      .get(req.params.id);
+    if (!t) return res.status(404).json({ error: 'no such tag' });
+
+    const counts = tagPurgeCounts(t.id);
+    const total = counts.streams + counts.snippets + counts.blocks;
+
+    /* Phase one. No `confirm` in the body means the caller is asking, not
+       telling — so answer and write nothing. */
+    if (!req.body?.confirm) {
+      return res.json({
+        preview: true, tag: { id: t.id, name: t.name, slug: t.slug },
+        retracted: !!t.retracted_at, counts,
+        /* What the caller has to send back. Counts rather than a token: a
+           token only proves the round trip happened, while these change if
+           somebody tags something in between — which is the case actually
+           worth catching. */
+        confirm: { streams: counts.streams, snippets: counts.snippets, blocks: counts.blocks },
+      });
+    }
+
+    const said = req.body.confirm;
+    if (said.streams !== counts.streams || said.snippets !== counts.snippets
+        || said.blocks !== counts.blocks) {
+      return res.status(409).json({
+        error: 'this tag changed since you looked — nothing was destroyed',
+        counts, you_saw: said,
+      });
+    }
+
+    tx(W, () => {
+      W.prepare('DELETE FROM stream_tag WHERE tag_id = ?').run(t.id);
+      W.prepare('DELETE FROM snippet_taglet WHERE tag_id = ?').run(t.id);
+      /* Both are ON DELETE SET NULL, and both are done explicitly so the count
+         in the log is a count of what this did rather than of what SQLite did
+         afterwards. A child tag is orphaned, not destroyed — it is a tag in its
+         own right that happened to hang under this one. */
+      W.prepare('UPDATE segment SET tag_id = NULL, updated_at = ? WHERE tag_id = ?')
+        .run(now(), t.id);
+      W.prepare('UPDATE tag SET parent_id = NULL, updated_at = ? WHERE parent_id = ?')
+        .run(now(), t.id);
+      W.prepare('DELETE FROM tag WHERE id = ?').run(t.id);
+    });
+
+    /* The row is gone, so this line is the only place its name still exists.
+       That is the whole reason `event` denormalises the actor and the detail. */
+    logEvent(req, 'destroyed', 'tag', t.id,
+             { name: t.name, slug: t.slug, ...counts, was_retracted: !!t.retracted_at });
+    bumpGeneration(W);
+    res.json({ ok: true, destroyed: { id: t.id, name: t.name }, counts, total });
+  });
+
   app.post('/api/tags/:id/harvest', requireRole('editor'), (req, res) => {
     const t = R.prepare('SELECT id, name, seed_url FROM tag WHERE id = ? AND retracted_at IS NULL')
       .get(req.params.id);

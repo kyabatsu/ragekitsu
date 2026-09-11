@@ -8,6 +8,7 @@
   },
   "scripts": {
     "start": "node server.js",
+    "backup": "node scripts/backup.js",
     "check": "node scripts/check-db.js",
     "probe": "node scripts/probe-media.js",
     "rebuild": "node scripts/rebuild.js",

@@ -8,7 +8,7 @@ import { buildTimeline, segmentOverlaps } from '../archive.js';
 const argv = process.argv.slice(2);
 const i = argv.indexOf('--db');
 const path = (i !== -1 ? argv[i + 1] : argv.find((a) => !a.startsWith('--')))
-  || 'data/archive.db';
+  || process.env.TENMA_DB || 'data/archive.db';
 const full = resolveDbPath(path);
 
 // open() will happily conjure an empty database at a mistyped path, and then
@@ -34,7 +34,7 @@ const n = (t) => one(`SELECT COUNT(*) c FROM ${t}`).c;
 
 console.log(`\nschema v${meta(db, 'schema_version')}   generation ${meta(db, 'generation')}`);
 for (const t of ['stream', 'capture', 'note', 'segment', 'tag', 'stream_tag',
-                 'person', 'changeset', 'change', 'upload']) {
+                 'person', 'changeset', 'change']) {
   console.log(`  ${t.padEnd(12)} ${String(n(t)).padStart(6)}`);
 }
 

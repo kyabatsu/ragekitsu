@@ -14,6 +14,11 @@ import { execFileSync } from 'node:child_process';
 import { closeSync, openSync, readSync, statSync } from 'node:fs';
 import { extname, resolve, sep } from 'node:path';
 import { bit, bumpGeneration, isUlid, now, slugify, tx, ulid } from './db.js';
+/* One import, one function. auth.js imports only db.js, so this direction is
+   the safe one — archive.js → auth.js → db.js, no cycle. It is here rather
+   than at the routes because a permission that lives at the route is a
+   permission each new route has to remember. */
+import { can } from './auth.js';
 
 // ===========================================================================
 //  clocks
@@ -1262,6 +1267,23 @@ export const WRITABLE = {
   // before the merge name it, and a log that cannot resolve its own past is
   // not a log. See the vocab lookup in `summary()`.
   snippet_taglet: { snippet_id: 'text', tag_id: 'text' },
+  /* A music row is mostly OBSERVATION — the probe read the title, the channel
+     and the upload date off somebody else's page — so only the parts a human
+     has an opinion about are writable. `video_id` and `url` are the identity
+     and are not among them: editing either would silently repoint the row at
+     a different video while keeping its tags, its author and its verdict.
+     Correct one by retracting it and submitting the right link. */
+  music: {
+    // Correctable because a probe can be wrong, or a title can be a mess of
+    // brackets nobody wants to read on a card.
+    title: 'text', channel: 'text', uploaded_at: 'int', note: 'text',
+    // The verdict, so approving is a changeset like every other decision and
+    // lands in the history with an author. See the review route.
+    status: 'text',
+    // Writable so a retraction has a way back, exactly as on `stream`.
+    retracted_at: 'int',
+  },
+  music_tag: { music_id: 'text', tag_id: 'text' },
 };
 
 // Fields that must be present to create one of these from nothing.
@@ -1277,6 +1299,13 @@ const REQUIRED = {
   // no file is not.
   snippet: ['title', 'video_path'],
   snippet_taglet: ['snippet_id', 'tag_id'],
+  /* Nothing creates a music row through a changeset today — POST /api/music
+     does it, because a submission has to canonicalise a URL and enqueue a
+     probe before there is anything to review. Listed anyway: validate() reads
+     this for every create, and a target type missing from it fails with a
+     TypeError instead of a refusal. */
+  music: ['video_id', 'url'],
+  music_tag: ['music_id', 'tag_id'],
 };
 
 // Streams, notes and segments are tombstoned; captures and tags are genuinely
@@ -1285,7 +1314,10 @@ const REQUIRED = {
 // tombstone, and the changeset that did it is already the record.
 // A snippet is content and tombstones like a stream. snippet_taglet is a
 // junction and removes cleanly, same as stream_tag.
-const TOMBSTONED = new Set(['stream', 'note', 'segment', 'tag', 'snippet']);
+/* `music` tombstones: retracting is the reversible verb every role above
+   viewer can reach, and the row has to survive it so that an admin purge is a
+   second, separate decision rather than a consequence of the first. */
+const TOMBSTONED = new Set(['stream', 'note', 'segment', 'tag', 'snippet', 'music']);
 
 // What a hard delete has to write down before it happens.
 //
@@ -1301,6 +1333,7 @@ const TOMBSTONED = new Set(['stream', 'note', 'segment', 'tag', 'snippet']);
 const REMEMBER_ON_DELETE = {
   snippet_taglet: ['snippet_id', 'tag_id'],
   stream_tag: ['stream_id', 'tag_id'],
+  music_tag: ['music_id', 'tag_id'],
 };
 const OPS = new Set(['create', 'update', 'delete']);
 
@@ -1345,7 +1378,85 @@ const ENUMS = {
      watchSources, it simply boosts nothing, and the setting looks like it
      saved and then did not work. */
   'stream.serve_pref': ['youtube', 'twitch', 'mirror', 'local', 'remote'],
+  /* The same three words as a snippet, and for the same reason: a queue that
+     cannot tell "not looked at yet" from "looked at and declined" shows you
+     the same pile every time you open it. */
+  'music.status': ['proposed', 'confirmed', 'rejected'],
 };
+
+/* ── who may propose what ──────────────────────────────────────────────────
+ *
+ * One capability per (target_type, op), asked of every change in a changeset
+ * before any of it is written.
+ *
+ * ABSENT MEANS NO CAPABILITY IS REQUIRED, and that is deliberate rather than
+ * an oversight: only the tag half of the archive has moved onto capabilities
+ * so far. Notes, segments, streams, captures and snippets are exactly as they
+ * were — gated once at the route by requireRole('suggester') and then trusted
+ * — so this change cannot break a write path it was not aimed at. Moving them
+ * over later is adding rows here, and each row is a decision somebody has to
+ * make on purpose.
+ *
+ * The whole map is about the VERB, never about the queue. Nothing here says
+ * whether a change applies immediately; that is `change.apply`, asked once in
+ * propose(). A suggester and an editor both hold `tag.retract` — the
+ * difference is only that one of them waits.
+ *
+ * Every op of a covered type is listed, including the ones nothing sends
+ * today. A gap in this table is not a refusal, it is a bypass, so the table is
+ * kept total for the types it covers rather than minimal.
+ */
+const CHANGE_CAPS = {
+  'tag:create': 'tag.create',
+  'tag:update': 'tag.edit',
+  'tag:delete': 'tag.retract',       // `delete` on a tag tombstones — see TOMBSTONED
+  'stream_tag:create': 'tag.attach',
+  'stream_tag:update': 'tag.attach', // repointing a link is attaching a different tag
+  'stream_tag:delete': 'tag.detach',
+  'snippet_taglet:create': 'tag.attach',
+  'snippet_taglet:update': 'tag.attach',
+  'snippet_taglet:delete': 'tag.detach',
+  /* Music, and the shape is the tag one exactly. `music:update` covers the
+     verdict as well as the title, and a suggester proposing status='confirmed'
+     on their own submission is not an escalation — it is a suggestion, and it
+     queues like every other, so an editor still decides. */
+  'music:create': 'music.submit',
+  'music:update': 'music.edit',
+  'music:delete': 'music.retract',
+  /* The junction is a TAG operation, not a music one: attaching Fuura Yuri to
+     a song is the same act as attaching her to a stream, and someone trusted
+     to do one is trusted to do the other. */
+  'music_tag:create': 'tag.attach',
+  'music_tag:update': 'tag.attach',
+  'music_tag:delete': 'tag.detach',
+};
+
+/** The capability a change needs, or null when it needs none. */
+export const capabilityFor = (targetType, op) => CHANGE_CAPS[`${targetType}:${op}`] ?? null;
+
+/** Refuse a changeset the author may not make, before anything is written.
+ *
+ *  Reports EVERY capability the batch is short of rather than the first: a
+ *  mint-and-attach is four change rows across two types, and being told about
+ *  them one submit at a time is the kind of feedback that reads as the feature
+ *  being broken.
+ *
+ *  A null person is a trusted internal caller — see propose(), which will not
+ *  let a route reach this without saying which it is. */
+function authorize(person, list) {
+  if (!person) return;
+  const missing = new Map();          // capability -> the act that wanted it
+  for (const c of list) {
+    const need = capabilityFor(c.target_type, c.op);
+    if (!need || can(person, need)) continue;
+    missing.set(need, `${c.op === 'delete' ? 'remove' : c.op} ${c.target_type.replace(/_/g, ' ')}`);
+  }
+  if (!missing.size) return;
+  throw new ChangeError({
+    error: `your role cannot ${[...missing.values()].join(', or ')}`,
+    missing: [...missing.keys()],
+  }, 403);
+}
 
 /** name -> slug. Derived, never authored, so the two cannot drift apart.
  *
@@ -1397,8 +1508,13 @@ export function currentValue(db, targetType, targetId, field) {
   return row ? row.v : null;
 }
 
-/** Normalise and check a proposed change list. Throws ChangeError. */
-export function validate(db, changes) {
+/** Normalise and check a proposed change list. Throws ChangeError.
+ *
+ *  `person` is who is asking, and it is checked LAST — after normalisation, so
+ *  the capability question is asked of a cleaned-up `{target_type, op}` rather
+ *  than of whatever arrived on the wire. Null means a trusted internal caller;
+ *  propose() is what makes that choice explicit. */
+export function validate(db, changes, person = null) {
   if (!Array.isArray(changes) || !changes.length) {
     throw new ChangeError('a changeset needs at least one change');
   }
@@ -1457,13 +1573,33 @@ export function validate(db, changes) {
     const missing = REQUIRED[tt].filter((f) => !got.has(f));
     if (missing.length) throw new ChangeError(`creating a ${tt} needs ${missing.join(', ')}`);
   }
+  authorize(person, out);
   return out;
 }
 
-/** Record a changeset. Applies it immediately when the author may. */
-export function propose(db, { authorId = null, reason = null, changes, autoApply = false,
+/** Record a changeset. Applies it immediately when the author may.
+ *
+ *  `person` is the author, as an object with a `role` — it answers both
+ *  questions this function has to ask: may they propose these changes at all
+ *  (validate → authorize), and do their proposals wait (`change.apply`).
+ *
+ *  It is REQUIRED, and `trusted: true` is the only way to omit it. That is on
+ *  purpose. A default of "no person means no check" is the kind of default
+ *  that is correct in every caller that exists today and wrong in the first
+ *  one somebody adds in a hurry — so the choice is made at the call site, in
+ *  writing, and a route that forgets both gets an error instead of a bypass.
+ *
+ *  `autoApply` still wins where it is given, because a trusted caller
+ *  proposing on somebody's behalf — bulk snippet review — is making the
+ *  decision itself and is not asking about the author's role. */
+export function propose(db, { authorId = null, person = null, trusted = false,
+                              reason = null, changes, autoApply = null,
                               mediaRoot = null }) {
-  const list = validate(db, changes);
+  if (!person && !trusted) {
+    throw new ChangeError('propose() needs `person`, or `trusted: true` for an internal caller');
+  }
+  const list = validate(db, changes, trusted ? null : person);
+  const auto = autoApply !== null ? !!autoApply : can(person, 'change.apply');
   const t = now();
   const csId = ulid();
 
@@ -1496,7 +1632,7 @@ export function propose(db, { authorId = null, reason = null, changes, autoApply
     });
   });
 
-  if (autoApply) {
+  if (auto) {
     apply(db, csId, { reviewerId: authorId, note: 'author may edit directly', mediaRoot });
   } else {
     // A proposal is a write. It adds rows the read API serves — the review
@@ -1681,11 +1817,22 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
         fields.slug = slugify(fields.name);
         fields.origin = 'user';
         fields.author_id = cs.author_id;
-        // Anyone may mint a tag; only an editor's goes straight into everyone's
-        // autocomplete. A suggester's stays 'proposed' — usable on their own
-        // suggestion, invisible in the picker — until someone confirms it.
-        // Same rule as auto-apply, read from the same place.
-        fields.status = authorMayEdit(db, cs.author_id) ? 'confirmed' : 'proposed';
+        /* Confirmed, because by the time this line runs somebody with the
+           authority to say yes has said it.
+           It used to read the AUTHOR's role and file a suggester's tag as
+           'proposed', and that was wrong in the one case it was written for.
+           A tag row is only ever created HERE, inside apply() — and apply() is
+           only reached two ways: an editor's own changeset, which auto-applies
+           because they may decide, or the review route, which requires
+           `review.decide`. So a suggester's tag came into existence at the
+           exact moment an editor approved it, and was then hidden from the
+           autocomplete that approval existed to put it in. The editor had to
+           find it again and confirm it a second time, on a screen that does
+           not explain why.
+           `proposed` is still a real state and still writable by hand — an
+           editor parking a tag they are unsure about — it simply is not
+           something an approval produces. */
+        fields.status = 'confirmed';
         // No guess at a category. A row minted from an autocomplete miss has
         // none until someone gives it one, and picking the most common one for
         // them is inference from a name — the same move as reading a game off a
@@ -1795,13 +1942,35 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
     // instead, and a reviewer is shown both values and decides.
   });
 
+  /* Derived state, refreshed AFTER the commit — and its failure is a logged
+     warning rather than the response.
+
+     This runs outside the transaction on purpose: recompute() stats every
+     capture file when mediaRoot is set, and holding the write lock across
+     filesystem IO would make the contention it is a victim of far worse.
+
+     But that means it can throw on a lock this request no longer holds — a
+     concurrent probe-media.js is enough — and it used to throw straight out of
+     apply(). The caller got a 500 for a changeset that HAD applied, retried,
+     and collected a second 500 from the primary-key collision. Two errors, no
+     edit lost, and no way to tell that from the outside.
+
+     So: the edit landed, the response says so, and the stale derived columns
+     are named in the log. They are all recoverable — the next write to the
+     stream recomputes them, and scripts/rebuild.js does the lot. */
+  const restale = [];
   for (const sid of touched) {
-    if (db.prepare('SELECT 1 FROM stream WHERE id = ?').get(sid)) {
-      recompute(db, sid, { mediaRoot });
-    }
+    if (!db.prepare('SELECT 1 FROM stream WHERE id = ?').get(sid)) continue;
+    try { recompute(db, sid, { mediaRoot }); }
+    catch (e) { restale.push(sid); console.error(`apply ${csId}: recompute ${sid} failed:`, e?.message ?? e); }
   }
   bumpGeneration(db);
-  return summary(db, csId);
+  const out = summary(db, csId);
+  /* Said out loud in the response too. A caller that cares — the record editor
+     refreshing a strip — can tell "applied, and the projection is current" from
+     "applied, and the projection is a rebuild behind". */
+  if (restale.length) out.recompute_failed = restale;
+  return out;
 }
 
 export function reject(db, csId, { reviewerId = null, note = null } = {}) {
@@ -1830,14 +1999,11 @@ function streamsOf(db, tt, tid) {
   return [];
 }
 
-/** May this person's own changesets apply on submission? Read for the same
- *  reason autoApply is: an editor's decisions are decisions, everyone else's
- *  are proposals. */
-function authorMayEdit(db, personId) {
-  if (!personId) return false;
-  const r = db.prepare('SELECT role FROM person WHERE id = ?').get(personId);
-  return ['editor', 'admin'].includes(r?.role);
-}
+/* `authorMayEdit(db, personId)` was here — the last place in this file that
+   read a role out of the database to make a decision. Its only caller was the
+   new-tag `status` above, which no longer asks: reaching apply() already means
+   somebody with `review.decide` said yes. Whether an author's OWN changeset
+   waits is asked once now, in propose(), as `can(person, 'change.apply')`. */
 
 // ---------------------------------------------------------------------------
 //  conversions — the two rewrites that keep a timestamp meaning what it meant

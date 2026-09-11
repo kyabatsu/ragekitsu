@@ -593,7 +593,7 @@
   .snip.tr-open > .snip-media { grid-area: media; }
   .snip.tr-open > .snip-body { grid-area: body; }
   .snip.tr-open > .snip-tr { grid-area: tr; }
-  .snip.rv.tr-open { grid-template-areas: "media body verdict" "tr tr tr"; }
+  .snip.hasv.tr-open { grid-template-areas: "media body verdict" "tr tr tr"; }
   .snip.big.tr-open { grid-template-areas: "media body" "media tr"; }
 
   /* ---- expanded ----------------------------------------------------------
@@ -750,6 +750,264 @@
   .ob-new .nt-cp, .nt-new .nt-cp { margin-top: 3px; }
 
   /* ---- review: which pile ------------------------------------------------ */
+  /* ---- music --------------------------------------------------------------
+     A grid of covers, because that is what these are: two-minute songs whose
+     art is how anybody recognises one. The add tile is the Index's `vod-add`
+     verbatim, sized to the card beside it. */
+  .mu-grid { display: grid; gap: 14px;
+    grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); }
+  .mu { display: flex; flex-direction: column; border-radius: var(--radius);
+    border: 1px solid var(--border); background: var(--surface); overflow: hidden; }
+  .mu.busy { opacity: 0.5; pointer-events: none; }
+  /* The clip row's two unsettled states, said the same way on a card. Same
+     colours, same dashes, same reason: the Music panel has one list now, and a
+     song waiting for a verdict has to be distinguishable from the shelf at a
+     glance rather than by reading a chip. */
+  .mu.is-pending { border-style: dashed;
+    border-color: color-mix(in srgb, var(--tl-meta) 42%, transparent);
+    background: color-mix(in srgb, var(--tl-meta) 5%, var(--surface)); }
+  .mu.is-pending .mu-art { opacity: 0.78; }
+  .mu.is-removed { border-style: dashed;
+    border-color: color-mix(in srgb, var(--tl-not) 45%, transparent);
+    background: color-mix(in srgb, var(--tl-not) 6%, var(--surface)); }
+  .mu.is-removed .mu-art { opacity: 0.5; }
+  .mu-going { opacity: 0; transform: scale(0.97);
+    transition: opacity 0.2s ease, transform 0.2s ease; }
+  /* 16:9 and cropped. YouTube's hqdefault is 4:3 with black bars baked in on
+     older uploads, so the cover is cropped to the shape every card shares
+     rather than letterboxed into it. */
+  .mu-art { position: relative; display: block; width: 100%; aspect-ratio: 16 / 9;
+    border: 0; padding: 0; cursor: pointer; background: var(--glass-sunk); }
+  .mu-art img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  /* No cover. Either YouTube has nothing for it any more, or the network is
+     between us and them — and the card should read as "no picture" rather than
+     as a layout that fell over. */
+  .mu-art.mu-noart { display: grid; place-items: center; }
+  .mu-art.mu-noart::before { content: 'no cover'; color: var(--text-3);
+    font-family: var(--font-mono); font-size: 0.68rem; }
+  .mu-art::after { content: ''; position: absolute; inset: 0; opacity: 0;
+    background: rgba(0,0,0,0.35); transition: opacity 0.15s ease; }
+  .mu-art:hover::after, .mu-art:focus-visible::after { opacity: 1; }
+  .mu-play { position: absolute; inset: 0; display: grid; place-items: center;
+    color: #fff; opacity: 0; transition: opacity 0.15s ease; z-index: 1; }
+  .mu-art:hover .mu-play, .mu-art:focus-visible .mu-play { opacity: 1; }
+  .mu-dur { position: absolute; right: 6px; bottom: 6px; z-index: 1;
+    padding: 1px 5px; border-radius: 4px; background: rgba(0,0,0,0.72);
+    color: #fff; font-family: var(--font-mono); font-size: 0.66rem; }
+  /* Status lives on the cover, not in the body, and that is what keeps the
+     grid regular. In the body it was a row that existed on some cards and not
+     others — and because grid items stretch to their row, ONE card carrying a
+     transient `saving…` made its whole row taller than the rows beneath it.
+     Up here it costs no height at all, and it is beside the duration and the
+     archive badge, which are the other two things the cover already says. */
+  .mu-state { position: absolute; left: 6px; bottom: 6px; right: 46px; z-index: 1;
+    display: flex; flex-wrap: wrap-reverse; gap: 4px; }
+  .mu-state .mu-chip { background: rgba(0,0,0,0.72); border-color: rgba(255,255,255,0.14);
+    color: #e8e6ec; backdrop-filter: blur(3px); }
+  .mu-state .mu-chip.bad { color: #ff9ba0; border-color: rgba(255,155,160,0.4); }
+  /* ---- one card, one height ------------------------------------------------
+     Every row below RESERVES its space whether or not it has anything in it,
+     the way the index's VOD title does. A grid where a card with two tag rows
+     is taller than the one beside it does not read as denser — it reads as
+     broken, and the eye spends its first moment on the ragged edge instead of
+     on the covers. The cost is some empty space on the sparsest card, which is
+     the right trade at three or four across.
+
+     What is NOT reserved: the status chips and the action row. Both are absent
+     for everybody or present for everybody within a pile — a shelf of
+     published songs has neither — and holding a line open for a state that is
+     usually not there would lengthen every card in the collection to suit the
+     rare one. A viewer with no rights simply gets shorter cards, uniformly. */
+  .mu-body { display: flex; flex-direction: column; gap: 5px; padding: 10px 12px 12px; }
+  .mu-t { font-weight: 640; font-size: 0.84rem; line-height: 1.35; color: var(--text);
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden; min-height: 2.7em; }
+  /* Channel and date on their own lines. They shared one flex row and wrapped,
+     so a short channel sat beside its date and a long one pushed it onto a
+     second line — which is why no two cards in the same row were the same
+     height. One line each, ellipsis, reserved even when the probe has not
+     answered yet and there is nothing to put in them. */
+  .mu-ch, .mu-date { font-size: 0.71rem; color: var(--text-3); min-height: 1.2em;
+    line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mu-ch { color: var(--text-2); }
+  /* ONE row of tags, and scroll for the rest. Most songs have one singer, a
+     few have two or three, and holding a second row open for the one in twenty
+     that needs it cost every other card twenty-four pixels of nothing. The
+     scroll is still there — wrapped rows, one visible at a time — so nothing
+     is hidden, it just is not paid for up front. */
+  /* One line, clipped, and NOT scrollable.
+     A 20px scroller is a scroller you fight: the wheel lands on it by accident
+     while the page is what you meant to move, and reaching a fifth singer means
+     dragging a bar the height of the text it hides. So the row shows what fits
+     and hovering it shows the rest — see .mu-pop below. The fade on the right
+     edge is the only thing that says there is more, which is exactly what a cut
+     chip already implies and this makes deliberate. */
+  .mu-tags { --mu-tagrow: 20px; display: flex; flex-wrap: nowrap; gap: 4px;
+    margin: 1px -4px 0; padding: 0 4px; align-items: center;
+    height: var(--mu-tagrow); overflow: hidden; border-radius: 7px;
+    transition: background 0.13s ease, box-shadow 0.13s ease;
+    -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 22px), transparent);
+    mask-image: linear-gradient(90deg, #000 calc(100% - 22px), transparent); }
+  /* The ROW lights up, not the chip under the pointer. The panel is about the
+     whole row's contents, so the row is what has to look hoverable — and a
+     highlight that followed the chips would flicker its way across the strip as
+     the cursor crossed the 4px gaps between them, which is the same reason the
+     panel itself is bound to the row. The padding and the negative margin that
+     cancels it are permanent, so lighting up moves nothing. */
+  .mu-tags.mu-lit { background: color-mix(in srgb, var(--accent) 9%, var(--surface-2));
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 24%, transparent); }
+  /* Inside the add window the strip is the thing you are USING, and there is a
+     whole panel of room, so it wraps and shows everything. */
+  .mu-minetags { flex-wrap: wrap; height: auto; overflow: visible;
+    -webkit-mask-image: none; mask-image: none; }
+  .mu-minetags.mu-lit { background: none; box-shadow: none; }
+  /* flex: none, so a chip is never squeezed narrower than its own text and the
+     row cuts at the container edge instead of at every chip at once. */
+  .mu-tag { height: 20px; display: inline-flex; align-items: center; flex: none;
+    max-width: 148px; }
+  .mu-tag { padding: 0 7px; border-radius: 20px; font-size: 0.68rem;
+    border: 1px solid var(--border); color: var(--text-2); white-space: nowrap; }
+  /* The NAME is what gets cut, never the × beside it. Without this a long
+     enough tag pushes its own remove button out past the chip's edge, where it
+     is unclickable and looks like a rendering fault. */
+  .mu-tag .mu-tagn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    min-width: 0; }
+  /* The × on a chip and the `+ tag` at the end of the strip. Same two
+     affordances the snippet strip has, sized for a chip that is 20px tall
+     rather than for a row that is 118. */
+  /* Every tag on the song, on hover, because the row itself can only ever show
+     the first few. Fixed-position and appended to the body: the card it belongs
+     to is inside a grid with clipped children, so anything positioned within it
+     would be cut by the very overflow this exists to escape. */
+  .mu-pop { position: fixed; z-index: 94; display: flex; flex-wrap: wrap; gap: 4px;
+    max-width: 320px; padding: 7px 8px; border-radius: 10px;
+    background: var(--panel); border: 1px solid var(--surface-3);
+    box-shadow: 0 10px 26px rgba(0,0,0,0.5); pointer-events: none; }
+  .mu-pop[hidden] { display: none; }
+  .mu-pop .mu-tag { max-width: none; }
+
+  .mu-tagx { margin: 0 -3px 0 4px; padding: 0 2px; border: 0; background: none;
+    color: var(--text-3); font: inherit; line-height: 1; cursor: pointer;
+    border-radius: 4px; }
+  .mu-tagx:hover { color: var(--tl-not); background: var(--surface-2); }
+  .mu-tagadd { border: 1px dashed var(--border); background: none; color: var(--text-3);
+    font-family: var(--font-mono); cursor: pointer; }
+  .mu-tagadd:hover { border-color: var(--text-3); color: var(--text-2);
+    background: var(--surface-2); }
+  .mu-tag i { display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+    margin-right: 5px; vertical-align: 1px; }
+  /* What the archive knows about this row, in one word. `preserved` is the
+     only one that is about the FILE rather than about the verdict, and it is
+     the whole reason the module exists — so it gets the accent. */
+  .mu-chip { padding: 1px 6px; border-radius: 5px; font-family: var(--font-mono);
+    font-size: 0.62rem; border: 1px solid var(--border); color: var(--text-3); }
+  /* Top right of the cover, where the index puts its badges — the frosted
+     square reads over artwork of any brightness, which is the whole reason it
+     has one. Opposite corner from the duration, so neither ever covers the
+     other. */
+  .mu-kept { position: absolute; top: 6px; right: 6px; z-index: 1; }
+  .mu-chip.wait { color: var(--text-3); }
+  .mu-chip.bad { color: var(--bad, #e5484d);
+    border-color: color-mix(in srgb, var(--bad, #e5484d) 45%, transparent); }
+  .mu-acts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+  /* Square, because they are glyphs now. A row of five verbs spelled out was
+     wider than the card and read as a paragraph; the icons are the same five
+     decisions and the tooltip carries the word. */
+  .mu-btn { width: 30px; height: 30px; display: grid; place-items: center;
+    padding: 0; border-radius: 8px; cursor: pointer; font: inherit;
+    border: 1px solid var(--border); background: transparent; color: var(--text-3);
+    transition: color 0.14s ease, border-color 0.14s ease, background 0.14s ease; }
+  .mu-btn svg { width: 15px; height: 15px; display: block; }
+  .mu-btn:hover { color: var(--text); border-color: var(--text-3); }
+  .mu-btn.yes { background: var(--accent); color: var(--on-accent);
+    border-color: transparent; }
+  .mu-btn.yes:hover { filter: brightness(1.08); color: var(--on-accent); }
+  /* A copy that says nothing looks like a button that did nothing. */
+  .mu-btn.copied { color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
+  /* Red on hover only. Four of the five buttons are some flavour of removal and
+     a card painted red at rest would say everything here is dangerous, which
+     stops meaning anything. */
+  .mu-btn.bad:hover { color: var(--bad, #e5484d);
+    border-color: color-mix(in srgb, var(--bad, #e5484d) 55%, transparent); }
+  /* Text buttons survive in the player's header. */
+  .mu-mhead .mu-btn { width: auto; height: auto; padding: 5px 12px;
+    font-size: 0.76rem; color: var(--text-2); }
+  .mu-mine { margin-left: 7px; color: var(--accent); }
+  .mu-count { color: var(--text-3); font-size: 0.76rem; white-space: nowrap; }
+  /* Narrower than the snippets one, which owns its whole toolbar. Here it
+     shares the row with the three piles, and those have to stay readable. */
+  /* No max-width: the search fills the bar and pushes the way-in button to
+     the right end of it, which is where the Snippets toolbar puts its own.
+     Capped, the button sat halfway across the panel beside a stub of a box. */
+  .mu-search { flex: 1 1 220px; }
+  .mu-search input { padding: 9px 12px 9px 34px; font-size: 0.82rem; }
+  .mu-search svg { left: 11px; }
+  .mu-empty { grid-column: 1 / -1; padding: 12vh 0; text-align: center;
+    color: var(--text-3); font-size: 0.82rem; }
+  /* The player. A dialog rather than an inline swap, because the grid is the
+     thing you came back to and an embed that replaced a card would lose your
+     place in it. */
+  .mu-modal { position: fixed; inset: 0; z-index: 90; display: grid;
+    place-items: center; padding: 24px; background: rgba(0,0,0,0.72); }
+  .mu-modal[hidden] { display: none; }
+  .mu-frame { width: min(960px, 100%); }
+  .mu-frame iframe { width: 100%; aspect-ratio: 16 / 9; border: 0;
+    border-radius: var(--radius); background: #000; display: block; }
+  .mu-mhead { display: flex; align-items: baseline; gap: 10px; margin-bottom: 9px;
+    color: var(--text); }
+  .mu-mhead b { font-size: 0.95rem; font-weight: 650; }
+  .mu-mhead span { color: var(--text-3); font-size: 0.76rem; }
+  .mu-mhead button { margin-left: auto; }
+
+  /* ---- the changeset queue ------------------------------------------------
+     One card per changeset, not per change row. A mint-and-attach is four
+     rows that mean one thing a person did, and reviewing it four times is
+     reviewing it wrong — the card is the unit a verdict applies to, so it is
+     the unit on screen. */
+  .cs-list { display: flex; flex-direction: column; gap: 8px; }
+  .cs { display: grid; grid-template-columns: 1fr auto; gap: 6px 14px;
+    align-items: start; padding: 12px 14px; border-radius: 12px;
+    border: 1px solid var(--border); background: var(--surface); }
+  .cs.busy { opacity: 0.5; pointer-events: none; }
+  .cs-going { opacity: 0; transform: translateX(18px);
+    transition: opacity 0.2s ease, transform 0.2s ease; }
+  .cs-why { font-weight: 650; font-size: 0.95rem; color: var(--text); }
+  .cs-who { font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-3);
+    white-space: nowrap; padding-top: 3px; }
+  /* The changes themselves, in sentences. Monospace for the values only —
+     the line is prose, and setting the whole thing in mono makes a queue of
+     ordinary editorial decisions read like a diff. */
+  .cs-what { grid-column: 1 / -1; margin: 2px 0 0; padding: 8px 10px;
+    border-radius: 8px; background: var(--glass-sunk); font-size: 0.78rem;
+    color: var(--text-2); display: flex; flex-direction: column; gap: 4px; }
+  .cs-what b { color: var(--text); font-weight: 620; }
+  .cs-what em { font-style: normal; font-family: var(--font-mono);
+    font-size: 0.72rem; color: var(--text); }
+  .cs-what .cs-gone { color: var(--text-3); }
+  /* A verb chip, so the shape of a queue is readable before any of it is. */
+  .cs-v { display: inline-block; min-width: 58px; margin-right: 7px; padding: 1px 6px;
+    border-radius: 5px; font-family: var(--font-mono); font-size: 0.63rem;
+    text-align: center; background: var(--glass-sunk); color: var(--text-3);
+    border: 1px solid var(--border); }
+  .cs-v.add { color: var(--tl-media); border-color: color-mix(in srgb, var(--tl-media) 45%, transparent); }
+  .cs-v.cut { color: var(--bad, #e5484d); border-color: color-mix(in srgb, var(--bad, #e5484d) 45%, transparent); }
+  /* Somebody edited the same field first. Loud, because approving over it is
+     how a suggestion silently reverts an edit its author never saw. */
+  .cs-clash { grid-column: 1 / -1; padding: 7px 10px; border-radius: 8px;
+    font-size: 0.74rem; border: 1px solid color-mix(in srgb, var(--bad, #e5484d) 40%, transparent);
+    background: color-mix(in srgb, var(--bad, #e5484d) 9%, transparent); color: var(--text-2); }
+  .cs-acts { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px;
+    align-items: center; margin-top: 2px; }
+  .cs-acts .lbl { color: var(--text-3); font-size: 0.72rem; margin-right: 2px; }
+  .cs-btn { padding: 5px 12px; border-radius: 8px; cursor: pointer; font: inherit;
+    font-size: 0.76rem; border: 1px solid var(--border); background: var(--surface-2, transparent);
+    color: var(--text-2); }
+  .cs-btn:hover { color: var(--text); border-color: var(--text-3); }
+  .cs-btn.yes { background: var(--accent); color: var(--on-accent); border-color: transparent;
+    font-weight: 600; }
+  .cs-btn.yes:hover { filter: brightness(1.08); }
+
   .rv-views { display: inline-flex; gap: 2px; padding: 2px; border-radius: 9px;
     background: var(--surface-2, rgba(255,255,255,0.05)); }
   .rv-view { padding: 5px 11px; border: 0; border-radius: 7px; cursor: pointer;
@@ -1183,6 +1441,14 @@
   .snip.is-pending { border: 1px dashed color-mix(in srgb, var(--tl-meta) 42%, transparent);
     background: color-mix(in srgb, var(--tl-meta) 4%, var(--panel)); }
   .snip.is-pending .snip-frame { opacity: 0.72; }
+  /* And its opposite. A clip taken back out of the archive lives in the same
+     list as everything else now, so the list has to be able to say so without
+     being read: dashed like the waiting one because neither is settled, red
+     rather than amber because one of them is a decision and the other is a
+     wait. Dimmer still, so a shelf skimmed at speed reads as published. */
+  .snip.is-removed { border: 1px dashed color-mix(in srgb, var(--tl-not) 45%, transparent);
+    background: color-mix(in srgb, var(--tl-not) 5%, var(--panel)); }
+  .snip.is-removed .snip-frame { opacity: 0.5; }
   .only-you { display: inline-flex; align-items: center; gap: 5px;
     font-family: var(--font-mono); font-size: 0.58rem; letter-spacing: 0.04em;
     padding: 2px 6px; border-radius: 5px;
@@ -1219,13 +1485,47 @@
 
   .rv-verdict { grid-area: verdict; display: flex; gap: 6px; align-items: flex-start;
     padding-top: 2px; }
-  .snip.rv { grid-template-columns: 210px minmax(0, 0.8fr) minmax(0, 1.25fr) auto;
+  /* `hasv` and not `rv`: the fourth column exists because the row CARRIES a
+     verdict, and that is now true in the collection too — a waiting clip in the
+     Snippets panel gets the same ✓/✗ the queue gives it. `rv` still means "this
+     row is in the Review panel", which is a different fact that other code
+     reads (snipRepaint asks it to rebuild the strip the way it was built), and
+     collapsing the two would make a tinted collection row start claiming to be
+     a queue row. */
+  .snip.hasv { grid-template-columns: 210px minmax(0, 0.8fr) minmax(0, 1.25fr) auto;
     grid-template-areas: "media body tr verdict"; }
-  .snip.rv .snip-media { grid-area: media; }
-  .snip.rv .snip-body { grid-area: body; }
-  .snip.rv .snip-tr { grid-area: tr; }
-  .snip.rv.big { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  .snip.hasv .snip-media { grid-area: media; }
+  .snip.hasv .snip-body { grid-area: body; }
+  .snip.hasv .snip-tr { grid-area: tr; }
+  .snip.hasv.big { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
     grid-template-areas: "media body verdict" "media tr verdict"; }
+
+  /* A song in the review queue, drawn as a ROW and not as the card it is in
+     its own panel. The queue is one thing at a time under a cursor that J and
+     K move, and a grid tile in the middle of that breaks the rhythm the whole
+     panel is built on. So it borrows `.snip.rv`'s grid outright — media, body,
+     third column, verdict — and only fills the cells differently. Nothing here
+     re-states geometry; if the clip row's columns change, this moves with it. */
+  .snip.mu-rv .snip-frame { border: 0; padding: 0; cursor: pointer;
+    display: block; width: 100%; height: 100%; }
+  .snip.mu-rv .snip-frame img { pointer-events: none; }
+  /* One row of tags is right on a 232px card where most songs have one singer.
+     Here there is a whole column, and a reviewer deciding on a submission
+     wants to see every tag it arrived with, not scroll for them. */
+  .snip.mu-rv .mu-tags { max-height: none; overflow: visible; }
+  .snip.mu-rv .mu-ch { font-size: 0.78rem; }
+  /* The third column. For a clip it is the transcript, which is what you read
+     to judge it; for a song it is where it came from and what the recorder
+     managed to find out — the same question, different evidence. */
+  .mu-rvtr { display: flex; flex-direction: column; gap: 5px;
+    font-size: 0.74rem; color: var(--text-2); }
+  .mu-rvline { display: flex; gap: 9px; align-items: baseline; }
+  .mu-rvline > b { flex: 0 0 60px; color: var(--text-3); font-weight: 500;
+    font-family: var(--font-mono); font-size: 0.6rem; letter-spacing: 0.04em;
+    text-transform: uppercase; }
+  .mu-rvline > span { min-width: 0; overflow-wrap: anywhere; }
+  .mu-rvline a { color: var(--text-2); }
+  .mu-rvline a:hover { color: var(--accent); }
 
   .rv-btn { width: 34px; height: 34px; display: grid; place-items: center; padding: 0;
     border: 1px solid var(--surface-3); border-radius: 9px; background: var(--surface);
@@ -1248,7 +1548,7 @@
   .rv-flag.warn { color: #e0c463; }
 
   @media (max-width: 1000px) {
-    .snip.rv { grid-template-columns: 160px minmax(0, 1fr) auto;
+    .snip.hasv { grid-template-columns: 160px minmax(0, 1fr) auto;
       grid-template-areas: "media body verdict" "tr tr tr"; }
   }
 
@@ -1297,7 +1597,7 @@
   /* The panel is a plain region — the dot field behind it is the page background. */
   #panel-index {
     --cal-track: rgba(255, 255, 255, 0.075);
-    --st-live: #7bc89b;
+    --st-held: #7bc89b;
     --st-missed: #e07070;
     --st-unknown: #b8b5bd;
   }
@@ -1364,10 +1664,10 @@
   /* status dots under the number */
   .cal-dots { display: flex; gap: 2.5px; margin-top: 3px; }
   .cal-dot { width: 4px; height: 4px; border-radius: 50%; transition: transform 300ms ease; }
-  .dot--live { background: var(--st-live); }
+  .dot--held { background: var(--st-held); }
   .dot--missed { background: var(--st-missed); }
   .dot--unknown { background: var(--st-unknown); }
-  .dot--scheduled { background: transparent; box-shadow: inset 0 0 0 1.2px var(--st-live); }
+  .dot--scheduled { background: transparent; box-shadow: inset 0 0 0 1.2px var(--st-held); }
   .cal-cell.streamed:hover .cal-dot:nth-child(1) { transform: scale(1.4); transition-delay: 0ms; }
   .cal-cell.streamed:hover .cal-dot:nth-child(2) { transform: scale(1.4); transition-delay: 40ms; }
 
@@ -3037,7 +3337,13 @@
      Rendered into #sheet or #th rather than <body>, because the page closes the
      sheet on any click that is not inside it — a popover on <body> would
      dismiss the thing it is editing the moment you clicked into it. */
-  .pop2 { position: fixed; z-index: 80; width: 290px; background: var(--panel);
+  /* Above everything it can be opened from, which is now more than it was: the
+     upload window is 92 and the Add-a-song window shares that rule, so at 80
+     the taglet picker opened from inside one rendered BEHIND it — a list you
+     could see the top edge of and nothing else. 96 clears the windows (92),
+     the embed (90) and the tag panel (94), and it is the topmost thing in the
+     page because a picker is always the most recent thing you asked for. */
+  .pop2 { position: fixed; z-index: 96; width: 290px; background: var(--panel);
     border-radius: 12px; padding: 8px; box-shadow: 0 0 0 1px rgba(255,255,255,0.1),
     0 20px 50px rgba(0,0,0,0.62); font-size: 0.82rem; }
   .pop2[hidden] { display: none; }
@@ -3237,6 +3543,7 @@
       <button class="tab" role="tab" id="tab-clips" aria-controls="panel-clips" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M7 3v18"/><path d="M3 7.5h4"/><path d="M3 12h18"/><path d="M3 16.5h4"/><path d="M17 3v18"/><path d="M17 7.5h4"/><path d="M17 16.5h4"/></svg>Clips</button>
       <button class="tab" role="tab" id="tab-images" aria-controls="panel-images" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg>Gallery</button>
       <button class="tab" role="tab" id="tab-memes" aria-controls="panel-memes" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 21a6 6 0 0 0-12 0"/><circle cx="12" cy="11" r="4"/><rect width="18" height="18" x="3" y="3" rx="2"/></svg>Memes</button>
+      <button class="tab" role="tab" id="tab-music" aria-controls="panel-music" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 13a2 2 0 0 0 2-2V7a2 2 0 0 1 4 0v13a2 2 0 0 0 4 0V4a2 2 0 0 1 4 0v13a2 2 0 0 0 4 0v-4a2 2 0 0 1 2-2"/></svg>Music</button>
       <button class="tab" role="tab" id="tab-tools" aria-controls="panel-tools" aria-selected="false" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.034 12.681a.498.498 0 0 1 .647-.647l9 3.5a.5.5 0 0 1-.033.943l-3.444 1.068a1 1 0 0 0-.66.66l-1.067 3.443a.5.5 0 0 1-.943.033z"/><path d="M5 3a2 2 0 0 0-2 2"/><path d="M19 3a2 2 0 0 1 2 2"/><path d="M5 21a2 2 0 0 1-2-2"/><path d="M9 3h1"/><path d="M9 21h2"/><path d="M14 3h1"/><path d="M3 9v1"/><path d="M21 9v2"/><path d="M3 14v1"/></svg>Tools</button>
       <button class="tab" role="tab" id="tab-review" aria-controls="panel-review" aria-selected="false" tabindex="-1" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><circle cx="12" cy="12" r="1"/><path d="M18.944 12.33a1 1 0 0 0 0-.66 7.5 7.5 0 0 0-13.888 0 1 1 0 0 0 0 .66 7.5 7.5 0 0 0 13.888 0"/></svg>Review</button>
       <!-- Off on its own at the far end, because it is not another view of the
@@ -3267,7 +3574,7 @@
           <div class="cal-grid" id="cal-grid"></div>
           <div class="cal-legend">
             <span class="cal-legend-item"><span class="cal-legend-ring"></span> Air time</span>
-            <span class="cal-legend-item"><span class="cal-legend-dot dot--live"></span> Live / VOD</span>
+            <span class="cal-legend-item"><span class="cal-legend-dot dot--held"></span> Archived</span>
             <span class="cal-legend-item"><span class="cal-legend-dot dot--missed"></span> Missed</span>
             <span class="cal-legend-item"><span class="cal-legend-dot dot--unknown"></span> Unknown</span>
             <span class="cal-legend-item"><span class="cal-legend-dot dot--scheduled"></span> Scheduled</span>
@@ -3336,6 +3643,16 @@
 
     <section class="panel" id="panel-snippets" role="tabpanel" aria-labelledby="tab-snippets" tabindex="0" hidden>
       <div class="toolbar">
+        <!-- No pile switcher. A clip waiting for a verdict and a clip taken
+             back out are both THIS collection, and the honest way to say so is
+             to leave them in it — yellow and dashed for waiting, red and dashed
+             for removed, with the verdict on the row for whoever may give one.
+             Three tabs over the same rows meant knowing which tab a thing was
+             in before you could look at it, which is a thing to remember in
+             place of a thing to see.
+
+             Still deliberately not a second review queue: no keys and no bulk
+             verbs here. Review is where you sit down and work through fifty. -->
         <div class="search snip-search-wrap">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4-4"/></svg>
           <input type="text" id="snip-search" placeholder="Search titles and transcripts — or Tab a tag"
@@ -3429,19 +3746,27 @@
       </section>
     </section>
 
+    <!-- FOUR rooms with nothing in them yet, and saying so. An empty state
+         that names what the room is FOR is a promise; one that shows invented
+         rows is a lie somebody has to remember to take back out.
+
+         Gallery was the one that was not taken back out. It shipped twelve
+         `imageItems` — invented ids, invented tags, a GIF badge on rows that
+         were not anything — behind a search box that searched nothing and a
+         Submit button wired to nothing. An archive whose whole claim is that
+         it holds a true record cannot open a tab onto pictures that do not
+         exist. The demo array, its map, its grid and the sheet template that
+         rendered it are gone with it. -->
     <section class="panel" id="panel-images" role="tabpanel" aria-labelledby="tab-images" tabindex="0" hidden>
-      <div class="toolbar">
-        <div class="search"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4-4"/></svg><input type="text" placeholder="Search tags"></div>
-        <span class="meta">recent uploads</span>
-        <button class="btn-primary">Submit image</button>
+      <div class="panel-soon">
+        <span class="ps-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg></span>
+        <b>The gallery is not here yet</b>
+        <span>Stills and reaction images, tagged the same way everything else
+          here is. Nothing backs it in the API yet, so it holds nothing —
+          rather than holding twelve pictures that were never taken.</span>
       </div>
-      <div class="grid" id="grid-images"></div>
     </section>
 
-    <!-- Three rooms with nothing in them yet, and saying so. An empty state
-         that names what the room is FOR is a promise; one that shows invented
-         rows is a lie somebody has to remember to take back out — see the
-         `imageItems` demo array, which is still sitting in this file. -->
     <section class="panel" id="panel-clips" role="tabpanel" aria-labelledby="tab-clips" tabindex="0" hidden>
       <div class="panel-soon">
         <span class="ps-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M7 3v18"/><path d="M3 7.5h4"/><path d="M3 12h18"/><path d="M3 16.5h4"/><path d="M17 3v18"/><path d="M17 7.5h4"/><path d="M17 16.5h4"/></svg></span>
@@ -3459,6 +3784,33 @@
         <b>Memes are not here yet</b>
         <span>A collection of its own, shaped like the gallery.</span>
       </div>
+    </section>
+
+    <section class="panel" id="panel-music" role="tabpanel" aria-labelledby="tab-music" tabindex="0" hidden>
+      <!-- The Snippets toolbar, shape for shape: the search on the left, the
+           way in on the right, and the count on its own line underneath where
+           it belongs to the RESULT rather than to the control that asked for
+           it. Two collections that behave alike should not need to be learned
+           twice. -->
+      <div class="toolbar">
+        <div class="search mu-search">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+            stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4-4"/></svg>
+          <input type="search" id="mu-q" placeholder="Search titles, channels, tags"
+                 autocomplete="off" aria-label="Search songs">
+        </div>
+        <button class="btn-primary snip-up-btn" id="mu-add" title="Add a song by link"
+                aria-expanded="false" aria-controls="mu-win">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+            stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path
+            d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
+          Add a song
+        </button>
+      </div>
+      <div class="snip-meta-row">
+        <span class="meta" id="mu-count"></span>
+      </div>
+      <div class="mu-grid" id="mu-grid"></div>
     </section>
 
     <section class="panel" id="panel-tools" role="tabpanel" aria-labelledby="tab-tools" tabindex="0" hidden>
@@ -3480,7 +3832,7 @@
              steps. Every published snippet is already in a panel built for
              looking at them, carrying the same row actions. -->
         <div class="rv-views" role="tablist" aria-label="Which snippets">
-          <button class="rv-view is-on" data-rvview="proposed" role="tab" aria-selected="true">Waiting</button>
+          <button class="rv-view is-on" data-rvview="proposed" role="tab" aria-selected="true">Queued</button>
           <!-- `rejected` is still the stored status; only the word changes. The
                pile holds two arrivals — never published, and published then
                taken back out — and they are the same thing to look at. -->
@@ -3490,8 +3842,16 @@
                rather than passing a fourth value to the same query. -->
           <button class="rv-view" data-rvview="suggestions" role="tab"
             aria-selected="false">Suggestions<span class="rv-sgn" id="rv-sgn" hidden></span></button>
+          <!-- Proposed EDITS, which is a different pile from proposed clips and
+               from proposed names: a changeset is somebody asking to change a
+               decision the archive has already made. It queued from the first
+               day suggesters existed and had nowhere to be seen, so a retracted
+               tag sat in a table with a promise on the button that made it
+               ("this lands on Review") and no Review to land on. -->
+          <button class="rv-view" data-rvview="changes" role="tab"
+            aria-selected="false">Changes<span class="rv-sgn" id="rv-csn" hidden></span></button>
         </div>
-        <span class="rv-progress" id="rv-progress">nothing waiting</span>
+        <span class="rv-progress" id="rv-progress">nothing queued</span>
         <span class="rv-pace" id="rv-pace"></span>
         <span style="flex:1"></span>
         <button class="btn-ghost" id="rv-undo" disabled>Undo</button>
@@ -3505,6 +3865,7 @@
       </div>
       <div class="snips" id="rv-list"></div>
       <div class="sg-list" id="sg-list" hidden></div>
+      <div class="cs-list" id="cs-list" hidden></div>
       <div id="rv-more" style="margin-top:14px;text-align:center" hidden>
         <button class="btn-ghost" id="rv-more-btn">Load more</button>
       </div>
@@ -3568,6 +3929,52 @@
       <div class="up-qh"><span>Yours</span></div>
       <div class="up-q" id="up-q"></div>
       <div class="up-empty" id="up-empty">Nothing waiting. Drop something in.</div>
+    </div>
+  </aside>
+
+  <!-- ═══ add a song ══════════════════════════════════════════════════════
+       The upload window's chrome — same glass, same head, same sunk inputs,
+       docked under its own button — with the file half taken out, because
+       nothing about a song is uploaded: the archive is given a link and fetches
+       its own copy later, if an editor says so.
+
+       No "Yours" queue either, and that is the point of this round rather than
+       an omission: a song you just submitted is now IN the grid behind this
+       window, dashed and yellow. A second list of the same rows inside the
+       window would be the pile switcher coming back through the side door. -->
+  <aside class="up-win glass" id="mu-win" aria-label="Add a song" hidden>
+    <div class="up-head">
+      <div>
+        <div class="up-title">Add a song</div>
+        <div class="up-sub">It goes to the queue with your tags on it.</div>
+      </div>
+      <button class="up-x" id="mu-win-x" type="button" aria-label="Close">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+
+    <div class="up-body">
+      <!-- The link row alone. The icon and the bold "Paste a link to the
+           video" above it said, in two lines and 24 pixels of artwork, what
+           the placeholder in the field already says. -->
+      <div class="up-link-row">
+        <input type="url" id="mu-url" placeholder="youtube.com/watch?v=…"
+               autocomplete="off" spellcheck="false">
+        <button class="btn-ghost" id="mu-go" type="button">Add</button>
+      </div>
+      <div class="up-limits">
+        youtube links · nothing is downloaded until an editor says yes
+      </div>
+
+      <!-- Add first, tag after — the snippet window's shape. Tagging BEFORE
+           the song existed meant the picker had nothing to hang a new name on,
+           so minting was refused there and the archive's own vocabulary was
+           half-available in one of the two places that use it. Here every row
+           is a real row, so `+ tag` is the same control the shelf has, minting
+           included. -->
+      <div class="up-qh"><span>Added this session</span></div>
+      <div class="up-q" id="mu-added"></div>
+      <div class="up-empty" id="mu-added-none">Nothing yet. Paste a link.</div>
     </div>
   </aside>
 
@@ -3748,31 +4155,9 @@
     (document.fonts ? document.fonts.ready : Promise.resolve()).then(() => moveIndicator(tabs[0]));
 
     /* ===== Icons ===== */
-    const imgIcon = '<span class="glyph"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="1.6"/><path d="m21 16-5-5L5 21"/></svg></span>';
     const playIcon = '<span class="glyph"><svg width="30" height="30" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></span>';
 
     /* ===== Data (swap for real records) ===== */
-    const imageItems = [
-      {id:'i1',gif:false,tags:['tenma_maemi','smile','solo','1girl']},
-      {id:'i2',gif:false,tags:['tenma_maemi','wink','close-up']},
-      {id:'i3',gif:true,tags:['tenma_maemi','dance','animated']},
-      {id:'i4',gif:false,tags:['tenma_maemi','pout','reaction']},
-      {id:'i5',gif:true,tags:['tenma_maemi','wave','animated','greeting']},
-      {id:'i6',gif:false,tags:['tenma_maemi','laugh']},
-      {id:'i7',gif:false,tags:['tenma_maemi','thumbs_up','solo']},
-      {id:'i8',gif:true,tags:['tenma_maemi','spin','animated']},
-      {id:'i9',gif:false,tags:['tenma_maemi','surprised']},
-      {id:'i10',gif:false,tags:['tenma_maemi','sticker','chibi']},
-      {id:'i11',gif:true,tags:['tenma_maemi','headpat','animated']},
-      {id:'i12',gif:false,tags:['tenma_maemi','peace_sign']}
-    ];
-    /* Image assets is still demo data — nothing in the API backs it yet.
-       Snippets is live; see the block further down. */
-    const imageMap = Object.fromEntries(imageItems.map(x => [x.id, x]));
-
-    const gi = document.getElementById('grid-images');
-    imageItems.forEach(it => gi.insertAdjacentHTML('beforeend',
-      `<div class="tile ph item" data-id="${it.id}" data-type="image" role="button" tabindex="0" aria-label="Open image">${it.gif ? '<span class="tag-corner pill accent">GIF</span>' : ''}${imgIcon}</div>`));
 
     /* =====================================================================
        API
@@ -3820,7 +4205,13 @@
     /* `raw` is deliberately absent, so it falls through to `unknown` — dim,
        not struck. Struck is a claim that there is nothing, and there is
        something; it just has not been merged. */
-    const STATE = { present: 'live', partial: 'live', unverified: 'unknown',
+    /* `held` — the archive HAS this broadcast — and deliberately not `live`,
+       which this map used to say. The liveness badge in this same file means
+       "she is broadcasting right now", and one word for two facts in one file
+       is the kind of thing that reads fine until somebody greps for it. The
+       broadcasting sense keeps the word everywhere it already had it: `--live`,
+       `.plat.is-live`, `.tq-row.is-live`. This sense no longer borrows it. */
+    const STATE = { present: 'held', partial: 'held', unverified: 'unknown',
                     never: 'missed', lost: 'missed' };
     const mapState = (v, startedAt) =>
       (startedAt * 1000 > Date.now() ? 'scheduled' : (STATE[v] ?? 'unknown'));
@@ -4124,6 +4515,15 @@
         day: Number(s.date.slice(8, 10)),
         time: hhmm(s.start_sod ?? 0),
         title: s.title || '(untitled)',
+        /* ...and the column as it actually is. The line above is a DISPLAY
+           value — an untitled stream reads "(untitled)" here while the column
+           holds null — so it is the wrong thing to propose an edit against:
+           base_value "(untitled)" against a column of null is a conflict that
+           can never be cleared. Every render site already does its own
+           `|| '(untitled)'`, so this one is belt-and-braces; the editor needs
+           the truth. The theater speaks the raw payload and has no such
+           problem, which is why INLINE.title falls back to `title`. */
+        title_raw: s.title ?? null,
         // The card's one-line subject. `media` now covers a franchise and an
         // agency as well as a game, which is what the field was always reaching
         // for — the first one filed is still the one shown.
@@ -4232,9 +4632,9 @@
     }
 
     /* --- status: worst case across the day's streams wins the dot --- */
-    const DOT = { live: 'dot--live', missed: 'dot--missed', unknown: 'dot--unknown', scheduled: 'dot--scheduled' };
-    const RANK = { live: 0, scheduled: 1, unknown: 2, missed: 3 };
-    const worst = (list, key) => list.reduce((acc, s) => (RANK[s[key]] > RANK[acc] ? s[key] : acc), 'live');
+    const DOT = { held: 'dot--held', missed: 'dot--missed', unknown: 'dot--unknown', scheduled: 'dot--scheduled' };
+    const RANK = { held: 0, scheduled: 1, unknown: 2, missed: 3 };
+    const worst = (list, key) => list.reduce((acc, s) => (RANK[s[key]] > RANK[acc] ? s[key] : acc), 'held');
 
     function renderCalendar() {
       calTitle.textContent = MONTHS[viewM] + ' ' + viewY;
@@ -5804,37 +6204,12 @@
       } catch (e) { offline(e); }
     }
 
-    const templates = {
-      image(it) {
-        currentUrl = `${location.origin}/i/${it.id}`;
-        sPrev.className = 'sheet-preview ph ratio-1';
-        sPrev.innerHTML = `${it.gif ? '<span class="sheet-badge pill accent">GIF</span>' : ''}${imgIcon}`;
-        sMain.innerHTML =
-          `<div class="sheet-kicker">Image asset</div>
-           <div class="sheet-tags">${it.tags.map(t => `<span class="chip">${esc(t)}</span>`).join('')}</div>
-           <div class="sheet-meta"><span class="pill">${it.gif ? 'GIF' : 'PNG'}</span><span class="pill">demo record</span></div>`;
-        sActs.innerHTML = copyBtn('Copy link to this asset') + openBtn;
-      },
-      clip(it) {
-        currentUrl = `${location.origin}/c/${it.id}`;
-        sPrev.className = 'sheet-preview ph ratio-169';
-        sPrev.innerHTML = playIcon;
-        sMain.innerHTML =
-          `<div class="sheet-kicker">Snippet</div>
-           <div class="sheet-title">${esc(it.title)}</div>
-           <div class="sheet-meta"><span class="pill">${esc(it.duration)}</span>${it.tags.map(t => `<span class="pill">${esc(t)}</span>`).join('')}</div>`;
-        sActs.innerHTML = copyBtn('Copy link to this snippet') + openBtn;
-      },
-    };
+    /* `templates` and `openSheet(type, item)` were here: a generic two-branch
+       sheet for an `image` and a `clip`. Both branches rendered demo records —
+       the image one said "demo record" on the pill in as many words — and the
+       only caller was the fabricated gallery grid. openSheetFor(), just above,
+       is the real one and is what every live surface uses. */
 
-    function openSheet(type, item) {
-      current = null;
-      sheet.classList.remove('playing');
-      templates[type](item);
-      sheet.hidden = false;
-      document.body.classList.add('sheet-open');
-      requestAnimationFrame(() => { sheet.classList.add('open'); fitSheet(); });
-    }
     function closeSheet() {
       if (sheet.hidden) return;
       sheet.classList.remove('open', 'playing');
@@ -5854,9 +6229,6 @@
       clearVod();
     }
 
-    document.getElementById('grid-images').addEventListener('click', e => {
-      const el = e.target.closest('.item'); if (el) openSheet('image', imageMap[el.dataset.id]);
-    });
     /* Snippets have their own row UI and do not open the sheet — the row
        already shows everything the sheet would, and the clip plays in place.
        Its listeners live in the snippets block below. */
@@ -8835,8 +9207,14 @@
       if (e.key === 'Escape' && !pop2.hidden) { e.stopImmediatePropagation(); closePop(); }
     }, true);
     document.addEventListener('click', (e) => {
+      /* `data-popopen` is the general form of the two named above: anything
+         that OPENS this popover has to be exempt from the click that closes
+         it, because the opening click is still propagating when it gets here —
+         so a new opener without the marker opens the popover and dismisses it
+         in the same gesture, which looks exactly like the button doing
+         nothing. That cost an afternoon once; it is a marker now. */
       if (!pop2.hidden && !pop2.contains(e.target)
-          && !e.target.closest('[data-tagadd], [data-tagchip]')) closePop();
+          && !e.target.closest('[data-tagadd], [data-tagchip], [data-popopen]')) closePop();
     });
 
     /* ---- the picker ------------------------------------------------------- */
@@ -10953,6 +11331,9 @@
       },
       title: {
         label: 'title', write: 'title', wide: true,
+        // The only spec whose stored value is not simply `rec[write]`. See
+        // adapt(): the sheet's record carries a display title.
+        base: (r) => ('title_raw' in r ? r.title_raw : (r.title ?? null)),
         get: (s) => s.title ?? '',
         parse: (v) => (v.trim() ? { value: v.trim() } : { error: 'A stream needs a title.' }),
       },
@@ -11078,11 +11459,29 @@
         return;
       }
       closeInline();
-      await submit([{
+
+      /* The value this edit was made against, so the server can refuse it if
+         somebody else has moved it since (issues.md #11).
+
+         `rec[spec.write]` and NOT `was`. `was` is spec.get() — what went in the
+         input box — and for two of these that is a different thing entirely:
+         `when` shows "2026-03-04 19:30" and writes an epoch, `duration` shows
+         "2:00:00" and writes seconds. stale() compares base_value against the
+         COLUMN, so the column is what has to be sent.
+
+         Omitted rather than sent as null when the record does not carry the
+         field at all. A missing base_value means "no check"; a null one means
+         "it was empty", and sending the second when you mean the first turns
+         every edit of that field into a 409 nobody can clear. */
+      const change = {
         target_type: capId ? 'capture' : 'stream',
         target_id: capId ?? rec.id,
         op: 'update', field: spec.write, value: out.value,
-      }], `edited ${spec.label}`, { after: refreshOpenViews });
+      };
+      const base = spec.base ? spec.base(rec)
+        : (spec.write in rec ? rec[spec.write] : undefined);
+      if (base !== undefined) change.base_value = base ?? null;
+      await submit([change], `edited ${spec.label}`, { after: refreshOpenViews });
     }
 
     function bindInline(root) {
@@ -12901,7 +13300,12 @@
     function snipState(s, review) {
       const fetching = s.fetch_status === 'queued' || s.fetch_status === 'running';
       return {
+        /* `!review` on both: inside the Review panel the pile you are standing
+           on already says which of these a row is, and repeating it on every
+           row is how a strip of badges stops being read. In the collection it
+           is the only thing that says so, so there it is the whole point. */
         pending: s.status === 'proposed' && !review,
+        removed: s.status === 'rejected' && !review,
         fetching,
         working: fetching
           || s.normalize_status === 'queued' || s.normalize_status === 'running',
@@ -12995,7 +13399,13 @@
         + flags;
     }
 
-    function snipRowHtml(s, { review = false } = {}) {
+    /* `keys` is whether the row is somewhere the J/K/A/X map is live, and it
+       defaults to `review` because for a year that was the same thing. It
+       stopped being: the Queued and Removed piles inside the Snippets panel
+       render review rows on purpose and have no keyboard on purpose, and a
+       button there whose tooltip promises "(A)" is telling the reader about a
+       key that does nothing on this panel. */
+    function snipRowHtml(s, { review = false, keys = review } = {}) {
       const lines = s.lines ?? [];
       /* Joined with a space, so it reads as speech. Each segment keeps its own
          start and end, which is what makes hover, click-to-seek and
@@ -13037,13 +13447,25 @@
              stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path
              d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></button>`
         : '';
-      const verdict = review ? `<div class="rv-verdict">
-          <button class="rv-btn rv-yes" type="button" data-rv="approve" title="Publish (A)"
+      /* The verdict follows the ROW, not the panel. It used to appear only in
+         the Review queue; now an unsettled clip carries it wherever it is
+         drawn, because the Snippets panel shows waiting and removed clips
+         inline and a tint that says "this needs a decision" beside no way to
+         make one is a tint that just looks broken.
+         Nothing on a published clip: the row already has Unlist for that, and
+         a ✓ on something already published does nothing. And no ✗ on something
+         already removed, for the same reason from the other end — putting it
+         back is the eye button, or Review's page button. */
+      const mayDecide = !!ME.can?.['review.decide'];
+      const verdict = mayDecide && s.status !== 'confirmed' ? `<div class="rv-verdict">
+          <button class="rv-btn rv-yes" type="button" data-rv="approve" title="Publish${
+            keys ? ' (A)' : ''}"
             aria-label="Publish"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"
             stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></button>
-          <button class="rv-btn rv-no" type="button" data-rv="reject" title="Reject (X)"
+          ${s.status === 'rejected' ? '' : `<button class="rv-btn rv-no" type="button"
+            data-rv="reject" title="Reject${keys ? ' (X)' : ''}"
             aria-label="Reject"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"
-            stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+            stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>`}
         </div>` : '';
 
       /* The clip's true shape, carried on the element so the expanded card can
@@ -13056,7 +13478,7 @@
       const ar = s.audio_only ? '960/280'
         : s.width && s.height ? `${s.width}/${s.height}` : '16/9';
 
-      const { pending, working } = snipState(s, review);
+      const { pending, removed, working } = snipState(s, review);
 
       const sound = s.audio_only
         ? `<span class="kind-pill" title="No picture — this one is sound"><svg width="9" height="9"
@@ -13070,7 +13492,8 @@
           ? `<span class="kind-pill" title="Stored as a GIF — converted to video only so it plays">GIF</span>`
           : '';
 
-      return `<article class="snip${review ? ' rv' : ''}${pending ? ' is-pending' : ''}${
+      return `<article class="snip${review ? ' rv' : ''}${verdict ? ' hasv' : ''}${
+        pending ? ' is-pending' : ''}${removed ? ' is-removed' : ''}${
         working ? ' is-working' : ''}${s.audio_only ? ' is-sound' : ''}"
         data-snip="${esc(s.id)}">
         <div class="snip-media" style="--ar:${ar}">
@@ -13247,7 +13670,12 @@
         const d = await api('/api/snippets?' + qs);
         if (reset) { snipList.innerHTML = ''; snipCache.clear(); }
         for (const s of d.snippets) snipCache.set(s.id, s);
-        snipList.insertAdjacentHTML('beforeend', d.snippets.map(snipRowHtml).join(''));
+        /* An arrow and not `map(snipRowHtml)`: that passed the array index as
+           the options argument, which worked only because destructuring a
+           number yields nothing. With a real second argument it would have
+           made every row after the first a review row. */
+        snipList.insertAdjacentHTML('beforeend',
+          d.snippets.map((s) => snipRowHtml(s)).join(''));
         SNIP.next = d.next;
         snipMore.hidden = !d.next;
         snipCount.textContent = d.count
@@ -13259,6 +13687,60 @@
         }
       } catch (e) { offline(e); } finally { SNIP.loading = false; }
     }
+
+    /** A verdict from inside the collection.
+     *
+     *  Deliberately thinner than the Review panel's rvAct: no undo stack, no
+     *  cursor to move, no pace clock. This is somebody browsing the collection
+     *  who spots one thing and deals with it — Review is where you work through
+     *  fifty, and the two want different amounts of machinery.
+     *
+     *  And the row STAYS, which is the other difference. In the queue a verdict
+     *  is the row's last moment there, so it leaves; here the row is part of a
+     *  collection it does not leave, and the verdict is a change to what it
+     *  looks like — the dashes and the tint come off, the buttons go with them.
+     *  Watching that happen in place is the feedback; a row that vanished from
+     *  the shelf you were reading would be the opposite. */
+    async function snipVerdict(row, decision) {
+      if (!row) return;
+      const id = row.dataset.snip;
+      row.classList.add('is-working');
+      let r;
+      try { r = await apiPost('/api/snippets/review', { ids: [id], decision }); }
+      catch (e) { r = { status: 0, body: { error: e.message } }; }
+      row.classList.remove('is-working');
+      if (r.status >= 400 || !r.body) {
+        return void toast('bad', 'That did not save',
+          r.body?.error ?? `HTTP ${r.status}`, 6000);
+      }
+      snipRowRefresh(id);
+    }
+
+    /** Re-read one clip and redraw the whole row, wherever it is drawn.
+     *
+     *  snipRepaint next door replaces only the taglet strip, on purpose — it
+     *  runs while a video is playing and rebuilding the row would tear the
+     *  player out. This one is for the case where the row's STATE changed, so
+     *  the tint, the class list and the button row all have to move together,
+     *  and there is nothing worth preserving in the old markup.
+     *
+     *  Never touches the review list: a row there has already left, optimistically,
+     *  and putting it back is Undo's job. */
+    async function snipRowRefresh(id) {
+      try {
+        const fresh = (await api(`/api/snippets/${id}`)).snippet;
+        snipCache.set(id, fresh);
+        for (const row of snipList.querySelectorAll(`.snip[data-snip="${CSS.escape(id)}"]`)) {
+          unmountClip(row);
+          row.outerHTML = snipRowHtml(fresh);
+        }
+      } catch { /* the write landed; the next load will show it */ }
+    }
+
+    snipList.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-rv]');
+      if (btn) snipVerdict(btn.closest('.snip'), btn.dataset.rv);
+    });
 
     /* The expression, left to right, as the query it is: `+pipkin-pippa
        ~karaoke -asmr`. Clicking a chip CYCLES its operator instead of dropping
@@ -13449,7 +13931,12 @@
         return void expandClip(e.target.closest('.snip'), false);
       }
       const media = e.target.closest('.snip-media');
-      if (media) {
+      /* `.snip` is now two things — the review queue draws songs in the same
+         shell — and expanding is about the <video> a song does not have. A song
+         answers its cover click with the YouTube embed instead, handled where
+         that pile lives; without this test it would also get `.big` put on it,
+         which rewrites the grid and leaves a stretched thumbnail behind. */
+      if (media && media.closest('.snip')?.dataset.snip) {
         const row = media.closest('.snip');
         /* Expanded, the video carries real controls and fills this cell, so
            every click here lands on it. Play/pause and the scrubber are the
@@ -13795,6 +14282,24 @@
       if (upWin.contains(document.activeElement)
           && document.activeElement?.tagName === 'TEXTAREA') return;
       e.stopPropagation(); upClose();
+    });
+    /* And a click anywhere else, the way the Add-a-song window closes.
+       Nothing is lost by it: the window is a view onto UP.items, so a transfer
+       goes on transferring and a half-typed title is still there when it comes
+       back — the same reason Escape has always been allowed to shut it.
+       The exclusions are the ways a click can be INSIDE this window's business
+       while landing outside its box: the popover the taglet picker opens, and
+       the full-page drop overlay. The drag that moves the window needs none —
+       it starts on the header, which is inside the box; only its mouseUP can
+       land elsewhere, and that is not a mousedown. The textarea guard from
+       Escape applies here too: a click into another panel while pasting a
+       transcript is the one dismissal that costs something. */
+    document.addEventListener('mousedown', (e) => {
+      if (!UP.open) return;
+      if (e.target.closest('#up-win, #snip-upload, .pop2, .up-hint')) return;
+      if (upWin.contains(document.activeElement)
+          && document.activeElement?.tagName === 'TEXTAREA') return;
+      upClose();
     });
     /* Coalesced into one frame, and skipped outright while the window is
        shut. This used to call upPlace() on every scroll event: a rect read and
@@ -15210,6 +15715,28 @@
     /** Attach or detach a taglet. Both go through a changeset like every other
      *  decision; minting a new one happens in the SAME changeset as the
      *  attachment, so a rejected suggestion leaves no orphan in the vocabulary. */
+    /** The music twin of snipTagletWrite.
+     *
+     *  Same endpoint, same shape, same one difference that matters: whether the
+     *  write lands or queues is `change.apply`, decided by the server, so an
+     *  editor's tag appears at once and a suggester's turns up in Review. The
+     *  page does not ask which happened — `submit()` next door already reads
+     *  the answer out of the response and says so. */
+    async function muTagWrite(changes, why, id) {
+      let r;
+      try { r = await apiPost('/api/changesets', { reason: why, changes }); }
+      catch (e) { r = { status: 0, body: { error: e.message } }; }
+      if (r.status >= 400) {
+        toast('bad', 'Tag not saved', r.body?.error ?? `HTTP ${r.status}`, 5000);
+        return false;
+      }
+      if (!ME.can?.['change.apply']) {
+        toast('queued', 'Queued for review', 'Nothing has changed on the song yet.', 5000);
+      }
+      await muRepaint(id);
+      return true;
+    }
+
     async function snipTagletWrite(changes, why, id) {
       let r;
       try { r = await apiPost('/api/changesets', { reason: why, changes }); }
@@ -15254,7 +15781,21 @@
        search runs against the vocabulary first, so a name that already exists
        under a slightly different spelling is offered before the mint row is
        even reachable, which is the duplicate this was most likely to create. */
-    function openTagletPicker(anchor, id, attached, { seed = '' } = {}) {
+    /* Which collection a tag is being hung on. The picker itself — the search,
+       the mint row, the kind swatches, the dedup against what is already
+       attached — is the same act for a clip and for a song, and the only things
+       that differ are the junction table it writes and how the row is redrawn
+       afterwards. So those are the table, and everything else is shared.
+
+       A second picker for songs would have been the cheaper edit and the worse
+       one: the vocabulary is one vocabulary, and two pickers over it drift. */
+    const TAG_TARGET = {
+      snippet: { junction: 'snippet_taglet', fk: 'snippet_id', write: snipTagletWrite },
+      music: { junction: 'music_tag', fk: 'music_id', write: muTagWrite },
+    };
+
+    function openTagletPicker(anchor, id, attached, { seed = '', on: kind = 'snippet' } = {}) {
+      const T = TAG_TARGET[kind];
       const on = new Set(attached.map((t) => t.id));
       openPop(anchor, `
         <input type="text" placeholder="Search or name a taglet…" autocomplete="off" spellcheck="false">
@@ -15309,7 +15850,7 @@
         paint();
       };
 
-      const choose = async (r, kind) => {
+      const choose = async (r, mintKind) => {
         closePop();
         /* Not a changeset. `taglet_suggestions` is a scratch field between
            upload and review rather than a curated one, and "who deleted the
@@ -15326,17 +15867,20 @@
         }
         const link = ulid26();
         if (!r.mint) {
-          return void snipTagletWrite([
-            { target_type: 'snippet_taglet', target_id: link, op: 'create', field: 'snippet_id', value: id },
-            { target_type: 'snippet_taglet', target_id: link, op: 'create', field: 'tag_id', value: r.t.id },
+          return void T.write([
+            { target_type: T.junction, target_id: link, op: 'create', field: T.fk, value: id },
+            { target_type: T.junction, target_id: link, op: 'create', field: 'tag_id', value: r.t.id },
           ], `tagged ${r.t.name}`, id);
         }
         const tid = ulid26();
-        await snipTagletWrite([
+        /* Mint and attach in ONE changeset, so a name that turns out to exist
+           merges rather than becoming a second row, and a suggester's whole
+           request is one thing for a reviewer to accept or refuse. */
+        await T.write([
           { target_type: 'tag', target_id: tid, op: 'create', field: 'name', value: r.name },
-          { target_type: 'tag', target_id: tid, op: 'create', field: 'kind', value: kind ?? 'general' },
-          { target_type: 'snippet_taglet', target_id: link, op: 'create', field: 'snippet_id', value: id },
-          { target_type: 'snippet_taglet', target_id: link, op: 'create', field: 'tag_id', value: tid },
+          { target_type: 'tag', target_id: tid, op: 'create', field: 'kind', value: mintKind ?? 'general' },
+          { target_type: T.junction, target_id: link, op: 'create', field: T.fk, value: id },
+          { target_type: T.junction, target_id: link, op: 'create', field: 'tag_id', value: tid },
         ], `added ${r.name}`, id);
       };
 
@@ -15469,12 +16013,51 @@
     const rvMore = document.getElementById('rv-more');
     const RV = { next: null, loading: false, booted: false, at: 0,
                  done: 0, started: null, undo: [], total: 0,
+                 /* Songs arrive whole on the first page while clips arrive a
+                    page at a time. `held` is the tail of songs that cannot be
+                    placed yet — see the watermark in loadReview. */
+                 held: [], songs: 0,
                  // Which pile you are looking at. The queue is the default and
                  // the other two exist so a decision can be revisited.
                  view: 'proposed' };
 
     bindSnipList(rvList);
     bindSnipEditing(rvList);
+
+    /* ---- one queue, two kinds of thing --------------------------------------
+       A clip and a song are different objects with different endpoints and
+       different renderers, and a reviewer sitting down to work through the
+       queue does not care: they are looking at submissions, and A means yes to
+       whichever one is under the cursor. So the difference is confined to this
+       table, and everything below asks the table rather than the row.
+
+       There is no `data-rvkind` attribute. The row already says what it is —
+       a clip carries `data-snip`, a song `data-mu` — and a second attribute
+       that has to agree with the first is a second attribute that can disagree
+       with it. */
+    const RV_KIND = {
+      snippet: {
+        cache: () => snipCache,
+        html: (r) => snipRowHtml(r, { review: true }),
+        /* When it arrived in the queue, which is what a queue is ordered by —
+           and for a clip that is the file's own age, not the row's. The list
+           endpoint sorts on exactly this, which is what lets the merge below
+           trust it. */
+        at: (r) => r.added_at ?? r.created_at,
+      },
+      music: {
+        cache: () => muCache,
+        html: (r) => muRvRow(r),
+        /* Submission time, deliberately NOT `uploaded_at`. The shelf sorts
+           songs by release date because it is a catalogue; a queue sorts by
+           when the work arrived, and a 2019 song pasted this morning is this
+           morning's work. */
+        at: (r) => r.created_at,
+      },
+    };
+    const rvKindOf = (row) => (row?.dataset.snip ? 'snippet' : 'music');
+    const rvIdOf = (row) => row?.dataset.snip ?? row?.dataset.mu ?? null;
+    const rvRefOf = (row) => ({ kind: rvKindOf(row), id: rvIdOf(row) });
 
     const rvRows = () => [...rvList.querySelectorAll('.snip')];
     const rvCur = () => rvRows()[RV.at] ?? null;
@@ -15483,14 +16066,15 @@
       const rows = rvRows();
       rows.forEach((r, i) => r.classList.toggle('rv-at', i === RV.at));
       const left = rows.length;
-      const noun = RV.view === 'proposed' ? 'waiting' : 'removed';
+      const noun = RV.view === 'proposed' ? 'queued' : 'removed';
       rvProgress.textContent = left
         ? `${RV.done ? `${RV.done} done · ` : ''}${left} on this page`
           + `${RV.total ? ` · ${RV.total} ${noun}` : ''}`
         : (RV.done ? `${RV.done} done · none left` : `nothing ${noun}`);
       if (RV.started && RV.done) {
         const secs = (performance.now() - RV.started) / 1000;
-        rvPace.textContent = `${fmtDur(secs)} · ${(secs / RV.done).toFixed(1)}s per snippet`;
+        // "per item", because the pile is no longer only clips.
+        rvPace.textContent = `${fmtDur(secs)} · ${(secs / RV.done).toFixed(1)}s per item`;
       } else rvPace.textContent = '';
       document.getElementById('rv-undo').disabled = !RV.undo.length;
     }
@@ -15515,18 +16099,56 @@
       const qs = new URLSearchParams({ status: RV.view, include: 'lines', limit: '50' });
       if (!reset && RV.next) qs.set('before', RV.next);
       try {
-        const d = await api('/api/snippets?' + qs);
-        if (reset) { rvList.innerHTML = ''; RV.at = 0; }
+        /* Songs on the first page only, and all of them at once. There are
+           dozens of them where there are thousands of clips, so one small
+           request is cheaper — and far simpler — than teaching a second cursor
+           to interleave with the first. Failing softly: a music outage should
+           cost the queue its songs, not its clips. */
+        const [d, mu] = await Promise.all([
+          api('/api/snippets?' + qs),
+          reset && ME.can?.['music.decide']
+            ? api(`/api/music?status=${RV.view}&limit=200`).catch(() => null)
+            : null,
+        ]);
+        if (reset) { rvList.innerHTML = ''; RV.at = 0; RV.held = []; RV.songs = 0; }
         for (const s of d.snippets) snipCache.set(s.id, s);
+        const fresh = d.snippets.map((s) => ({ kind: 'snippet', id: s.id, row: s,
+                                               at: RV_KIND.snippet.at(s) }));
+        if (mu) {
+          /* Only what still has a verdict left in it. `?status=rejected` also
+             returns tombstones, and a tombstoned song is not awaiting anything
+             — its Restore lives in the Music panel, beside the pile that holds
+             it. A row in a review queue with no verdict on it is a row that
+             teaches people to skip rows. */
+          const songs = (mu.music ?? []).filter((m) => !m.retracted);
+          RV.songs = songs.length;
+          for (const m of songs) muCache.set(m.id, m);
+          RV.held = songs.map((m) => ({ kind: 'music', id: m.id, row: m,
+                                        at: RV_KIND.music.at(m) }));
+        }
+        /* The merge, and the one subtle line in it. Clips come newest-first a
+           page at a time; songs came all at once. A song older than the oldest
+           clip on this page belongs BELOW clips that have not been fetched yet,
+           so it waits for the page that would sit above it — or, when there are
+           no pages left, everything held is flushed. Without the watermark the
+           queue would be correctly ordered on page one and wrong from page two
+           onwards, which is the kind of wrong nobody reports because it looks
+           like the list simply being long. */
+        const floor = d.next && fresh.length
+          ? Math.min(...fresh.map((i) => i.at ?? 0))
+          : -Infinity;
+        const ready = RV.held.filter((h) => (h.at ?? 0) >= floor);
+        RV.held = RV.held.filter((h) => (h.at ?? 0) < floor);
         rvList.insertAdjacentHTML('beforeend',
-          d.snippets.map((s) => snipRowHtml(s, { review: true })).join(''));
+          [...fresh, ...ready].sort((a, b) => (b.at ?? 0) - (a.at ?? 0))
+            .map((i) => RV_KIND[i.kind].html(i.row)).join(''));
         RV.next = d.next;
-        RV.total = d.count;
+        RV.total = d.count + RV.songs;
         rvMore.hidden = !d.next;
         if (!rvRows().length) {
           rvList.innerHTML = `<div class="snips-empty">${
             RV.view === 'proposed'
-              ? 'Nothing waiting. Everything imported has been through here.'
+              ? 'Nothing queued. Every clip and every song has been through here.'
               : 'Nothing has been removed. Published snippets live in the '
                 + 'Snippets panel, not here.'}</div>`;
         }
@@ -15551,24 +16173,31 @@
          clips every bulk verb is destructive at fifty-at-a-time scale — the
          occasional un-publish is a per-row X, not a page button. */
       const sg = view === 'suggestions';
+      const cs = view === 'changes';
+      /* Both non-clip views want the same thing from the clip apparatus:
+         nothing. Kept as one flag rather than two so a third such view cannot
+         half-hide it. */
+      const clips = !sg && !cs;
       document.getElementById('rv-approve-all').hidden = view !== 'proposed';
       document.getElementById('rv-reject-all').hidden = view !== 'proposed';
       document.getElementById('rv-restore-all').hidden = view !== 'rejected';
       /* The whole clip-review apparatus goes away here: the bulk verbs mean
          nothing, the J/K/A/X keys have no rows to act on, and Undo undoes a
          verdict rather than a canonization. */
-      document.getElementById('rv-undo').hidden = sg;
-      document.querySelector('.rv-keys').hidden = sg;
-      document.getElementById('rv-progress').hidden = sg;
-      document.getElementById('rv-pace').hidden = sg;
-      rvList.hidden = sg;
+      document.getElementById('rv-undo').hidden = !clips;
+      document.querySelector('.rv-keys').hidden = !clips;
+      document.getElementById('rv-progress').hidden = !clips;
+      document.getElementById('rv-pace').hidden = !clips;
+      rvList.hidden = !clips;
       rvMore.hidden = true;
       sgList.hidden = !sg;
+      csList.hidden = !cs;
       /* Silence whatever was playing in the list we just hid. `hidden` stops a
          video being drawn and stops nothing else — the same bug the tab
          switcher had, one level down. */
-      if (sg) for (const v of rvList.querySelectorAll('video')) v.pause();
+      if (!clips) for (const v of rvList.querySelectorAll('video')) v.pause();
       if (sg) return void loadSuggestions();
+      if (cs) return void loadChangesets();
       loadReview({ reset: true });
     }
     for (const b of document.querySelectorAll('[data-rvview]')) {
@@ -15593,6 +16222,978 @@
     const sgList = document.getElementById('sg-list');
     const sgCount = document.getElementById('rv-sgn');
     const SG = { rows: [], open: new Set(), loading: false };
+
+    /* ---- the changeset queue ---------------------------------------------
+     *
+     * The queue of proposed EDITS. It has existed server-side since suggesters
+     * did — `POST /api/changesets` queues anything from someone without
+     * `change.apply` — and until now nothing ever called `GET /api/changesets`,
+     * so the tag browser's own confirm dialog promised "as a suggestion this
+     * lands on Review" and there was no Review for it to land on.
+     */
+    /* =====================================================================
+       music — somebody else's video, kept because it will not always be there
+       =====================================================================
+
+       The module is small on purpose. Submission reuses the link route's
+       canonicaliser, the tag picker is the archive's own, retraction is a
+       changeset like every other decision, and the capability table decides
+       who sees which button. Only the verdict needed anything new, and that is
+       two buttons on a card.
+
+       Reviewed HERE rather than in the Review panel, and that was a choice: a
+       song is judged by listening to it, the embed is already on the card, and
+       sending an editor to a different screen to approve something they have
+       to come back here to hear is the kind of split nobody makes twice.
+    */
+    const muGrid = document.getElementById('mu-grid');
+    const muCount = document.getElementById('mu-count');
+    const muQ = document.getElementById('mu-q');
+    const MU = { rows: [], q: '', loading: false, booted: false };
+    /* Every song the page has seen, by id — the music twin of `snipCache`, and
+       here for the same reason it is: the review queue renders songs too, and
+       its rows are not in `MU.rows`. A handler that resolved a card by looking
+       through the Music panel's current page could only ever work on the Music
+       panel. This one works wherever the row is. */
+    const muCache = new Map();
+
+    /** `2013.10.09`, the VIDEO's own upload date — not the row's age. Which
+     *  one is on the card matters: these are catalogued by when the song came
+     *  out, not by when somebody got round to pasting it. */
+    const muDate = (at) => {
+      if (!at) return '';
+      const d = new Date(at * 1000);
+      return `${d.getFullYear()}.${pad2(d.getMonth() + 1)}.${pad2(d.getDate())}`;
+    };
+
+    /* The one state that is about the FILE rather than about the verdict, and
+       the reason the module exists at all: the archive has its own copy. Drawn
+       as the index's card badge rather than as another word — a shelf of forty
+       cards each saying "preserved" is forty words nobody reads, and the same
+       glyph in the same pink is a thing you learn to see once. */
+    /* The five verbs. Tooltips carry the word, since a glyph alone is a guess
+       — and `aria-label` carries it for anyone not looking at glyphs at all. */
+    const MU_ICON = {
+      approve: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>',
+      deny:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>',
+      unlist:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18.84 12.25 1.72-1.71h-.02a5.004 5.004 0 0 0-.12-7.07 5.006 5.006 0 0 0-6.95 0l-1.72 1.71"/><path d="m5.17 11.75-1.71 1.71a5.004 5.004 0 0 0 .12 7.07 5.006 5.006 0 0 0 6.95 0l1.71-1.71"/><line x1="8" x2="8" y1="2" y2="5"/><line x1="2" x2="5" y1="8" y2="8"/><line x1="16" x2="16" y1="19" y2="22"/><line x1="19" x2="22" y1="16" y2="16"/></svg>',
+      retract: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 21H8a2 2 0 0 1-1.42-.587l-3.994-3.999a2 2 0 0 1 0-2.828l10-10a2 2 0 0 1 2.829 0l5.999 6a2 2 0 0 1 0 2.828L12.834 21"/><path d="m5.082 11.09 8.828 8.828"/></svg>',
+      link:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>',
+      restore: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg>',
+      delete:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 11v6"/><path d="M14 11v6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
+    };
+
+    const MU_KEPT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+      + 'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+      + '<rect width="20" height="5" x="2" y="3" rx="1"/>'
+      + '<path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/></svg>';
+
+    /** What the archive knows, in one word each. Only the states worth a
+     *  glance — the unremarkable case says nothing at all. */
+    /* `verdict: false` drops the three chips that say which pile the row is in.
+       On the shelf that is news — a proposed song sits beside published ones —
+       and in the review queue it is the tab you are standing on repeated on
+       every row, which is how a strip of chips stops being read. What stays
+       either way is the machine's half: what the probe and the fetch are
+       doing, which the tab cannot tell you. */
+    function muChips(m, { verdict = true } = {}) {
+      const out = [];
+      if (verdict && m.status === 'proposed') out.push('<span class="mu-chip wait">queued</span>');
+      /* Both can be true at once, and then both are said: they are different
+         facts about the same row and one does not imply the other. */
+      if (verdict && m.status === 'rejected') out.push('<span class="mu-chip bad">turned down</span>');
+      if (verdict && m.retracted) out.push('<span class="mu-chip bad">retracted</span>');
+      if (m.probe_status === 'queued' || m.probe_status === 'running') {
+        out.push('<span class="mu-chip wait">reading…</span>');
+      }
+      if (m.probe_status === 'failed') {
+        out.push(`<span class="mu-chip bad" title="${esc(m.probe_note ?? '')}">unread</span>`);
+      }
+      if (m.fetch_status === 'queued' || m.fetch_status === 'running') {
+        out.push('<span class="mu-chip wait">saving…</span>');
+      }
+      if (m.fetch_status === 'failed') {
+        out.push(`<span class="mu-chip bad" title="${esc(m.fetch_note ?? '')}">not saved</span>`);
+      }
+      return out.join('');
+    }
+
+    /** A song's tags, and what may be done to them.
+     *
+     *  The snippet strip's two affordances, said in this panel's vocabulary: a
+     *  × on each chip for whoever may detach, and a `+ tag` at the end for
+     *  whoever may attach. Both are capabilities and not roles, which is what
+     *  makes a suggester's version of this strip identical — their write goes
+     *  through the same changeset and simply waits for a reviewer.
+     *
+     *  Not on a tombstoned row: while a retraction stands, nothing else about
+     *  the song can be changed through the panel, and the changeset system
+     *  would refuse the write anyway. */
+    const muTagChip = (t, mayDetach) =>
+      `<span class="mu-tag" title="${esc(t.name)}"><i
+         style="background:var(--seg-${esc(t.kind)})"></i><span
+         class="mu-tagn">${esc(t.name)}</span>${mayDetach
+        ? `<button class="mu-tagx" type="button" data-mutagrm="${esc(t.link_id ?? '')}"
+             title="Take ${esc(t.name)} off this song"
+             aria-label="Remove ${esc(t.name)}">×</button>` : ''}</span>`;
+
+    function muTagStrip(m) {
+      const live = !m.retracted;
+      const mayDetach = live && !!ME.can?.['tag.detach'];
+      const mayAttach = live && !!ME.can?.['tag.attach'];
+      /* `+ tag` FIRST, which is the opposite of where the snippet strip puts
+         it, and for a reason particular to this card: the strip is clamped to
+         one row and scrolls, so anything after the tags is below the fold on
+         every song with more than a couple of singers — reachable only by
+         scrolling a 20px window to find the control you were looking for.
+         At the front it is always where your hand expects it, and the tags
+         scroll past it. `data-popopen` keeps the document-level dismissal from
+         closing the picker on the very click that opened it. */
+      return (mayAttach
+            ? `<button class="mu-tag mu-tagadd" type="button" data-mutagadd data-popopen
+                 title="Put a tag on this song">+ tag</button>` : '')
+        + m.tags.map((t) => muTagChip(t, mayDetach)).join('');
+    }
+
+    function muCard(m) {
+      const mine = m.author_id && m.author_id === ME.id;
+      const may = {
+        /* A tombstoned row is out of the verdict business until it is restored.
+           The review route refuses one anyway — `retracted_at IS NULL` is in its
+           lookup — so offering the button would be offering a 404. */
+        approve: !!ME.can?.['music.decide'] && m.status !== 'confirmed' && !m.retracted,
+        /* Only what is still waiting can be turned down. Offering Deny on a
+           song already in the removed pile is offering a button that does
+           nothing — the review route answers `changed: 0` — and a row of five
+           verbs where two are inert is how a card stops being read at all. */
+        deny: !!ME.can?.['music.decide'] && m.status === 'proposed' && !m.retracted,
+        undo: !!ME.can?.['music.decide'] && m.status === 'confirmed' && !m.retracted,
+        // Undoing the tombstone comes first: while it stands, nothing else about
+        // the row can be changed through the panel.
+        unretract: !!ME.can?.['music.retract'] && m.retracted,
+        requeue: !!ME.can?.['music.decide'] && m.status === 'rejected' && !m.retracted,
+        // Nothing already out of the collection needs tombstoning as well.
+        retract: !!ME.can?.['music.retract'] && !m.retracted && m.status !== 'rejected',
+        /* Matches the server's own guard: a published song has to be turned
+           down or retracted first, so a slip costs a click and not a master. */
+        purge: !!ME.can?.['music.purge'] && (m.status !== 'confirmed' || m.retracted),
+      };
+      const btn = (act, icon, label, cls = '') =>
+        `<button class="mu-btn ${cls}" type="button" data-muact="${act}"
+           title="${esc(label)}" aria-label="${esc(label)}">${MU_ICON[icon]}</button>`;
+      const acts = [
+        /* First, and shown to everyone. It is the only thing on this card a
+           signed-out visitor can do, and putting it first means an editor's
+           hand does not learn one position and then find another there when
+           the buttons beside it come and go with the pile. */
+        btn('copy', 'link', 'Copy the link'),
+        may.approve ? btn('approve', 'approve', 'Approve', 'yes') : '',
+        may.deny ? btn('reject', 'deny', 'Deny', 'bad') : '',
+        /* Same action as Deny and a different word, because the starting state
+           is different: this one takes a song back OFF the shelf. It lands in
+           Removed, where it can be put back. */
+        may.undo ? btn('reject', 'unlist', 'Unlist — take it off the shelf', 'bad') : '',
+        may.unretract ? btn('unretract', 'restore', 'Restore — undo the retraction', 'yes') : '',
+        may.requeue ? btn('reset', 'restore', 'Back to the queue', 'yes') : '',
+        may.retract ? btn('retract', 'retract', 'Retract', 'bad') : '',
+        may.purge ? btn('purge', 'delete', 'Delete', 'bad') : '',
+      ].filter(Boolean).join('');
+      /* A row still being read has no title yet, and drawing an empty one over
+         a video nobody has looked at reads as a broken card. Say what is
+         actually happening instead. */
+      const title = m.title
+        ?? (m.probe_status === 'failed' ? m.url : 'Waiting for the recorder…');
+      /* The two unsettled states, said in the border rather than only in a
+         chip. This panel is one list now, so a card has to be legible as
+         waiting or removed from across the grid — the chips underneath say
+         WHICH removal it was. */
+      const tint = m.retracted || m.status === 'rejected' ? ' is-removed'
+                 : m.status === 'proposed' ? ' is-pending' : '';
+      return `<article class="mu${tint}" data-mu="${esc(m.id)}">
+        <button class="mu-art" type="button" data-muplay title="Play">
+          <!-- A thumbnail that will not load is not a rendering glitch here, it
+               is the news: YouTube serves nothing for a video that has been
+               taken down, so this is the first place the archive finds out the
+               thing it exists to preserve is gone. Degrades to a marked empty
+               cover rather than a broken-image icon, and says so. -->
+          <img loading="lazy" src="${esc(m.thumb)}" alt=""
+            onerror="this.closest('.mu-art').classList.add('mu-noart');this.remove()">
+          <span class="mu-play"><svg width="42" height="42" viewBox="0 0 24 24"
+            fill="currentColor"><path d="M8 5v14l11-7z"/></svg></span>
+          ${(() => { const c = muChips(m); return c ? `<span class="mu-state">${c}</span>` : ''; })()}
+          ${m.duration_s ? `<span class="mu-dur">${dur(m.duration_s)}</span>` : ''}
+          ${m.preserved ? `<span class="cbadge on mu-kept" role="img"
+            aria-label="The archive holds a copy of this"
+            title="The archive holds a copy of this">${MU_KEPT}</span>` : ''}
+        </button>
+        <div class="mu-body">
+          <div class="mu-t" title="${esc(m.title ?? m.url)}">${esc(title)}</div>
+          <div class="mu-ch" title="${esc(m.channel ?? '')}">${esc(m.channel ?? '')}</div>
+          <div class="mu-date">${m.uploaded_at ? muDate(m.uploaded_at) : ''}${
+            mine && m.status === 'proposed' ? '<span class="mu-mine">yours</span>' : ''}</div>
+          <div class="mu-tags">${muTagStrip(m)}</div>
+          ${acts ? `<div class="mu-acts">${acts}</div>` : ''}
+        </div>
+      </article>`;
+    }
+
+    /** The same song, as a row in the review queue.
+     *
+     *  Deliberately a SHORTER action set than the card: this pile is "things
+     *  waiting for a verdict", so it carries the verdict and the two things you
+     *  need to reach one — watch it, and copy the link to check it elsewhere.
+     *  Retract, restore and delete are about a song's life after the verdict
+     *  and live in the Music panel, where the piles that hold those states are.
+     *
+     *  The verdict buttons are `data-rv`, the same attribute a clip's are, and
+     *  that is the whole of "Accept is the same key whatever the item is": the
+     *  keymap and the click handler already act on `data-rv` and never learn
+     *  there are two kinds of thing in the list.
+     */
+    function muRvRow(m) {
+      const may = {
+        approve: !!ME.can?.['music.decide'] && m.status !== 'confirmed' && !m.retracted,
+        /* Only something still waiting can be turned down; the route answers
+           `changed: 0` otherwise, and a button that reports success while doing
+           nothing is worse than a missing one. */
+        reject: !!ME.can?.['music.decide'] && m.status === 'proposed' && !m.retracted,
+      };
+      const rv = (act, cls, icon, label) =>
+        `<button class="rv-btn ${cls}" type="button" data-rv="${act}"
+           title="${esc(label)}" aria-label="${esc(label)}">${MU_ICON[icon]}</button>`;
+      const verdict = `<div class="rv-verdict">${
+        (may.approve ? rv('approve', 'rv-yes', 'approve', 'Publish (A)') : '')
+        + (may.reject ? rv('reject', 'rv-no', 'deny', 'Reject (X)') : '')}</div>`;
+
+      const title = m.title
+        ?? (m.probe_status === 'failed' ? m.url : 'Waiting for the recorder…');
+      const line = (k, v) => (v ? `<div class="mu-rvline"><b>${k}</b><span>${v}</span></div>` : '');
+      /* Everything a verdict actually rests on, and nothing else. The link is
+         real and opens in a new tab, because "is this the song it says it is"
+         is answered on YouTube and not here. */
+      const facts = line('link',
+          `<a href="${esc(m.url)}" target="_blank" rel="noopener noreferrer">${esc(m.url)}</a>`)
+        + line('channel', esc(m.channel ?? ''))
+        + line('uploaded', m.uploaded_at ? muDate(m.uploaded_at) : '')
+        + line('by', m.author
+            ? esc(m.author) + (m.author_id && m.author_id === ME.id
+                ? '<span class="mu-mine">yours</span>' : '')
+            : '')
+        /* The probe's own words when it has something to say. A row that could
+           not be read is the one case where the reviewer needs the machine's
+           account rather than the metadata it failed to fetch. */
+        + line('note', esc(m.probe_note ?? m.note ?? ''));
+
+      return `<article class="snip rv hasv mu-rv" data-mu="${esc(m.id)}">
+        <div class="snip-media" style="--ar:16/9">
+          <button class="snip-frame mu-art" type="button" data-muplay
+            title="Watch it" aria-label="Watch ${esc(m.title ?? 'this song')}">
+            <img loading="lazy" src="${esc(m.thumb)}" alt=""
+              onerror="this.closest('.snip-frame').classList.add('mu-noart');this.remove()">
+            <span class="snip-play" aria-hidden="true">${playIcon}</span>
+            ${m.duration_s ? `<span class="snip-dur">${dur(m.duration_s)}</span>` : ''}
+          </button>
+        </div>
+        <div class="snip-body">
+          <div class="snip-title" title="${esc(m.title ?? m.url)}">${esc(title)}</div>
+          ${(() => {
+            /* Only when there is something in them. An empty strip still
+               carries its own top margin, and two of those under every row of
+               a fifty-row queue is a queue that scrolls half again as far for
+               nothing. */
+            const c = muChips(m, { verdict: false });
+            return c ? `<div class="snip-tags">${c}</div>` : '';
+          })()}
+          ${m.tags.length ? `<div class="mu-tags">${m.tags.map((t) =>
+            `<span class="mu-tag" title="${esc(t.name)}"><i
+               style="background:var(--seg-${esc(t.kind)})"></i>${esc(t.name)}</span>`).join('')}</div>` : ''}
+          <div class="sheet-actions snip-acts">
+            <button class="btn-ghost sheet-ico" type="button" data-muact="copy"
+              title="Copy the link" aria-label="Copy the link">${MU_ICON.link}</button>
+          </div>
+        </div>
+        <div class="snip-tr mu-rvtr">${facts}</div>
+        ${verdict}
+      </article>`;
+    }
+
+    function muPaint() {
+      muGrid.innerHTML = MU.rows.length
+        ? MU.rows.map(muCard).join('')
+        : `<div class="mu-empty">${MU.q
+            ? `Nothing matches “${esc(MU.q)}” here.`
+            : 'Nothing here yet. Paste a link and it starts as a suggestion.'}</div>`;
+      /* "3 of them" is a different fact from "3 songs", and on a filtered
+         list the second one reads as the collection being smaller than it is. */
+      const n = MU.rows.length;
+      const noun = MU.q ? (n === 1 ? 'match' : 'matches') : (n === 1 ? 'song' : 'songs');
+      muCount.textContent = n ? `${n} ${noun}` : '';
+    }
+
+    /* One request, no pile. The server bands the answer — waiting first, the
+       shelf, then removed — and hands back only what this reader may see, so a
+       visitor gets the collection and an editor gets the collection with its
+       queue sitting on top of it. */
+    async function loadMusic() {
+      if (MU.loading) return;
+      MU.loading = true;
+      try {
+        const d = await api('/api/music?limit=200'
+          + (MU.q ? `&q=${encodeURIComponent(MU.q)}` : ''));
+        MU.rows = d.music ?? [];
+        for (const m of MU.rows) muCache.set(m.id, m);
+        muPaint();
+      } catch (e) { offline(e); muGrid.innerHTML = '<div class="mu-empty">Could not load.</div>'; }
+      finally { MU.loading = false; }
+    }
+
+    /** Re-read ONE song and redraw its card in place.
+     *
+     *  The music twin of snipRepaint, and here for the same reason: a tag
+     *  written on the fortieth card should not reload two hundred of them and
+     *  scroll you back to the first. The whole card is replaced rather than
+     *  just the tag strip — unlike a clip row there is no <video> mounted in it
+     *  to destroy, and a status that changed under us should redraw with it. */
+    async function muRepaint(id) {
+      try {
+        const fresh = (await api(`/api/music/${id}`)).music;
+        muCache.set(id, fresh);
+        const i = MU.rows.findIndex((m) => m.id === id);
+        if (i >= 0) MU.rows[i] = fresh;
+        for (const card of document.querySelectorAll(`.mu[data-mu="${CSS.escape(id)}"]`)) {
+          card.outerHTML = muCard(fresh);
+        }
+        // The add window draws the same song in a different shape.
+        if (MU_MINE.includes(id)) muMinePaint();
+      } catch { /* the write landed; the next load will show it */ }
+    }
+
+    /* ---- the player ------------------------------------------------------ */
+    const muModal = document.createElement('div');
+    muModal.className = 'mu-modal';
+    muModal.hidden = true;
+    document.body.appendChild(muModal);
+
+    function muPlay(m) {
+      muModal.innerHTML = `<div class="mu-frame">
+        <div class="mu-mhead">
+          <b>${esc(m.title ?? m.url)}</b>
+          <span>${esc(m.channel ?? '')}${m.uploaded_at ? ` · ${muDate(m.uploaded_at)}` : ''}</span>
+          <button class="mu-btn" type="button" data-muclose>Close</button>
+        </div>
+        <iframe src="${esc(m.embed)}?autoplay=1&rel=0" allow="autoplay; encrypted-media"
+          referrerpolicy="strict-origin-when-cross-origin" allowfullscreen
+          title="${esc(m.title ?? 'music video')}"></iframe>
+      </div>`;
+      muModal.hidden = false;
+    }
+    /* Emptied and not merely hidden. A hidden iframe goes on playing, which is
+       the same bug the tab switcher had with <video> and is louder here. */
+    function muClose() { muModal.hidden = true; muModal.innerHTML = ''; }
+    muModal.addEventListener('click', (e) => {
+      if (e.target === muModal || e.target.closest('[data-muclose]')) muClose();
+    });
+    addEventListener('keydown', (e) => { if (e.key === 'Escape' && !muModal.hidden) muClose(); });
+
+    /* ---- adding one ------------------------------------------------------ */
+    /* ---- the way in ------------------------------------------------------
+       The upload window's behaviour, minus everything that only a file needs:
+       no drag-to-move, because a song submission is a five-second interaction
+       and not a panel you keep open while bytes move; no queue, because the
+       grid behind it is the queue now. What is kept is the part that makes the
+       two panels feel like one archive — a primary button in the toolbar that
+       opens a glass panel under itself. */
+    const muWin = document.getElementById('mu-win');
+    const muAddBtn = document.getElementById('mu-add');
+    const muUrl = document.getElementById('mu-url');
+    /* `mu-added`, not `mu-q` — that id is the search box at the top of the
+       panel, and getElementById would have handed this list the input instead.
+       The rows went into an <input>, which cannot have children, so every one
+       of them measured zero by zero and nothing in the window was clickable. */
+    const muAdded = document.getElementById('mu-added');
+    const muAddedNone = document.getElementById('mu-added-none');
+    /* What this session put forward, newest first. Ids only — the rows
+       themselves live in muCache, so a repaint anywhere updates this list too
+       rather than leaving a second stale copy of the same song. */
+    const MU_MINE = [];
+
+    function muWinPlace() {
+      if (window.innerWidth <= 560) { muWin.style.maxHeight = ''; return; }
+      const r = muAddBtn.getBoundingClientRect();
+      const w = muWin.offsetWidth || 424;
+      muWin.style.left = `${Math.round(Math.min(Math.max(8, r.right - w), window.innerWidth - w - 8))}px`;
+      muWin.style.top = `${Math.round(r.bottom + 8)}px`;
+      muWin.style.maxHeight = `${Math.max(220, window.innerHeight - r.bottom - 20)}px`;
+    }
+
+    function muWinOpen() {
+      if (!ME.can?.['music.submit']) {
+        return void toast('bad', 'Sign in first',
+          'Adding a song needs an account that may suggest.', 5000);
+      }
+      muWin.hidden = false;
+      muWinPlace();
+      muAddBtn.setAttribute('aria-expanded', 'true');
+      requestAnimationFrame(() => { muWin.classList.add('open'); muUrl.focus(); });
+    }
+    function muWinClose() {
+      muWin.classList.remove('open');
+      muAddBtn.setAttribute('aria-expanded', 'false');
+      setTimeout(() => { muWin.hidden = true; }, 210);
+    }
+    const muWinIsOpen = () => muWin.classList.contains('open');
+
+    muAddBtn.addEventListener('click', () => (muWinIsOpen() ? muWinClose() : muWinOpen()));
+    document.getElementById('mu-win-x').addEventListener('click', muWinClose);
+    addEventListener('resize', () => { if (muWinIsOpen()) muWinPlace(); });
+    /* Outside-click and Escape. The tag picker opens as a popover of its own
+       OUTSIDE this window's box, so a click in it must not read as a click
+       away — hence `.pop2` in the allowlist. */
+    document.addEventListener('mousedown', (e) => {
+      if (!muWinIsOpen()) return;
+      if (e.target.closest('#mu-win, #mu-add, .pop2')) return;
+      muWinClose();
+    });
+    addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && muWinIsOpen() && muModal.hidden && pop2.hidden) {
+        muWinClose();
+      }
+    });
+
+    /** One song in the window's list.
+     *
+     *  The snippet upload window's card, with the halves a link does not have
+     *  taken out: no progress bar, no transfer to abort, no title field —
+     *  YouTube's title is the title, and it arrives when the probe answers.
+     *  What is left is the part this exists for: the tag strip, which is the
+     *  SAME strip the shelf card carries, so `+ tag` is the same picker with
+     *  the same vocabulary and the same ability to mint a name that is missing.
+     */
+    function muMineRow(m) {
+      const reading = m.probe_status === 'queued' || m.probe_status === 'running';
+      const failed = m.probe_status === 'failed';
+      const title = m.title ?? (failed ? m.url : 'Reading the video…');
+      const state = failed ? (m.probe_note || 'could not read it')
+                  : reading ? 'reading…'
+                  : m.status === 'confirmed' ? 'published'
+                  : 'waiting for review';
+      return `<div class="up-item mu-mine${failed ? ' sad' : ''}" data-mu="${esc(m.id)}">
+        <div class="up-top">
+          <div class="up-thumb">${m.thumb && !failed
+            ? `<img src="${esc(m.thumb)}" alt="" loading="lazy"
+                 onerror="this.remove()">`
+            : `<svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                 stroke="currentColor" stroke-width="1.8"><path
+                 d="M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1"/></svg>`}</div>
+          <div class="up-mid">
+            <div class="up-name" title="${esc(m.title ?? m.url)}">${esc(title)}</div>
+            <div class="up-state">${esc(state)}</div>
+          </div>
+        </div>
+        <div class="mu-tags mu-minetags">${muTagStrip(m)}</div>
+      </div>`;
+    }
+
+    function muMinePaint() {
+      const rows = MU_MINE.map((id) => muCache.get(id)).filter(Boolean);
+      muAdded.innerHTML = rows.map(muMineRow).join('');
+      muAddedNone.hidden = rows.length > 0;
+      /* Poll only while something is still being read, and stop the moment
+         nothing is. A window left open on a settled list should be as quiet as
+         a closed one. */
+      const reading = rows.some((m) => m.probe_status === 'queued'
+                                    || m.probe_status === 'running');
+      clearTimeout(muMinePaint._t);
+      if (reading && muWinIsOpen()) {
+        muMinePaint._t = setTimeout(muMineRefresh, 4000);
+      }
+    }
+
+    async function muMineRefresh() {
+      const ids = MU_MINE.filter((id) => {
+        const m = muCache.get(id);
+        return m && (m.probe_status === 'queued' || m.probe_status === 'running');
+      });
+      /* One request per row still reading, and there are never many — this is
+         one person's own additions in one sitting. */
+      await Promise.all(ids.map((id) => muRepaint(id).catch(() => {})));
+      muMinePaint();
+      if (ids.length) loadMusic();
+    }
+
+    async function muSubmit() {
+      const url = muUrl.value.trim();
+      if (!url) return void toast('bad', 'Needs a link', 'Paste a YouTube link.');
+      const go = document.getElementById('mu-go');
+      go.disabled = true;
+      const r = await apiPost('/api/music', { url });
+      go.disabled = false;
+      if (r.status === 409) {
+        return void toast('bad', 'Already here',
+          r.body?.music?.title ? `Filed as “${r.body.music.title}”.` : 'That video is in the archive.');
+      }
+      if (r.status !== 201) {
+        return void toast('bad', 'Refused', r.body?.error ?? `HTTP ${r.status}`, 7000);
+      }
+      const m = r.body.music;
+      muCache.set(m.id, m);
+      if (!MU_MINE.includes(m.id)) MU_MINE.unshift(m.id);
+      /* Cleared, not closed. Adding one song and then another is the common
+         shape — a set list, an album, a month of a channel — and closing after
+         each would make that ten gestures instead of two. */
+      muUrl.value = '';
+      muUrl.focus();
+      muMinePaint();
+      loadMusic();
+    }
+    document.getElementById('mu-go').addEventListener('click', muSubmit);
+    muUrl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); muSubmit(); }
+    });
+
+    /* ---- the verdict, and everything after it ---------------------------- */
+    /** The tag strip's two gestures, wherever the strip is drawn.
+     *
+     *  Bound to the shelf AND to the add window's list, because the strip is
+     *  the same markup in both and a handler that only existed on the grid
+     *  would make `+ tag` inert in the one place somebody is actually tagging.
+     *  Returns true when it handled the event. */
+    function muTagClick(e) {
+      const host = e.target.closest('[data-mu]');
+      const m = host && muCache.get(host.dataset.mu);
+      if (!m) return false;
+      const tagAdd = e.target.closest('[data-mutagadd]');
+      if (tagAdd) {
+        e.stopPropagation();
+        openTagletPicker(tagAdd, m.id, m.tags, { on: 'music' });
+        return true;
+      }
+      const tagRm = e.target.closest('[data-mutagrm]');
+      if (tagRm) {
+        e.stopPropagation();
+        /* The JUNCTION row is what gets deleted — the tag itself survives being
+           taken off a song. Its id came down with the row, so unlike the
+           snippet strip this needs no second request to ask which row joins
+           these two. */
+        const link = tagRm.dataset.mutagrm;
+        const t = m.tags.find((x) => x.link_id === link);
+        if (!link || !t) {
+          toast('bad', 'Could not detach that', 'No junction id came back.', 5000);
+          return true;
+        }
+        muTagWrite([{ target_type: 'music_tag', target_id: link, op: 'delete' }],
+          `untagged ${t.name}`, m.id);
+        return true;
+      }
+      return false;
+    }
+    muAdded.addEventListener('click', muTagClick);
+
+    /* ---- every tag, on hover -----------------------------------------------
+       The shelf's strip shows one line of a song that may have six singers, so
+       the row is the summary and this is the whole answer. Only on the grid:
+       the add window's strip already wraps and shows everything, and a popover
+       over the thing it is duplicating is just a second copy in the way. */
+    const muPop = Object.assign(document.createElement('div'),
+      { className: 'mu-pop', hidden: true });
+    document.body.appendChild(muPop);
+    let muPopFor = null;
+
+    function muPopShow(strip) {
+      const card = strip.closest('[data-mu]');
+      const m = card && muCache.get(card.dataset.mu);
+      if (!m?.tags?.length) return;
+      muPopFor?.classList.remove('mu-lit');
+      muPopFor = strip;
+      strip.classList.add('mu-lit');
+      // Never with the × buttons: this panel does not take clicks (it is
+      // pointer-events: none, so the pointer stays on the row it belongs to and
+      // the hover does not flicker), and a control you cannot press is worse
+      // than no control.
+      muPop.innerHTML = m.tags.map((t) => muTagChip(t, false)).join('');
+      muPop.hidden = false;
+      const r = strip.getBoundingClientRect();
+      const w = muPop.offsetWidth, h = muPop.offsetHeight;
+      // Below by default, above when there is no room — the shelf's last row
+      // sits near the bottom of the window as often as not.
+      const top = r.bottom + 6 + h > window.innerHeight ? r.top - h - 6 : r.bottom + 6;
+      muPop.style.left = `${Math.round(Math.max(8, Math.min(r.left, window.innerWidth - w - 8)))}px`;
+      muPop.style.top = `${Math.round(Math.max(8, top))}px`;
+    }
+    function muPopHide() {
+      muPop.hidden = true;
+      muPopFor?.classList.remove('mu-lit');
+      muPopFor = null;
+    }
+
+    /* pointerover/out and NOT pointerenter/leave.
+     *
+     * enter and leave do not bubble, so reaching them by delegation means
+     * listening in the capture phase — where they still arrive, once per
+     * element the pointer crosses. Every chip in the strip is such an element,
+     * so crossing the 4px gap between two tags fired leave-then-enter and the
+     * panel blinked its way along the row.
+     *
+     * over and out DO bubble, and they carry `relatedTarget` — where the
+     * pointer came from, or went to. That is the whole fix: a move that stays
+     * inside the same strip is a move this ignores, whichever children it was
+     * between. */
+    muGrid.addEventListener('pointerover', (e) => {
+      const strip = e.target?.closest?.('.mu-tags');
+      if (!strip || strip === muPopFor) return;
+      muPopShow(strip);
+    });
+    muGrid.addEventListener('pointerout', (e) => {
+      const strip = e.target?.closest?.('.mu-tags');
+      if (!strip || strip !== muPopFor) return;
+      // Still inside the row — a chip handing over to its neighbour, or to the
+      // row itself. `contains(null)` is false, so leaving the window hides it.
+      if (strip.contains(e.relatedTarget)) return;
+      muPopHide();
+    });
+    // A repaint or a scroll leaves the panel pointing at nothing.
+    muGrid.addEventListener('scroll', muPopHide, true);
+    addEventListener('scroll', muPopHide, true);
+
+    muGrid.addEventListener('click', async (e) => {
+      const card = e.target.closest('.mu');
+      if (!card) return;
+      /* From the cache and not from `MU.rows`: a card redrawn in place by
+         muRepaint is a card whose row came back on its own request, and the
+         page's one answer to "what is this song" should be the same object
+         wherever it was last read. */
+      const m = muCache.get(card.dataset.mu);
+      if (!m) return;
+      if (e.target.closest('[data-muplay]')) return void muPlay(m);
+      if (muTagClick(e)) return;
+
+      const act = e.target.closest('[data-muact]')?.dataset.muact;
+      if (!act) return;
+
+      if (act === 'copy') {
+        /* The YouTube link, not this page's — the point is sharing the song
+           with somebody who has never heard of this archive. */
+        if (navigator.clipboard) navigator.clipboard.writeText(m.url).catch(() => {});
+        const b = e.target.closest('[data-muact]');
+        b.classList.add('copied');
+        setTimeout(() => b.classList.remove('copied'), 1200);
+        return;
+      }
+
+      if (act === 'retract') {
+        const queued = !ME.can?.['change.apply'];
+        if (!confirm(`Retract “${m.title ?? m.url}”?\n\n`
+          + 'It leaves the collection. The row is tombstoned, not destroyed, so it '
+          + 'can be brought back.'
+          + (queued ? '\n\nAs a suggestion this lands on Review — accepted it happens, '
+                    + 'rejected nothing changed.' : ''))) return;
+        card.classList.add('busy');
+        await submit([{ target_type: 'music', target_id: m.id, op: 'delete' }],
+          `retracted ${m.title ?? m.video_id}`, { after: () => muRepaint(m.id) });
+        card.classList.remove('busy');
+        return;
+      }
+
+      if (act === 'unretract') {
+        /* A changeset, because a retraction was one — undoing it is the same
+           kind of decision as making it, with the same author and the same
+           queue for anyone who cannot apply their own. */
+        card.classList.add('busy');
+        await submit([{ target_type: 'music', target_id: m.id, op: 'update',
+                        field: 'retracted_at', value: null }],
+          `restored ${m.title ?? m.video_id}`, { after: () => muRepaint(m.id) });
+        card.classList.remove('busy');
+        return;
+      }
+
+      if (act === 'purge') {
+        /* Two calls, and the first one is what makes the question answerable:
+           a confirm that cannot say what it is about to destroy is not a
+           confirmation. */
+        const pre = await apiPost(`/api/music/${m.id}/purge`, {});
+        if (pre.status !== 200) {
+          return void toast('bad', 'Cannot destroy', pre.body?.error ?? `HTTP ${pre.status}`, 8000);
+        }
+        const p = pre.body;
+        if (!confirm(`Destroy “${p.music.title ?? m.url}”?\n\n`
+          + `This removes the row and its ${p.counts.tags} tag`
+          + `${p.counts.tags === 1 ? '' : 's'} for good.`
+          + (p.preserved ? '\nThe recorder is asked to delete the saved file.' : '')
+          + '\n\nThere is no undo.')) return;
+        card.classList.add('busy');
+        const r = await apiPost(`/api/music/${m.id}/purge`, { confirm: p.confirm });
+        card.classList.remove('busy');
+        if (r.status !== 200) {
+          return void toast('bad', 'Not destroyed', r.body?.error ?? `HTTP ${r.status}`, 8000);
+        }
+        toast('applied', 'Destroyed', 'The row is gone. The log keeps its name.');
+        loadMusic();
+        return;
+      }
+
+      card.classList.add('busy');
+      const r = await apiPost(`/api/music/${m.id}/review`, { decision: act });
+      card.classList.remove('busy');
+      if (r.status !== 200) {
+        return void toast('bad', 'That did not save', r.body?.error ?? `HTTP ${r.status}`, 6000);
+      }
+      /* Redrawn where it stands rather than faded out and the grid reloaded.
+         The card does not leave this panel on a verdict any more — it changes
+         colour — and watching that happen is what tells you the verdict landed.
+         It settles into its band on the next load; a card that jumped two
+         hundred rows down the instant you approved it would be a card you then
+         had to go and find to check. */
+      muRepaint(m.id);
+      const said = {
+        approve: ['applied', 'Published', 'The recorder is saving a copy now.'],
+        reject: ['queued', 'Denied', 'It moves to Removed. Nothing was destroyed.'],
+        reset: ['queued', 'Back in the queue', 'It is waiting for a verdict again.'],
+      }[act] ?? ['applied', 'Saved', ''];
+      toast(said[0], said[1], said[2]);
+    });
+
+    /* Debounced, because every keystroke is a query and the useful answer is
+       the one for the whole word. 180ms is below the point where it reads as
+       lag and above the point where "fuura" is five round trips.
+       The term SURVIVES a view switch on purpose: looking for a song, not
+       finding it in Songs, and clicking Waiting is one thought, and a box that
+       emptied itself in the middle of it would make you type it twice. */
+    let muTimer = null;
+    muQ.addEventListener('input', () => {
+      clearTimeout(muTimer);
+      muTimer = setTimeout(() => {
+        const q = muQ.value.trim();
+        if (q === MU.q) return;
+        MU.q = q;
+        loadMusic();
+      }, 180);
+    });
+    muQ.addEventListener('keydown', (e) => {
+      // Escape clears rather than blurs — the box is a filter, and leaving a
+      // filter set while looking at a list that says "nothing here" is how you
+      // conclude the collection is empty.
+      if (e.key !== 'Escape' || !muQ.value) return;
+      e.preventDefault(); e.stopPropagation();
+      muQ.value = ''; MU.q = ''; loadMusic();
+    });
+    document.getElementById('tab-music').addEventListener('click', () => {
+      if (MU.booted) return void loadMusic();
+      MU.booted = true;
+      loadMusic();
+    });
+
+    const csList = document.getElementById('cs-list');
+    const csCount = document.getElementById('rv-csn');
+    const CS = { rows: [], names: {}, loading: false };
+
+    /* What each target type is called in a sentence. `stream_tag` and
+       `snippet_taglet` are absent on purpose — a junction never describes
+       itself, it describes the pair it joins, and csGroups() handles those
+       separately. */
+    const CS_NOUN = { tag: 'tag', stream: 'stream', snippet: 'clip', note: 'note',
+                      segment: 'chapter', capture: 'capture' };
+
+    /** Change rows → the things a person actually did.
+     *
+     *  Creates arrive one row per FIELD sharing a target_id, so rendering rows
+     *  one by one produces "created tag name = Nikke" and "created tag kind =
+     *  media" as two separate lines about one act. Grouped by target first,
+     *  then read as a whole. */
+    function csGroups(cs) {
+      const groups = new Map();
+      for (const c of cs.changes ?? []) {
+        const key = `${c.op}:${c.target_type}:${c.target_id}`;
+        const g = groups.get(key)
+          ?? { op: c.op, tt: c.target_type, id: c.target_id, f: new Map() };
+        if (c.field) g.f.set(c.field, { value: c.value, base: c.base_value });
+        groups.set(key, g);
+      }
+      return [...groups.values()];
+    }
+
+    /** id → what it is called.
+     *
+     *  The server resolves every id it can, but a tag minted inside THIS
+     *  changeset has no row yet — its name exists only in the change rows we
+     *  are looking at, which is exactly where this looks second. */
+    function csNamer(cs) {
+      const local = new Map();
+      for (const c of cs.changes ?? []) {
+        if (c.target_type === 'tag' && c.field === 'name' && c.value) {
+          local.set(c.target_id, c.value);
+        }
+      }
+      return (id) => CS.names[id] ?? local.get(id)
+        ?? `<span class="cs-gone">${esc(String(id ?? '').slice(0, 8))}…</span>`;
+    }
+
+    /** One group → one sentence of HTML. */
+    function csLine(g, name) {
+      const b = (v) => `<b>${typeof v === 'string' && v.startsWith('<span') ? v : esc(String(v ?? ''))}</b>`;
+      const val = (v) => `<em>${esc(String(v ?? ''))}</em>`;
+      const chip = (cls, word) => `<span class="cs-v ${cls}">${word}</span>`;
+      const f = (k) => g.f.get(k)?.value ?? null;
+
+      // --- the junctions. Two rows, one fact: this thing is about that tag.
+      if (g.tt === 'stream_tag' || g.tt === 'snippet_taglet') {
+        const host = g.tt === 'stream_tag' ? 'stream_id' : 'snippet_id';
+        const what = g.tt === 'stream_tag' ? 'stream' : 'clip';
+        /* A delete carries no fields of its own — the pair is written down on
+           its way out as base_value, which is the only reason this can say
+           what was removed rather than "a link". */
+        const tag = g.f.get('tag_id');
+        const on = g.f.get(host);
+        const tagId = tag?.value ?? tag?.base ?? null;
+        const onId = on?.value ?? on?.base ?? null;
+        const tail = onId ? ` ${g.op === 'delete' ? 'from' : 'to'} the ${what} ${b(name(onId))}`
+                          : ` ${g.op === 'delete' ? 'from' : 'to'} a ${what}`;
+        return g.op === 'delete'
+          ? chip('cut', 'untag') + `take ${b(name(tagId))} off${tail.replace(/^ from/, ' — from')}`
+          : chip('add', 'tag') + `add ${b(name(tagId))}${tail}`;
+      }
+
+      const noun = CS_NOUN[g.tt] ?? g.tt;
+
+      if (g.op === 'create') {
+        if (g.tt === 'tag') {
+          const kind = f('kind');
+          return chip('add', 'mint') + `add the tag ${b(f('name'))} to the archive's `
+            + `vocabulary${kind && kind !== 'unknown' ? ` as ${val(kind)}` : ''}`;
+        }
+        /* What it is ON, resolved, and not the raw id it is stored as.
+           This used to print `create a note — stream_id 01M0E2JE3RF…`, which
+           names the right row and tells the reviewer nothing they can act on:
+           there is no screen in the archive that takes a ULID. The server
+           already resolves stream, snippet and tag ids into names for exactly
+           this; the line just was not asking. */
+        const HOST = { stream_id: 'stream', snippet_id: 'clip', music_id: 'song' };
+        const host = [...g.f.entries()].find(([k]) => HOST[k]);
+        const rest = [...g.f.entries()].filter(([k]) => !HOST[k] && g.f.get(k)?.value);
+        const said = rest.find(([k]) => k === 'text' || k === 'title' || k === 'label');
+        return chip('add', 'new') + `a ${noun}`
+          + (host ? ` on the ${HOST[host[0]]} ${b(name(host[1].value))}` : '')
+          + (said ? ` — ${val(said[1].value)}`
+                  : rest.length ? ` — ${esc(rest[0][0])} ${val(rest[0][1].value)}` : '');
+      }
+
+      if (g.op === 'delete') {
+        /* `delete` on a tombstoned type is a retraction, and calling it a
+           delete in the one place a person decides whether to allow it would
+           be the interface lying about how reversible it is. */
+        if (g.tt === 'tag') {
+          return chip('cut', 'retract') + `retract the tag ${b(name(g.id))} — it leaves `
+            + 'every stream, clip and chapter using it, and autocomplete';
+        }
+        return chip('cut', 'remove') + `remove a ${noun}`;
+      }
+
+      // update — one line per field, joined by the caller
+      return [...g.f.entries()].map(([field, { value, base }]) => {
+        if (g.tt === 'tag' && field === 'name') {
+          return chip('', 'rename') + `${b(base)} → ${b(value)}`;
+        }
+        const subj = g.tt === 'tag' ? `${b(name(g.id))}` : `the ${noun}`;
+        return chip('', 'edit') + `${subj} · ${esc(field)} `
+          + (base ? `${val(base)} → ` : 'set to ') + val(value);
+      }).join('<br>');
+    }
+
+    function csBadge() {
+      csCount.textContent = String(CS.rows.length);
+      csCount.hidden = !CS.rows.length;
+    }
+
+    function csPaint() {
+      csBadge();
+      if (!CS.rows.length) {
+        csList.innerHTML = '<div class="snips-empty">Nothing waiting. Every proposed '
+          + 'edit has been approved or turned down.</div>';
+        return;
+      }
+      csList.innerHTML = CS.rows.map((cs) => {
+        const name = csNamer(cs);
+        const lines = csGroups(cs).map((g) => `<div>${csLine(g, name)}</div>`).join('');
+        /* A conflict is not a reason to hide the approve button — sometimes the
+           later edit is the wrong one — so it is shown, loudly, and the verdict
+           stays with the person reading it. */
+        const clash = (cs.conflicts ?? []).length ? `<div class="cs-clash">
+          Somebody edited ${cs.conflicts.length === 1 ? 'this field' : 'these fields'} after
+          this was written: ${cs.conflicts.map((c) =>
+            `<b>${esc(c.field)}</b> is now <em>${esc(c.current ?? '')}</em>, not
+             <em>${esc(c.proposed_against ?? '')}</em>`).join('; ')}.
+          Approving replaces what is there now.</div>` : '';
+        return `<article class="cs" data-cs="${esc(cs.id)}">
+          <div class="cs-why">${esc(cs.reason || 'no reason given')}</div>
+          <div class="cs-who">${esc(cs.author ?? 'unknown')} · ${logWhen(cs.created_at)}</div>
+          <div class="cs-what">${lines}</div>
+          ${clash}
+          <div class="cs-acts">
+            <button class="cs-btn yes" type="button" data-csact="approve">Approve</button>
+            <button class="cs-btn" type="button" data-csact="reject">Turn down</button>
+          </div>
+        </article>`;
+      }).join('');
+    }
+
+    async function loadChangesets() {
+      if (CS.loading) return;
+      CS.loading = true;
+      csList.innerHTML = '<div class="snips-empty">Loading…</div>';
+      try {
+        const d = await api('/api/changesets?status=open&limit=100');
+        CS.rows = d.changesets ?? [];
+        CS.names = d.names ?? {};
+        csPaint();
+      } catch (e) {
+        offline(e);
+        csList.innerHTML = '<div class="snips-empty">Could not load.</div>';
+      } finally { CS.loading = false; }
+    }
+
+    /** The badge, kept current without drawing the queue. */
+    async function csPoll() {
+      if (!ME.can?.['review.read']) return;
+      try {
+        const d = await api('/api/changesets?status=open&limit=100');
+        CS.rows = d.changesets ?? [];
+        CS.names = d.names ?? {};
+        csBadge();
+      } catch { /* a badge is a nicety; failing it is not worth a toast */ }
+    }
+
+    csList.addEventListener('click', async (e) => {
+      const b = e.target.closest('[data-csact]');
+      if (!b) return;
+      const card = b.closest('.cs');
+      const id = card?.dataset.cs;
+      if (!id) return;
+      const decision = b.dataset.csact;
+      card.classList.add('busy');
+      let r;
+      try {
+        r = await apiPost(`/api/changesets/${id}/review`, { decision });
+      } catch (err) { r = { status: 0, body: { error: err.message } }; }
+      if (r.status >= 400 || !r.body) {
+        card.classList.remove('busy');
+        toast('bad', 'That did not save',
+          r.body?.error ?? `HTTP ${r.status}`, 6000);
+        return;
+      }
+      card.classList.add('cs-going');
+      setTimeout(() => {
+        CS.rows = CS.rows.filter((c) => c.id !== id);
+        csPaint();
+      }, 200);
+      toast(decision === 'approve' ? 'applied' : 'queued',
+        decision === 'approve' ? 'Approved' : 'Turned down',
+        decision === 'approve'
+          ? 'It is in the archive, and in the history.'
+          : 'Nothing changed. The proposal stays on the record.');
+      /* An approved changeset can rewrite anything — a tag's name, a chapter's
+         colour, what a stream is about — so the screens behind this one are now
+         out of date. */
+      if (decision === 'approve') await refreshOpenViews();
+    });
     const SG_KINDS = ['media', 'character', 'meta', 'general'];
 
     async function loadSuggestions() {
@@ -15764,28 +17365,56 @@
     /** Send a verdict. Optimistic: the row is already gone.
      *  apiPost resolves on any status — it does not throw — so the check is on
      *  the code, not a catch. */
-    async function rvSend(ids, decision) {
-      let r;
-      try { r = await apiPost('/api/snippets/review', { ids, decision }); }
-      catch (e) { r = { status: 0, body: { error: e.message } }; }
-      if (r.status >= 400 || !r.body) {
-        toast('bad', 'That did not save',
-          `${ids.length} snippet${ids.length === 1 ? '' : 's'} stayed in the queue. `
-          + (r.body?.error ?? `HTTP ${r.status}`), 6000);
-        return null;
+    /** Send one verdict for a mixed set of things.
+     *
+     *  `refs` are `{kind, id}`, so this is the one function that knows the two
+     *  endpoints exist. Clips go in a single batched call because their route
+     *  takes a list; songs go one at a time because theirs does not — and it
+     *  does not because approving a song also enqueues a download, which is a
+     *  per-row decision the route makes as it goes. Sequential rather than
+     *  parallel: a page-sized Publish should not open fifty sockets at the
+     *  recorder in the same tick.
+     *
+     *  Returns `{ changed }`, or null when NOTHING landed. A partial failure
+     *  reports what got through and says so, because "17 of 20" is a fact the
+     *  reviewer has to act on and "that did not save" is not. */
+    async function rvSend(refs, decision) {
+      const post = async (url, body) => {
+        try { return await apiPost(url, body); }
+        catch (e) { return { status: 0, body: { error: e.message } }; }
+      };
+      const clips = refs.filter((x) => x.kind === 'snippet').map((x) => x.id);
+      const songs = refs.filter((x) => x.kind === 'music').map((x) => x.id);
+      let changed = 0;
+      const errs = [];
+      if (clips.length) {
+        const r = await post('/api/snippets/review', { ids: clips, decision });
+        if (r.status >= 400 || !r.body) errs.push(r.body?.error ?? `HTTP ${r.status}`);
+        else changed += r.body.changed ?? 0;
       }
-      return r.body;
+      for (const id of songs) {
+        const r = await post(`/api/music/${id}/review`, { decision });
+        if (r.status !== 200 || !r.body) errs.push(r.body?.error ?? `HTTP ${r.status}`);
+        else changed += r.body.changed ?? 0;
+      }
+      if (errs.length) {
+        toast('bad', changed ? `Only ${changed} of ${refs.length} saved` : 'That did not save',
+          `${refs.length - changed} stayed in the queue. ${[...new Set(errs)].join(' · ')}`, 7000);
+      }
+      return errs.length && !changed ? null : { changed };
     }
 
     function rvAct(row, decision) {
       if (!row) return;
-      const id = row.dataset.snip;
+      const ref = rvRefOf(row);
+      if (!ref.id) return;
       const idx = rvRows().indexOf(row);
       RV.started ??= performance.now();
       unmountClip(row);
       row.classList.add('rv-going');
       // Remembered BEFORE the row goes, so undo can put back exactly what left.
-      RV.undo.push({ id, decision, idx, item: snipCache.get(id) });
+      RV.undo.push({ ...ref, decision, idx,
+                     item: RV_KIND[ref.kind].cache().get(ref.id) });
       if (RV.undo.length > 50) RV.undo.shift();
       setTimeout(() => {
         row.remove();
@@ -15793,18 +17422,18 @@
         RV.total = Math.max(0, RV.total - 1);
         rvFocus(Math.min(idx, rvRows().length - 1));
       }, 200);
-      rvSend([id], decision);
+      rvSend([ref], decision);
     }
 
     async function rvUndoLast() {
       const last = RV.undo.pop();
       if (!last) return;
-      const r = await rvSend([last.id], 'reset');
+      const r = await rvSend([{ kind: last.kind, id: last.id }], 'reset');
       if (!r) { RV.undo.push(last); return void rvPaint(); }
       // Put it back where it was, not at the end — the queue is ordered and a
       // row that reappears somewhere else is a row you have to hunt for.
       const rows = rvRows();
-      const html = snipRowHtml(last.item, { review: true });
+      const html = RV_KIND[last.kind].html(last.item);
       if (rows[last.idx]) rows[last.idx].insertAdjacentHTML('beforebegin', html);
       else rvList.insertAdjacentHTML('beforeend', html);
       RV.done = Math.max(0, RV.done - 1);
@@ -15813,13 +17442,17 @@
     }
 
     async function rvAll(decision) {
-      const ids = rvRows().map((r) => r.dataset.snip);
-      if (!ids.length) return;
+      const refs = rvRows().map(rvRefOf).filter((x) => x.id);
+      if (!refs.length) return;
       const word = decision === 'approve' ? 'Publish'
         : decision === 'reset' ? 'Put back in the queue' : 'Reject';
-      if (!confirm(`${word} all ${ids.length} snippet${ids.length === 1 ? '' : 's'} on this page?`)) return;
+      /* "items", because the page can hold both now. Naming the split — "9
+         clips and 3 songs" — would be more precise and would also be the
+         longest sentence in a confirm dialog whose only job is to make you
+         notice the number. */
+      if (!confirm(`${word} all ${refs.length} item${refs.length === 1 ? '' : 's'} on this page?`)) return;
       RV.started ??= performance.now();
-      const r = await rvSend(ids, decision);
+      const r = await rvSend(refs, decision);
       if (!r) return;
       RV.done += r.changed;
       RV.undo.length = 0;      // a page-sized action is not a keystroke to take back
@@ -15830,7 +17463,20 @@
     rvList.addEventListener('click', (e) => {
       const btn = e.target.closest('[data-rv]');
       if (btn) return void rvAct(btn.closest('.snip'), btn.dataset.rv);
+      /* The two things a song's row offers besides the verdict. Both are here
+         rather than shared with the Music panel's handler because that one
+         resolves its card out of `MU.rows` and carries six actions this pile
+         deliberately does not have. */
       const row = e.target.closest('.snip');
+      const m = row?.dataset.mu ? muCache.get(row.dataset.mu) : null;
+      if (m && e.target.closest('[data-muplay]')) return void muPlay(m);
+      if (m && e.target.closest('[data-muact="copy"]')) {
+        if (navigator.clipboard) navigator.clipboard.writeText(m.url).catch(() => {});
+        const b = e.target.closest('[data-muact]');
+        b.classList.add('copied');
+        setTimeout(() => b.classList.remove('copied'), 1200);
+        return;
+      }
       if (row && !e.target.closest('[data-rvtitle]')) rvFocus(rvRows().indexOf(row));
     });
 
@@ -15840,11 +17486,15 @@
     document.getElementById('panel-review').addEventListener('keydown', (e) => {
       // Never steal a key from a field someone is typing in.
       if (e.target.matches('input, textarea')) return;
-      /* Every key in this map acts on the clip under the cursor, and the queue
-         has no clips. Left unguarded, X in the vocabulary queue would reject
-         whichever clip the review list happened to still be scrolled to,
-         invisibly, behind a hidden list. */
-      if (RV.view === 'suggestions') return;
+      /* Every key in this map acts on the clip under the cursor, and the
+         non-clip piles have no clips. Left unguarded, X in the vocabulary
+         queue would reject whichever clip the review list happened to still be
+         scrolled to, invisibly, behind a hidden list.
+         Written as "which piles ARE clips" rather than as a list of the ones
+         that are not: the first version named `suggestions`, Changes arrived
+         beside it, and X went straight back to rejecting a clip nobody could
+         see. An allowlist cannot be forgotten by the next pile. */
+      if (RV.view !== 'proposed' && RV.view !== 'rejected') return;
       const k = e.key.toLowerCase();
       const map = {
         j: () => rvFocus(RV.at + 1),
@@ -15857,11 +17507,23 @@
         // which is the undo for a rejection made weeks ago rather than a
         // moment ago.
         r: () => rvAct(rvCur(), 'reset'),
+        /* Clip-only, and they no-op on a song rather than being guarded here:
+           snipEditTitle needs a `[data-rvtitle]` and snipEditTranscript needs a
+           row in snipCache, and a music row has neither. A guard in this map
+           would be a third place that has to know what a song is. */
         e: () => rvEditTitle(rvCur()),
         t: () => snipEditTranscript(rvCur()),
         u: () => rvUndoLast(),
+        /* "Play what is under the cursor", which is a different act for each
+           kind: a clip has a <video> in the row, and a song has a YouTube
+           embed that opens over the page — the only way to watch it, since the
+           archive's copy is not what anyone should be watching. */
         ' ': () => {
-          const v = rvCur()?.querySelector('video');
+          const row = rvCur();
+          if (!row) return;
+          const m = row.dataset.mu ? muCache.get(row.dataset.mu) : null;
+          if (m) return void (muModal.hidden ? muPlay(m) : muClose());
+          const v = row.querySelector('video');
           if (v) (v.paused ? v.play().catch(() => {}) : v.pause());
         },
       };
@@ -15884,6 +17546,10 @@
          generation. Without it the queue is a pile nobody goes looking for:
          nothing anywhere else in the archive says it has anything in it. */
       sgPoll();
+      /* The same argument for the proposed-edits count, and it matters more
+         here: a suggestion queues silently and its author is told "queued for
+         review", so a badge nobody sees is a promise nobody keeps. */
+      csPoll();
       tqWatch(false); rqWatch(false);
       if (RV.booted) return;
       RV.booted = true;
