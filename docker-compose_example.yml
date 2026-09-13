@@ -89,8 +89,8 @@ services:
       PORT: "8000"
       TENMA_HOST: "0.0.0.0"
       
-      TENMA_ADMIN_PASS: "q2sK&76UcJaAMZb6" #"a long passphrase you did not use anywhere else"
-      TENMA_ADMIN_HANDLE: "kyabatsu"
+      TENMA_ADMIN_PASS: " ADMIN PASSWORD"
+      TENMA_ADMIN_HANDLE: "ADMIN HANDLE"
       TENMA_PUBLIC_URL: "https://kyabatsu-nas.foxhound-avior.ts.net" #"https://foxeroti.ca"
 
       TENMA_WHISPER_BIN: /usr/local/bin/whisper-cli
@@ -105,7 +105,7 @@ services:
       # Must match archive_token in the Pi's config.json.
       # `openssl rand -hex 32` over SSH. Unset disables ingest entirely, which
       # is the safe failure rather than an open one.
-      TENMA_INGEST_TOKEN: "ecd474f2b1dbe607f849ad9542b81195757bdb251b346b3f62f02902b2e4a3fd"
+      TENMA_INGEST_TOKEN: "INGEST TOKEN"
       # ─────────────────────────────────────────────────────────────────────
       # DELETE THIS LINE BEFORE THE ROUTER EVER FORWARDS A PORT HERE.
       #

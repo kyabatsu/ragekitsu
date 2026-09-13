@@ -1,12 +1,10 @@
-# The archive itself never travels with the code. It is per-machine state, it
-# is rebuilt by migrate() on boot from whatever vintage it happens to be, and
-# the -wal/-shm files beside it belong to that one .db and nothing else.
+# The archive itself never travels with the code.
 data/
 cache/
 whisper/
 models/
 
-# Scratch databases the scripts and tests leave behind.
+# Scratch databases
 *.try.db
 *.try.db-*
 *-test.db
@@ -14,6 +12,7 @@ models/
 
 src/node_modules/
 .DS_Store
+docker-compose.yml
 *.log
 @eaDir/
 @tmp/
