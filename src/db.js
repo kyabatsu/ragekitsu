@@ -71,6 +71,31 @@ const PRAGMAS_RO = [
    it — that list is what turns a database left behind by a collapse into one
    clear sentence instead of a puzzling error from inside a route. */
 const MIGRATIONS = [
+  /* ── 2026-09-10, memes and the gallery ────────────────────────────────────
+     One table for everything this archive hosts, told apart by `kind`. See the
+     column's own comment in schema.sql for why the split is by provenance.
+
+     The rename is here and not in REBUILDS, which surprised me: ALTER TABLE
+     RENAME COLUMN has been able to express this since SQLite 3.25, and it
+     carries the dependent indexes across with it — `ix_snippet_live` and the
+     rest come out the far side naming the new column, checked. So there is no
+     12-step rebuild, no one-shot to run by hand, and no copy of fifteen hundred
+     rows: the change is an ALTER that takes about a millisecond on restart.
+
+     Keyed on `file_path` being ABSENT, which is what makes it run exactly once.
+     A fresh database is built from schema.sql and already has it; a live one
+     has `video_path` and gets renamed; a database that has already been through
+     here is skipped. The order in this list matters for the same reason the
+     entries below it read oddly: `kind` and the rest are ADD COLUMNs and could
+     go in any order, but the rename must not be attempted twice.
+
+     `capture.video_path` and `music.video_path` keep their name. Those two hold
+     videos and always will; this one holds PNGs now. */
+  ['snippet', 'file_path',
+   `ALTER TABLE snippet RENAME COLUMN video_path TO file_path`],
+  ['snippet', 'kind',
+   `ALTER TABLE snippet ADD COLUMN kind TEXT NOT NULL DEFAULT 'snippet'`],
+  ['snippet', 'source', `ALTER TABLE snippet ADD COLUMN source TEXT`],
 ];
 
 /* Rebuilds — for the shape changes ALTER TABLE cannot express: a new PRIMARY
@@ -206,6 +231,11 @@ const FLOOR = [
   ['snippet', 'fetch_status'],   // the last MIGRATIONS-only column to land
   ['tag', 'gate'],               // came across in the taglet merge
   ['stream_tag', 'id'],          // the surrogate key the changeset path needs
+  /* `snippet.file_path` is deliberately NOT here. This list is for what
+     MIGRATIONS can no longer fix, and MIGRATIONS fixes that one — adding it
+     would refuse, at open(), every database the migration above is about to
+     bring forward. The test is not "does the code need this column"; it is
+     "would the code be stuck without a one-shot". */
 ];
 
 /** Refuse a database from before the collapse, by name and with the fix.
@@ -237,8 +267,23 @@ function floorCheck(db) {
 /** Check the floor, then apply any migration whose column or table is missing,
  *  any rebuild, and any data backfill that has not run. Returns what it did —
  *  which, on a database already at the current schema, is an empty array. */
-export function migrate(db) {
-  floorCheck(db);
+/** The ALTERs alone, and the reason they are their own function.
+ *
+ *  create() execs schema.sql BEFORE migrating, so on an existing database the
+ *  CREATE TABLEs are skipped and the CREATE INDEXes are not — which is fine
+ *  until an index names a column the ALTERs are about to add. Then schema.sql
+ *  aborts on `no such column: kind` and the server never starts.
+ *
+ *  That trap is why POST_MIGRATION used to exist, and the collapse's note over
+ *  it says the trap "stops being a problem once the ALTERs are gone". The ALTERs
+ *  came back with memes, so rather than bringing POST_MIGRATION back — a second
+ *  place indexes get declared, which is the two-documents problem again — the
+ *  ORDER changed: bring the columns up to date first, then let schema.sql
+ *  declare everything against a table that already has them.
+ *
+ *  A no-op on an empty file: every entry is skipped for want of its table, and
+ *  the schema exec that follows creates the finished shape anyway. */
+export function migrateColumns(db) {
   const applied = [];
   for (const [table, column, sql] of MIGRATIONS) {
     const hasTable = db.prepare(
@@ -254,6 +299,16 @@ export function migrate(db) {
       .map((r) => r.name));
     if (!cols.has(column)) { db.exec(sql); applied.push(`${table}.${column}`); }
   }
+  return applied;
+}
+
+export function migrate(db) {
+  floorCheck(db);
+  /* Idempotent, so calling it here as well as in create() costs one
+     table_xinfo per entry. Kept because migrate() is the documented entry point
+     for "bring this database up to date" and a caller who reaches for it
+     directly should not get a half-migrated file. */
+  const applied = migrateColumns(db);
 
   const present = (t) => !!db.prepare(
     `SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(t);
@@ -277,7 +332,13 @@ export function migrate(db) {
      columns this file had just ALTERed in. schema.sql declares all of them now
      and it runs first, so there is nothing left for it to add — the reason it
      existed was that create() execs schema.sql BEFORE the ALTERs, which stops
-     being a problem once the ALTERs are gone. */
+     being a problem once the ALTERs are gone.
+
+     2026-09-10: the ALTERs came back, and with them an index over one of the
+     new columns — so the problem came back too, exactly as written above. It
+     was NOT solved by bringing this list back. create() now runs the ALTERs
+     before the schema exec instead, which fixes the whole class rather than the
+     one index, and keeps every index declared in exactly one file. */
 
   /* ── the ran-once guard (issues.md #13) ────────────────────────────────
    *
@@ -386,16 +447,32 @@ export function isArchive(path) {
 
 /** Open, create the schema if absent, migrate. Safe on every start.
  *
- *  floorCheck runs BEFORE the schema is exec'd, and the order is the whole
- *  point. schema.sql's CREATE TABLEs are all IF NOT EXISTS, so on an existing
- *  database they are skipped and its columns are NOT added — but the CREATE
- *  INDEXes still run, and one of them names `snippet.source_url`. Against a
- *  database from before the collapse that aborts the boot with
- *  `no such column: source_url`, which is a true statement about the wrong
- *  problem. Asking first turns that into a sentence naming the cutover. */
+ *  Three steps, in an order that is entirely load-bearing.
+ *
+ *  floorCheck runs BEFORE anything else. schema.sql's CREATE TABLEs are all IF
+ *  NOT EXISTS, so on an existing database they are skipped and its columns are
+ *  NOT added — but the CREATE INDEXes still run, and one of them names
+ *  `snippet.source_url`. Against a database from before the collapse that
+ *  aborts the boot with `no such column: source_url`, which is a true statement
+ *  about the wrong problem. Asking first turns that into a sentence naming the
+ *  cutover.
+ *
+ *  migrateColumns runs SECOND, and that is newer than it looks. It used to be
+ *  part of migrate() below the schema exec, which was fine for as long as
+ *  MIGRATIONS was empty. The moment an ALTER adds a column and schema.sql
+ *  declares an index over it, the exec hits that index on a database that has
+ *  not been ALTERed yet and dies. Columns first, then the declaration.
+ *
+ *  schema.sql is THIRD and is the whole truth: every table, every index, every
+ *  trigger, against a table shape that is now current whichever kind of
+ *  database this is.
+ *
+ *  migrate() is LAST for the rebuilds and the data repairs, which need the
+ *  finished schema to run against. */
 export function create(path) {
   const db = open(path);
   floorCheck(db);
+  migrateColumns(db);
   db.exec(readFileSync(SCHEMA_PATH, 'utf8'));
   migrate(db);
   return db;

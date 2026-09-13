@@ -4,6 +4,7 @@
 data/
 cache/
 whisper/
+models/
 
 # Scratch databases the scripts and tests leave behind.
 *.try.db

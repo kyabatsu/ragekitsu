@@ -81,6 +81,15 @@ export const CAPABILITIES = [
      role system that wants one without the other should not have to fork the
      code to get it. */
   'music.decide',
+  /* Pasting a link whose SOURCE the archive has not vouched for.
+     A Discord attachment URL is a file somebody put somewhere — which server
+     and which channel is the whole of what separates it from an unrestricted
+     upload endpoint, so links from there are held to a list of channels
+     somebody named on purpose. This is the exemption, and it belongs to the
+     people who can already put a file in by hand: gating them buys no safety
+     and costs them every thread and forum post, which are separate channels
+     with ids nobody can enumerate in advance. */
+  'link.any',
   // the queue
   'change.apply',    // my own proposals take effect without review
   'review.read',     // see other people's
@@ -105,7 +114,7 @@ const GRANTS = (() => {
                      'tag.attach', 'tag.detach',
                      'music.submit', 'music.edit', 'music.retract'];
   const editor = [...suggester, 'change.apply', 'review.read', 'review.decide',
-                  'music.decide'];
+                  'music.decide', 'link.any'];
   /* Purge is admin-only and deliberately does NOT go through the changeset
      system: a changeset's `delete` op tombstones, and a tombstone is the
      reversible thing an editor is trusted with. Destroying rows is a different

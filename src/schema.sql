@@ -687,9 +687,58 @@ END;
 CREATE TABLE IF NOT EXISTS snippet (
   id            TEXT PRIMARY KEY,           -- ULID
   slug          TEXT NOT NULL UNIQUE,       -- the filename stem, the importer's key
+
+  -- WHICH COLLECTION this row belongs to. One table, three panels.
+  --
+  --   snippet   a moment cut from her own stream, hosted here
+  --   meme      a reaction face, a screenshot with text, found or made elsewhere
+  --   gallery   art
+  --
+  -- The split is by PROVENANCE and not by file type, which is the only line
+  -- that holds: a meme is often an mp4 and a snippet is sometimes a gif, so a
+  -- rule about extensions would put "breaking it down" in the wrong panel
+  -- forever. Where it came from and what it is for is the question a person
+  -- can actually answer.
+  --
+  -- One table rather than three, because everything BELOW this line is the
+  -- same for all of them: quarantine, promotion, normalize, poster, gates,
+  -- tags, review, retraction, purge, deep links. Three tables would be three
+  -- copies of that, kept in step by hand. The word is the difference; the
+  -- machinery is not.
+  --
+  -- Defaults to 'snippet' so every row that predates the column is one, which
+  -- is exactly what they are.
+  kind          TEXT NOT NULL DEFAULT 'snippet',
+
   title         TEXT NOT NULL,
   summary       TEXT,                       -- human blurb; editable, unlike the transcript
-  video_path    TEXT NOT NULL,              -- relative to TENMA_MEDIA_ROOT
+
+  -- Where it came from and who made it. Free text on purpose: a Discord
+  -- permalink, a twitter handle, "drawn by X". Deliberately NOT a taglet —
+  -- two hundred artists who drew one picture each is exactly the vocabulary
+  -- bloat review exists to prevent — and deliberately not source_url, which
+  -- is the recorder's column and means "fetch this". Credit is the thing most
+  -- likely to be regretted if it is not captured at the moment of upload.
+  --
+  -- There is no `caption` beside it. What a picture SAYS goes in `transcript`,
+  -- the same column a clip's speech goes in, written by the OCR pass and
+  -- corrected by an editor the same way — so it is searched by the index that
+  -- already exists rather than by a second one, and there is one place for
+  -- the fact rather than two that can disagree.
+  source        TEXT,
+
+  -- Relative to TENMA_MEDIA_ROOT, under a per-kind prefix: snippets/, memes/,
+  -- gallery/. The folder on disk says what a file is without opening this
+  -- database, which is worth something when 21 TB has to be sorted by hand one
+  -- day.
+  --
+  -- Was `video_path`, renamed when memes arrived and it stopped being true —
+  -- this column now holds PNGs. `capture.video_path` and `music.video_path`
+  -- keep the old name on purpose: those two really are videos, and renaming
+  -- them to match would be making three names agree by making two of them
+  -- vaguer. The rename is an ordinary MIGRATIONS entry; ALTER TABLE RENAME
+  -- COLUMN carries the indexes with it and moves no files.
+  file_path     TEXT NOT NULL,
   poster_path   TEXT,                       -- first frame, written by the importer
   duration_s    REAL,
   width         INTEGER,
@@ -833,6 +882,35 @@ CREATE INDEX IF NOT EXISTS ix_snippet_source_url ON snippet(source_url)
 -- exactly that handful out of the whole archive.
 CREATE INDEX IF NOT EXISTS ix_snippet_suggestions
   ON snippet(id) WHERE taglet_suggestions IS NOT NULL;
+-- Every panel now asks for one kind, so every list query carries this column.
+-- Leading with it and keeping the live sort behind it means the Memes grid and
+-- the Snippets list are each one index scan rather than a scan of all three
+-- collections filtered down.
+CREATE INDEX IF NOT EXISTS ix_snippet_kind ON snippet(kind, added_at DESC, id DESC)
+  WHERE retracted_at IS NULL;
+-- The same file, submitted twice. Memes are re-uploaded constantly — the same
+-- reaction face arrives from four people in a week — and the hash is the only
+-- thing that can tell, since the filename never survives the trip. Every
+-- upload does one lookup on this before it writes a byte.
+--
+-- NOT unique, and that was a deliberate reversal. A UNIQUE index reads like
+-- the stronger guarantee and is the wrong tool three times over:
+--
+--   * it is built over data nobody has inspected. Fifteen hundred imported
+--     clips carry hashes the audit computed, and any two identical files
+--     among them abort CREATE UNIQUE INDEX — which runs at startup, so the
+--     archive would refuse to BOOT rather than refuse an upload;
+--   * it disagrees with the rule the upload route actually enforces, which is
+--     scoped `AND retracted_at IS NULL`. A file that was uploaded and then
+--     retracted must be uploadable again; a unique index says otherwise, and
+--     the tombstone is still sitting there holding the hash;
+--   * it turns a considered 409 — which names the twin, or declines to, based
+--     on who is asking — into a constraint error from inside an INSERT.
+--
+-- Partial on NOT NULL because that is where the rows are: the hash is written
+-- by the upload route and by the audit, and everything older has none.
+CREATE INDEX IF NOT EXISTS ix_snippet_sha ON snippet(sha256)
+  WHERE sha256 IS NOT NULL;
 
 -- One row per transcript line, carrying the timing WhisperX already produced.
 -- Not tombstoned and not changeset-managed: a transcript is replaced whole by
@@ -973,6 +1051,57 @@ CREATE TABLE IF NOT EXISTS job (
 CREATE INDEX IF NOT EXISTS ix_job_claim ON job(status, kind, created_at);
 CREATE INDEX IF NOT EXISTS ix_job_snippet ON job(snippet_id)
   WHERE snippet_id IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- model — which machine reads which thing, and whether it is here yet.
+--
+-- Three tasks, one row each, and the row names the model that fills the slot.
+-- Keyed on the TASK rather than on the model, because "which model does OCR"
+-- is the question everything asks and there is exactly one answer at a time.
+-- Swapping PP-OCRv5_mobile for the server build is an UPDATE of one field, not
+-- a second row and a flag deciding between them — and the list of models worth
+-- offering is a constant in archive.js, where it can grow without a migration.
+--
+-- What is NOT here is a file path. The models live in the sidecar's own volume
+-- and it is the only thing that downloads, loads or evicts one; this table
+-- holds the archive's memory of what the sidecar last said, so the panel can
+-- draw without waiting on a network call that may be a container that is not
+-- running. Every column below except `slug` and `enabled` is that cache.
+--
+-- The same shape would have suited whisper, which is configured by environment
+-- variable and predates this. It is listed here anyway — a panel that showed
+-- two of the three machines would be a panel you cannot trust — and the
+-- transcribe row's `slug` is read-only for as long as TENMA_WHISPER_MODEL is
+-- what actually decides.
+CREATE TABLE IF NOT EXISTS model (
+  task        TEXT PRIMARY KEY,             -- transcribe | ocr | search
+  slug        TEXT NOT NULL,                -- what the sidecar is asked to load
+  -- Off means the queue still fills and nothing claims from it, matching the
+  -- transcription switch: gating the enqueue would make every request during
+  -- a pause evaporate silently.
+  enabled     INTEGER NOT NULL DEFAULT 1,
+  -- unknown   nobody has asked since this process started
+  -- absent    the sidecar is up and does not have this model
+  -- installed on disk over there, not in memory
+  -- loaded    in memory and ready; the sidecar evicts on idle
+  -- error     the sidecar said no, or could not be reached; see state_note
+  state       TEXT NOT NULL DEFAULT 'unknown',
+  state_note  TEXT,
+  bytes       INTEGER,                      -- as reported, for the panel
+  checked_at  INTEGER,
+  used_at     INTEGER,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+
+-- The three slots, created once and never overwritten: OR IGNORE is what lets
+-- this statement run on every boot without undoing an admin's choice.
+INSERT OR IGNORE INTO model(task, slug, created_at, updated_at)
+  VALUES ('transcribe', 'whisper', 0, 0);
+INSERT OR IGNORE INTO model(task, slug, created_at, updated_at)
+  VALUES ('ocr', 'PP-OCRv5_mobile', 0, 0);
+INSERT OR IGNORE INTO model(task, slug, created_at, updated_at)
+  VALUES ('search', 'ViT-B-32__openai', 0, 0);
 
 -- ---------------------------------------------------------------------------
 -- music — somebody else's music video, kept because it will not always be

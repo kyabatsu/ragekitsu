@@ -1,0 +1,18 @@
+# Pinned, because a rebuild months from now should produce the same runtime —
+# the same reasoning the archive's Dockerfile pins node:22-alpine for.
+#
+# paddleocr pulls paddlex and a long tail of its own; paddlepaddle is the
+# runtime under it. Between them they are most of this image, which is the
+# whole reason OCR is a sidecar and not a few more lines in the archive's
+# Dockerfile.
+paddleocr==3.7.0
+paddlepaddle==3.3.1
+
+# The HTTP surface. Flask for correct multipart parsing — the archive posts
+# multipart/form-data and hand-rolling that boundary parsing is exactly the
+# kind of thing that works until a filename has a quote in it.
+flask==3.1.3
+# waitress rather than Flask's development server, which says so on every boot
+# and is not built to hold a connection for the two minutes a cold model load
+# can take.
+waitress==3.0.2

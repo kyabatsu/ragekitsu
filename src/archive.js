@@ -183,14 +183,11 @@ export function probeMedia(file) {
  * which breaks progressive playback and makes a link preview hang. MP4 rather
  * than WebM because a Discord embed is a requirement with one answer.
  *
- * The rules were worked out in scripts/normalize-media.js against the real
- * collection; this is the server's copy of them, and the duplication is
- * deliberate rather than lazy. That script runs on a PC against the NAS over
- * SMB and deliberately takes NO database — importing this module would drag
- * db.js and node:sqlite in behind it, which is the one dependency it exists
- * without. So they are two copies ON PURPOSE, and the cost is real: change the
- * target here and scripts/normalize-media.js keeps the old one until somebody
- * changes it too. Both say so, in both files.
+ * The rules were worked out offline against the real collection, by a bulk
+ * pass that ran on a PC over SMB and took no database with it. That pass has
+ * been run and its script is gone; this is the surviving copy of what it
+ * learned, and the numbers below are the answer it arrived at rather than a
+ * first guess. If a bulk pass is ever needed again, it starts from here.
  */
 const OK_PIX = new Set(['yuv420p', 'yuvj420p']);
 const OK_PROFILE = new Set(['baseline', 'constrained baseline', 'main', 'high']);
@@ -235,8 +232,143 @@ export function moovFirst(file) {
  *  six answers depend on things no probe reports: the extension, and where the
  *  moov atom sits.
  */
+/* What ffprobe calls a picture, measured rather than guessed:
+ *
+ *     .png    png_pipe   / png     no duration
+ *     .jpg    image2     / mjpeg   duration 0.04  ← one frame at 25fps
+ *     .webp   webp_pipe  / webp    no duration
+ *     .gif    gif        / gif     duration 1.0   ← animated, and not a still
+ *
+ * The JPEG line is why this is a FORMAT test and not a duration test. A jpeg
+ * reports a fortieth of a second, so `duration > 0` calls it a video, and the
+ * classifier below then finds mjpeg where it wanted h264 and schedules an
+ * H.264 encode of a photograph. GIF goes the other way and is deliberately not
+ * here: an animated gif is a moving picture, and snippet rows have handled
+ * those since long before memes existed.
+ *
+ * An animated WebP lands here and is treated as a still, which shows its first
+ * frame. Rare enough to accept, and the alternative is decoding every upload
+ * to count frames. */
+const STILL_FORMATS = new Set(['png_pipe', 'image2', 'jpeg_pipe', 'webp_pipe',
+                               'bmp_pipe', 'tiff_pipe']);
+const STILL_CODECS = new Set(['png', 'apng', 'mjpeg', 'webp', 'bmp', 'tiff']);
+
+/** Is this file a single picture? Exported because the upload route decides
+ *  what to do with it and the media route decides what to call it. */
+export function isStill(p) {
+  return !!p && STILL_FORMATS.has(String(p.container ?? '').toLowerCase())
+    && STILL_CODECS.has(String(p.video_codec ?? '').toLowerCase())
+    && p.width > 0 && p.height > 0;
+}
+
+/* The three collections one table holds, and the ONLY place the list is
+   written. server.js imports it for the upload route and the list filter, and
+   ENUMS below uses it to refuse a fourth — so a new collection is an edit to
+   this line and to nothing that has to be found afterwards. */
+export const SNIPPET_KINDS = ['snippet', 'meme', 'gallery'];
+
+/** Which directory in the media tree each collection's masters live in.
+ *
+ *  The MEDIA tree only. Quarantine stays flat and deliberately so: a file is
+ *  there for the minutes between an upload and a verdict, the names are minted
+ *  ULIDs so nothing can collide, and the promote job carries both paths
+ *  explicitly — so mirroring the layout there would buy nothing and cost a
+ *  worker change. ls_jobs.resolve_name() takes the promote SOURCE with
+ *  `bare=True`, which is to say a quarantine name with a directory in it is
+ *  refused by the recorder before any of this is consulted.
+ */
+export const KIND_DIR = { snippet: 'snippets', meme: 'memes', gallery: 'gallery' };
+
+/* ── the machines that read things ────────────────────────────────────────
+ *
+ * Three tasks, and for each one the models worth offering. A constant and not
+ * a table: the `model` row records which one is CHOSEN, and that is a fact
+ * about this archive; which models exist is a fact about the world, and
+ * putting the second in the database means a migration every time a new build
+ * ships.
+ *
+ * `bytes` is what the download costs, so the panel can say so before somebody
+ * on a 2-core NAS with 8 GB commits to it. Approximate on purpose — it is
+ * there to distinguish "a few hundred megabytes" from "several gigabytes",
+ * and the sidecar reports the real figure once the file is on disk.
+ *
+ * Nothing here downloads anything. This is the menu.
+ */
+export const MODEL_TASKS = ['transcribe', 'ocr', 'search'];
+
+export const MODEL_TASK = {
+  transcribe: {
+    label: 'Transcription',
+    what: 'Speech in a clip, written down.',
+    /* The one task that does not go to the sidecar. whisper.cpp is a single
+       static binary the archive already spawns, and moving it would be a
+       rewrite of something that works to gain a network hop. */
+    runner: 'local',
+    into: 'the transcript, line by line, with timings',
+  },
+  ocr: {
+    label: 'Text in pictures',
+    what: 'Words ON a meme — the part a search can match.',
+    runner: 'sidecar',
+    /* Deliberately the same column a clip's speech lands in. A caption field
+       beside it would be two homes for one fact, searched by two indexes, and
+       the first to drift is the one nothing indexes. */
+    into: 'the transcript, as lines with no timings',
+  },
+  search: {
+    label: 'Smart search',
+    what: 'What a picture is OF, without anybody typing it.',
+    runner: 'sidecar',
+    into: 'an embedding beside the row — not built yet',
+  },
+};
+
+export const MODEL_CATALOG = {
+  transcribe: [
+    { slug: 'whisper', name: 'whisper.cpp', bytes: null,
+      note: 'Whichever GGUF TENMA_WHISPER_MODEL points at. Accented English is '
+          + 'the constraint here, not speed.' },
+  ],
+  ocr: [
+    { slug: 'PP-OCRv5_mobile', name: 'PP-OCRv5 mobile', bytes: 16 << 20,
+      note: 'Chinese, Japanese and English in one model, and small enough to '
+          + 'load and evict without thinking about it.' },
+    { slug: 'PP-OCRv5_server', name: 'PP-OCRv5 server', bytes: 90 << 20,
+      note: 'More accurate on small or angled text. Several times the work per '
+          + 'picture, on a box with two cores.' },
+  ],
+  search: [
+    { slug: 'ViT-B-32__openai', name: 'CLIP ViT-B/32', bytes: 350 << 20,
+      note: 'The usual first choice: fast, 512-dimension embeddings, English '
+          + 'prompts.' },
+    { slug: 'ViT-B-16-SigLIP-384__webli', name: 'SigLIP ViT-B/16 384', bytes: 820 << 20,
+      note: 'Noticeably better at finding things, and slower per picture. '
+          + 'Changing model means re-embedding everything.' },
+  ],
+};
+
+/** The catalogue entry for a chosen slug, or a stand-in describing it.
+ *
+ *  A stand-in rather than null, because an admin is allowed to type a model
+ *  this file has never heard of — the sidecar is what decides whether it
+ *  exists, and a panel that refused to draw an unknown name would be the
+ *  archive overruling the thing that actually knows.
+ */
+export function modelInfo(task, slug) {
+  const hit = (MODEL_CATALOG[task] ?? []).find((m) => m.slug === slug);
+  return hit ?? { slug, name: slug, bytes: null,
+                  note: 'Not one this archive knows about — the sidecar decides.' };
+}
+
 export function classifyMedia(file, p) {
-  if (!p || !(p.duration_s > 0)) return 'broken';
+  if (!p) return 'broken';
+  /* Before the duration test, not after — see STILL_FORMATS above for the
+     jpeg that would otherwise be sent off to be re-encoded as video. A still
+     needs no normalize pass at all: there is no container to remux, no
+     soundtrack to fix and no moov atom to move. The bytes that arrived are the
+     bytes that get served. */
+  if (isStill(p)) return 'still';
+  if (!(p.duration_s > 0)) return 'broken';
 
   /* Audio with no picture. A clip of somebody saying something is a perfectly
      good archive entry — arguably the PUREST one, since the transcript is what
@@ -245,8 +377,9 @@ export function classifyMedia(file, p) {
 
      Two outcomes, matching the video ones: already-AAC copies, everything else
      encodes. Both produce an .m4a, so what gets served is one format whatever
-     arrived. scripts/normalize-media.js never returns these: it walks a folder
-     with a video-extension filter and will not see an audio file. */
+     arrived. A folder-walking bulk pass never sees these at all — it filters
+     on video extensions — which is why this branch had to be written here and
+     could not be brought over from one. */
   if (!p.video_codec) {
     if (!p.audio_codec) return 'broken';
     const aOk = p.audio_codec === 'aac'
@@ -434,6 +567,31 @@ export function wavePosterArgs(input, output) {
              mismatch. */
           'showwavespic=s=960x280:colors=0xff4d94|0x8a7fff,format=yuv420p',
           '-frames:v', '1', output];
+}
+
+/** The thumbnail for a picture, which is a different problem from the still
+ *  for a clip.
+ *
+ *  posterArgs bounds the WIDTH, because every clip it has ever been handed was
+ *  wider than it was tall. A screenshot of a chat log is 600 x 3000, and
+ *  bounding its width alone produces a 960 x 4800 JPEG — a thumbnail heavier
+ *  than the picture it stands in for, on the one collection built to show
+ *  hundreds of them at once.
+ *
+ *  So: fitted inside a box, not scaled to a side. `decrease` never enlarges,
+ *  which matters because a reaction face is often 200 px and blowing it up to
+ *  960 would cost bytes to make it look worse.
+ *
+ *  Deliberately NOT square, though the grid draws squares. Cropping here would
+ *  throw away the part of the picture the hover is meant to reveal, and a
+ *  square tile is one line of `object-fit: cover` in the panel that wants one.
+ */
+export function stillPosterArgs(input, output, box = 960) {
+  return ['-nostdin', '-loglevel', 'error', '-y', '-i', input,
+          '-frames:v', '1', '-q:v', '4',
+          '-vf', `scale='min(iw,${box})':'min(ih,${box})'`
+                 + ':force_original_aspect_ratio=decrease:force_divisible_by=2',
+          output];
 }
 
 export function posterArgs(input, output, durationS) {
@@ -687,9 +845,20 @@ const WEBM_AUDIO = new Set(['vorbis', 'opus']);
 const MP4_VIDEO  = new Set(['h264', 'hevc', 'av1']);
 const MP4_AUDIO  = new Set(['aac', 'mp3', 'opus', 'flac', 'alac']);
 
+const STILL_MIME = { png: 'image/png', apng: 'image/apng', mjpeg: 'image/jpeg',
+                     webp: 'image/webp', bmp: 'image/bmp', tiff: 'image/tiff',
+                     gif: 'image/gif' };
+
 export function servedType(container, vcodec, acodec) {
   const c = String(container || '').toLowerCase();
   const v = String(vcodec || '').toLowerCase();
+  /* Pictures first, and keyed on the CODEC rather than the container: `image2`
+     is the demuxer for a numbered sequence of anything, so it says nothing
+     about what the frame is, while `mjpeg` says jpeg and only jpeg. Without
+     this a meme fell through to `return null` and the type came from the
+     extension — which works, and is the one place in the archive where a
+     filename gets to decide what a file is. */
+  if (STILL_MIME[v] && !acodec) return STILL_MIME[v];
   // No audio track is fine and common for a short clip; an unknown one is not.
   const aOk = (set) => !acodec || set.has(String(acodec).toLowerCase());
 
@@ -1252,7 +1421,18 @@ export const WRITABLE = {
   // who decided it.
   stream_tag: { stream_id: 'text', tag_id: 'text' },
   snippet: {
-    title: 'text', summary: 'text', video_path: 'text', poster_path: 'text',
+    title: 'text', summary: 'text', file_path: 'text', poster_path: 'text',
+    /* Where a picture came from. Editable by hand for the same reason
+       `summary` is, and it is the one field on a gallery image nothing can
+       derive: an artist's handle is not in the archive's vocabulary and is
+       not supposed to be. What a picture SAYS is `transcript`, written by the
+       OCR pass and corrected through the transcript editor. */
+    source: 'text',
+    /* Which collection this belongs in. Writable because filing a meme as
+       gallery art is a judgement somebody can get wrong and should be able to
+       change — and because it going through a changeset means the move is
+       attributable, which "it used to be in Memes" otherwise never is. */
+    kind: 'text',
     source_stream_id: 'text', source_offset_s: 'int', status: 'text',
     // duration_s, width, height and bytes are measurements of a file. A human
     // correcting them by hand would be describing something other than what is
@@ -1297,7 +1477,7 @@ const REQUIRED = {
   // No title requirement beyond this: the importer derives one from the
   // filename stem, and a clip with a bad title is recoverable where a clip with
   // no file is not.
-  snippet: ['title', 'video_path'],
+  snippet: ['title', 'file_path'],
   snippet_taglet: ['snippet_id', 'tag_id'],
   /* Nothing creates a music row through a changeset today — POST /api/music
      does it, because a submission has to canonicalise a URL and enqueue a
@@ -1361,6 +1541,10 @@ const ENUMS = {
      left to diverge. */
   'tag.kind': ALL_KINDS,
   'tag.status': ['proposed', 'confirmed'],
+  /* The three collections. Named for the panels rather than for the file types
+     they tend to hold, because the split is by provenance: a meme is often an
+     mp4 and a snippet is sometimes a gif. */
+  'snippet.kind': SNIPPET_KINDS,
 
   /* The publication gate.
        proposed   imported, not yet looked at — invisible to the public
@@ -1632,8 +1816,18 @@ export function propose(db, { authorId = null, person = null, trusted = false,
     });
   });
 
+  /* What apply() worked out, carried back out through propose().
+     summary() reads the changeset's own rows and cannot know any of this: that
+     a create was resolved onto a row which already existed, or that the row it
+     landed on had been retracted and is now back. An editor's mint goes
+     straight through here, so dropping it meant the one caller who most needs
+     the distinction — the person who just pressed the button — was the only
+     one who never got it. */
+  let resolved = null;
   if (auto) {
-    apply(db, csId, { reviewerId: authorId, note: 'author may edit directly', mediaRoot });
+    const done = apply(db, csId, { reviewerId: authorId,
+                                   note: 'author may edit directly', mediaRoot });
+    resolved = done?.merged ?? null;
   } else {
     // A proposal is a write. It adds rows the read API serves — the review
     // queue, the stream's history, the "2 open suggestions" badge — and
@@ -1643,7 +1837,9 @@ export function propose(db, { authorId = null, person = null, trusted = false,
     // anywhere. apply() bumps for the same reason; propose() simply never did.
     bumpGeneration(db);
   }
-  return summary(db, csId);
+  const out = summary(db, csId);
+  if (resolved?.length) out.merged = resolved;
+  return out;
 }
 
 /** Changes whose field moved since the changeset was written. */
@@ -1680,6 +1876,11 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
   const changes = db.prepare(
     'SELECT * FROM change WHERE changeset_id = ? ORDER BY seq').all(csId);
   const touched = new Set();
+  /* Out here, not in the transaction, because the fold happens inside it and
+     the response is assembled after it. Only ever read once tx() has
+     committed — a rollback throws straight past the return below, so a
+     half-resolved list can never be reported as an outcome. */
+  const merged = [];                  // tag creates folded into an existing row
 
   tx(db, () => {
     // ---- no silent shifts -------------------------------------------------
@@ -1743,7 +1944,6 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
     // a single INSERT so the row is never half-built and a reviewer can never
     // leave half a stream behind.
     const creates = new Map();          // target_id -> { type, fields }
-    const merged = [];                  // tag creates folded into an existing row
     for (const c of changes) {
       if (c.op !== 'create') continue;
       if (!creates.has(c.target_id)) {
@@ -1765,7 +1965,15 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
       for (const [tid, c] of [...creates]) {
         if (c.type !== vocab || !c.fields.name) continue;
         const slug = slugify(c.fields.name);
-        const existing = db.prepare(`SELECT id FROM ${vocab} WHERE slug = ?`).get(slug);
+        /* retracted_at comes back too, and the query deliberately does NOT
+           filter it out. It cannot: UNIQUE(slug) is table-wide, so a
+           tombstoned row still owns its name and there is no minting around
+           it — a second row with the same slug is not a thing this schema can
+           hold. The bug was folding onto one WITHOUT NOTICING: the changeset
+           applied, the toast said yes, and everything pointed at a row that
+           every list filters out of existence. */
+        const existing = db.prepare(
+          `SELECT id, name, retracted_at FROM ${vocab} WHERE slug = ?`).get(slug);
         if (!existing || existing.id === tid) continue;
         creates.delete(tid);
         for (const ch of changes) {
@@ -1783,8 +1991,40 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
             if (v === tid) pending.fields[k] = existing.id;
           }
         }
-        record(vocab, existing.id, 'name', c.fields.name, c.fields.name);
-        merged.push({ wanted: tid, resolved_to: existing.id, slug });
+        /* Asking for the name again IS the reversal.
+           `tag.retract` is a tombstone and the capability list says so out
+           loud — "reversible" — and it sits at the same rank as `tag.create`:
+           both are a suggester's to propose and an editor's to approve. So
+           bringing one back needs no authority that minting it did not, and
+           there is nothing to escalate. Anything irreversible is `tag.purge`,
+           which is an admin's and destroys the row outright — a purged tag
+           leaves no slug behind and this branch never sees it.
+           Recorded rather than done quietly, so the review log says a tag came
+           back and does not merely imply it by the row changing shape. */
+        if (existing.retracted_at) {
+          record(vocab, existing.id, 'retracted_at', existing.retracted_at, null);
+          /* And the name AS TYPED. slugify() is case-insensitive, so
+             "Limbus Company" and "LIMBUS COMPANY" are one row and one slug —
+             but the display casing is the thing somebody just took the trouble
+             to type, and handing back a tombstone still wearing its old
+             shouting is not what they asked for.
+             Only on a restore. A LIVE row keeps its name: renaming a tag that
+             forty streams already carry, as a side effect of somebody else's
+             mint colliding with it, is a bigger edit than the one they made
+             and not one they were shown. */
+          record(vocab, existing.id, 'name', existing.name, c.fields.name);
+          db.prepare(`UPDATE ${vocab} SET retracted_at = NULL, status = 'confirmed',
+                                          name = ?, updated_at = ? WHERE id = ?`)
+            .run(c.fields.name, t, existing.id);
+        } else {
+          /* from and to both the name it already has. This row exists so the
+             changeset log shows the name was what collided; it used to record
+             the TYPED name on both sides, which read as a rename that never
+             happened. */
+          record(vocab, existing.id, 'name', existing.name, existing.name);
+        }
+        merged.push({ wanted: tid, resolved_to: existing.id, slug,
+                      ...(existing.retracted_at ? { restored: true } : {}) });
       }
     }
 
@@ -1970,6 +2210,13 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
      refreshing a strip — can tell "applied, and the projection is current" from
      "applied, and the projection is a rebuild behind". */
   if (restale.length) out.recompute_failed = restale;
+  /* What the applier RESOLVED rather than created, which until now it worked
+     out and then dropped on the floor. A caller cannot otherwise tell "your
+     tag was minted" from "your tag already existed and you were quietly
+     attached to it" from "a retracted tag came back" — three different
+     outcomes behind one success, and the middle one is why a toast could say
+     yes while nothing appeared. */
+  if (merged.length) out.merged = merged;
   return out;
 }
 
@@ -2057,4 +2304,152 @@ export function summary(db, csId) {
      FROM change WHERE changeset_id = ? ORDER BY seq`).all(csId);
   if (cs.status === 'open') out.conflicts = stale(db, csId);
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// notes -> a subtitle track
+//
+// A phone writes lines like
+//
+//     @ 09.09 11:06:54 — Tenma's Homemade Stew
+//
+// and an NLE wants those as cues measured from the start of the FILE it is
+// cutting. Those are two different clocks with a stream between them, which is
+// the conversion this archive already models — so the parsing lives here,
+// beside positionToAxis and axisToPosition, rather than in a script that has
+// to be told things the archive already knows.
+//
+// Two of those things are why this is not just the standalone script moved:
+//
+//   * THE YEAR. The paste has none. A script has to guess from the current
+//     date; here the stream's own started_at settles it, so a January triage
+//     of a December capture lands in December instead of eleven months out.
+//   * THE ZONE. A wall clock means nothing without one, and the machine
+//     running the conversion is not necessarily the one that wrote the notes.
+//     `stream.tz_offset_min` is what the recorder observed AT THE TIME, so it
+//     is right across DST and across travel, which a local-timezone guess is
+//     not.
+// ---------------------------------------------------------------------------
+
+/* Accepts the shape an iPhone Action Button shortcut emits, and the obvious
+   neighbours of it: an optional leading `@`, an optional year, `.` `-` or `/`
+   between date parts, HH:MM or HH:MM:SS, and any of the dashes a phone
+   keyboard might produce between the stamp and the words.
+
+   Anchored at both ends and deliberately strict. A line that is nearly a
+   timestamp is reported as skipped rather than guessed at — the same rule
+   parseNoteLine follows, and for the same reason: a silently wrong number is
+   the one failure nobody notices. */
+const PHONE_RE = new RegExp(String.raw`^\s*@?\s*`
+  + String.raw`(?:(?<year>\d{4})[.\-/])?`
+  + String.raw`(?<a>\d{1,2})[.\-/](?<b>\d{1,2})\.?\s+`
+  + String.raw`(?<h>\d{1,2}):(?<mi>\d{2})(?::(?<s>\d{2}))?`
+  + String.raw`\s*[-‐-―~>|]+\s*`
+  + String.raw`(?<text>.*)$`, 'u');
+
+/** A wall clock in a fixed offset -> unix seconds.
+ *
+ *  Date.UTC gives the instant those numbers would name in UTC; subtracting the
+ *  offset moves it to the zone they were actually written in. tzOffsetMin is
+ *  minutes EAST of UTC, matching stream.tz_offset_min (-300 for UTC-5).
+ */
+export function wallToUnix(y, mo, d, h, mi, s, tzOffsetMin) {
+  const utc = Date.UTC(y, mo - 1, d, h, mi, s);
+  if (Number.isNaN(utc)) return null;
+  /* Rejects 31 February rather than letting Date roll it into March. A rolled
+     date is a plausible-looking number in the wrong place. */
+  const back = new Date(utc);
+  if (back.getUTCMonth() !== mo - 1 || back.getUTCDate() !== d) return null;
+  return utc / 1000 - tzOffsetMin * 60;
+}
+
+/** One pasted line -> { unix, text } | null.
+ *
+ *  `near` is the stream's started_at, and it does two jobs: it picks the year
+ *  the paste omitted, and it decides MM.DD against DD.MM when the numbers are
+ *  ambiguous. Both are resolved by proximity, because a note is written while
+ *  the stream is running — hours away at worst, never months.
+ */
+export function parsePhoneLine(line, { near, tzOffsetMin = 0, dayFirst = null } = {}) {
+  const m = PHONE_RE.exec(String(line ?? ''));
+  if (!m) return null;
+  const g = m.groups;
+  const text = g.text.trim();
+  const h = Number(g.h), mi = Number(g.mi), s = Number(g.s ?? 0);
+  if (h > 23 || mi > 59 || s > 59) return null;
+  const a = Number(g.a), b = Number(g.b);
+
+  /* Both readings, then whichever lands nearer the stream. `21.09` can only be
+     day-first and needs no vote; `09.11` is genuinely ambiguous and proximity
+     is the only evidence there is. An explicit dayFirst overrides both. */
+  const orders = dayFirst === true ? [[b, a]] : dayFirst === false ? [[a, b]] : [[a, b], [b, a]];
+  const years = g.year ? [Number(g.year)]
+    : (() => { const y = new Date(near * 1000).getUTCFullYear(); return [y, y - 1, y + 1]; })();
+
+  let best = null;
+  for (const [mo, d] of orders) {
+    if (mo < 1 || mo > 12 || d < 1 || d > 31) continue;
+    for (const y of years) {
+      const unix = wallToUnix(y, mo, d, h, mi, s, tzOffsetMin);
+      if (unix === null) continue;
+      const off = Math.abs(unix - near);
+      if (!best || off < best.off) best = { off, unix };
+    }
+  }
+  return best ? { unix: best.unix, text } : null;
+}
+
+/** Seconds -> `HH:MM:SS,mmm`. Negative clamps to zero: a note taken before the
+ *  recording started is still about this stream, and an NLE cannot show a cue
+ *  at a negative time. */
+export function srtTime(sec) {
+  const ms = Math.max(0, Math.round(sec * 1000));
+  const h = Math.floor(ms / 3600000);
+  const mi = Math.floor((ms % 3600000) / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  return `${pad2(h)}:${pad2(mi)}:${pad2(s)},${String(ms % 1000).padStart(3, '0')}`;
+}
+const pad2 = (n) => String(n).padStart(2, '0');
+
+/** The shortest cue anybody can read, and the floor two notes a second apart
+ *  would otherwise fall below — a zero-length cue is one an NLE draws as
+ *  nothing at all. */
+export const CUE_MIN_S = 0.8;
+
+/** Cues -> an .srt document.
+ *
+ *  Fixed length by default, `dur` seconds. Running each cue to the next one
+ *  sounded better than it is: two notes an hour apart make an hour-long
+ *  caption, and in an NLE the track is drawn as blocks you can see, so a gap
+ *  already says "nothing marked here" without a caption stretched over it.
+ *
+ *  `gap: true` is the other behaviour, for when a continuous band is what you
+ *  want. Either way the end is clamped to the next cue's start, so two notes
+ *  ten seconds apart do not overlap into a stack an editor has to untangle.
+ */
+export function buildSrt(cues, { gap = false, dur = 10 } = {}) {
+  const rows = cues
+    .filter((c) => c.at !== null && c.at !== undefined && Number.isFinite(c.at))
+    .map((c) => ({ at: Math.max(0, c.at), text: String(c.text ?? '').trim() }))
+    .filter((c) => c.text)
+    .sort((x, y) => x.at - y.at);
+
+  const out = [];
+  rows.forEach((c, i) => {
+    const next = rows[i + 1]?.at;
+    /* The last cue has no next, so it takes `dur` whatever the mode — running
+       it to infinity is not a thing SRT can say, and a caption that never
+       clears is worse than one that does. */
+    let end = gap && next !== undefined ? next : c.at + dur;
+    /* Clamped either way. A fixed 10s on notes 3s apart would overlap, and
+       overlapping cues are drawn stacked — something to untangle rather than
+       read. The floor below then keeps a clamped cue long enough to see. */
+    if (next !== undefined && end > next) end = next;
+    if (end < c.at + CUE_MIN_S) end = c.at + CUE_MIN_S;
+    out.push(`${i + 1}\n${srtTime(c.at)} --> ${srtTime(end)}\n${c.text}\n`);
+  });
+  /* CRLF and a BOM, because the target is Premiere on Windows: without the BOM
+     it reads a UTF-8 file as the system code page and every non-ASCII name in
+     the track comes out as mojibake. */
+  return out.length ? '﻿' + out.join('\n') : '';
 }

@@ -142,26 +142,33 @@
      Two lists that answer the same question from opposite ends: which taglets
      gate, and who is let through. Side by side because that is how the pair is
      actually read — you come here holding one and looking for the other. */
-  .ad-intro { max-width: 68ch; margin-bottom: 22px; color: var(--text-2);
+  /* ops-, and NOT ad-, which is what these were called for a long time.
+     Every one of them was invisible to anybody running an ad blocker: the
+     generic cosmetic filters in EasyList and friends hide elements whose class
+     begins `ad-` on sight, so `.ad-grid` was display:none in the browser with
+     nothing in this file saying so and nothing in the console to find. The
+     whole admin panel rendered as its intro paragraph and a screenful of
+     background. Do not name a class after an advertisement. */
+  .ops-intro { max-width: 68ch; margin-bottom: 22px; color: var(--text-2);
     font-size: 0.86rem; line-height: 1.6; }
-  .ad-intro b { color: var(--text); }
-  .ad-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  .ops-intro b { color: var(--text); }
+  .ops-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
     gap: 16px; align-items: start; }
-  .ad-card { padding: 16px 18px 18px; border-radius: 14px;
+  .ops-card { padding: 16px 18px 18px; border-radius: 14px;
     border: 1px solid var(--border); background: var(--surface); }
-  .ad-card h3 { margin: 0 0 4px; font-size: 0.95rem; }
-  .ad-note { margin: 0 0 14px; color: var(--text-3); font-size: 0.76rem; line-height: 1.5; }
-  .ad-rows { display: flex; flex-direction: column; gap: 8px; }
-  .ad-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  .ops-card h3 { margin: 0 0 4px; font-size: 0.95rem; }
+  .ops-note { margin: 0 0 14px; color: var(--text-3); font-size: 0.76rem; line-height: 1.5; }
+  .ops-rows { display: flex; flex-direction: column; gap: 8px; }
+  .ops-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
     padding: 9px 11px; border-radius: 10px; background: var(--glass-sunk); }
   /* Namespaced, both of them. `.who` already exists in the topbar carrying
      `margin-left: auto`, and an unscoped name inheriting an auto margin is
      how every row here ended up starting a third of the way across the
      card. `.sub` is scoped everywhere else in this file for the same
      reason; it is too generic a word to leave loose. */
-  .ad-who { font-weight: 600; font-size: 0.86rem; }
-  .ad-sub { color: var(--text-3); font-family: var(--font-mono); font-size: 0.66rem; }
-  .ad-empty { padding: 14px 2px; color: var(--text-3); font-size: 0.8rem; }
+  .ops-who { font-weight: 600; font-size: 0.86rem; }
+  .ops-sub { color: var(--text-3); font-family: var(--font-mono); font-size: 0.66rem; }
+  .ops-empty { padding: 14px 2px; color: var(--text-3); font-size: 0.8rem; }
 
   /* ---- the transcription queue -------------------------------------------
      A queue of minutes, not seconds. The row that matters is whichever one is
@@ -207,6 +214,50 @@
   .tq-dark { padding: 11px 13px; border-radius: 10px; font-size: 0.78rem;
     background: color-mix(in srgb, var(--tl-meta) 12%, transparent); color: var(--text-2); }
   .tq-dark code { font-family: var(--font-mono); font-size: 0.72rem; color: var(--text); }
+
+  /* ---- the models --------------------------------------------------------
+     One row per task, and every row says the same four things in the same
+     order: what it reads, which model does it, whether that model is here, and
+     the switch. A card where each machine explained itself differently would
+     be three cards. */
+  .ml-row { padding: 12px 13px; border-radius: 11px; background: var(--glass-sunk);
+    margin-bottom: 8px; }
+  .ml-top { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; }
+  .ml-label { font-weight: 650; font-size: 0.86rem; }
+  .ml-what { color: var(--text-3); font-size: 0.75rem; }
+  .ml-state { font-family: var(--font-mono); font-size: 0.6rem; letter-spacing: 0.04em;
+    text-transform: uppercase; padding: 2px 6px; border-radius: 5px;
+    background: var(--surface-2); color: var(--text-3); white-space: nowrap; }
+  /* Loaded is the only green: installed means it is on a disk somewhere, which
+     is not the same as ready to answer in the next second. */
+  .ml-state.loaded { background: color-mix(in srgb, var(--accent) 26%, transparent);
+    color: var(--accent); }
+  .ml-state.installed { background: color-mix(in srgb, var(--tl-meta) 20%, transparent);
+    color: var(--tl-meta); }
+  .ml-state.error { background: color-mix(in srgb, var(--tl-not) 16%, transparent);
+    color: var(--tl-not); }
+  .ml-pick { display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+    margin-top: 9px; }
+  .ml-pick select { padding: 4px 8px; border-radius: 7px; border: 1px solid var(--border);
+    background: var(--surface-2); color: var(--text); font: inherit; font-size: 0.76rem;
+    max-width: 100%; }
+  .ml-pick select:disabled { opacity: 0.55; cursor: not-allowed; }
+  .ml-pick button { padding: 4px 10px; border-radius: 7px; border: 1px solid var(--border);
+    background: none; color: var(--text-2); font: inherit; font-size: 0.72rem; cursor: pointer; }
+  .ml-pick button:hover { background: var(--surface-2); color: var(--text); }
+  .ml-pick button.is-off { border-color: var(--tl-not); color: var(--tl-not); }
+  .ml-note { margin-top: 7px; color: var(--text-3); font-size: 0.73rem; line-height: 1.5; }
+  .ml-why { margin-top: 6px; color: var(--tl-not); font-size: 0.73rem; }
+  .ml-q { margin-top: 7px; font-family: var(--font-mono); font-size: 0.66rem;
+    color: var(--text-3); }
+  .ml-row.is-off { opacity: 0.6; }
+  /* Not having a sidecar is the expected state today, so it is said once at
+     the top in the same voice the transcription card uses for whisper, rather
+     than three times as three errors. */
+  .ml-dark { padding: 11px 13px; border-radius: 10px; font-size: 0.78rem;
+    margin-bottom: 10px;
+    background: color-mix(in srgb, var(--tl-meta) 12%, transparent); color: var(--text-2); }
+  .ml-dark code { font-family: var(--font-mono); font-size: 0.72rem; color: var(--text); }
 
   /* ---- the recorder's queue ----------------------------------------------
      The same row idiom as the transcription card above, because it is the same
@@ -313,29 +364,29 @@
   /* A gate word, wherever it appears. Same shape held by a taglet and by a
      person, because it is the same word — that is the whole mechanism, and two
      different-looking chips would hide it. */
-  .ad-key { display: inline-flex; align-items: center; gap: 5px; padding: 2px 4px 2px 8px;
+  .ops-key { display: inline-flex; align-items: center; gap: 5px; padding: 2px 4px 2px 8px;
     border-radius: 6px; font-family: var(--font-mono); font-size: 0.68rem;
     background: color-mix(in srgb, var(--tl-not) 14%, transparent); color: var(--tl-not); }
-  .ad-key button { border: 0; background: none; color: inherit; cursor: pointer;
+  .ops-key button { border: 0; background: none; color: inherit; cursor: pointer;
     font: inherit; opacity: 0.6; padding: 0 3px; border-radius: 4px; }
-  .ad-key button:hover { opacity: 1; background: color-mix(in srgb, var(--tl-not) 22%, transparent); }
+  .ops-key button:hover { opacity: 1; background: color-mix(in srgb, var(--tl-not) 22%, transparent); }
 
-  .ad-give { margin-left: auto; display: flex; gap: 6px; align-items: center; }
-  .ad-give select, .ad-add input { background: var(--surface-2); border: 1px solid var(--border);
+  .ops-give { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+  .ops-give select, .ops-add input { background: var(--surface-2); border: 1px solid var(--border);
     color: var(--text); font: inherit; font-size: 0.76rem; padding: 4px 8px; border-radius: 7px; }
-  .ad-give select:disabled { opacity: 0.4; }
-  .ad-add { position: relative; margin-top: 12px; }
-  .ad-add input { width: 100%; padding: 8px 11px; }
-  .ad-ac { position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 5;
+  .ops-give select:disabled { opacity: 0.4; }
+  .ops-add { position: relative; margin-top: 12px; }
+  .ops-add input { width: 100%; padding: 8px 11px; }
+  .ops-ac { position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 5;
     max-height: 260px; overflow-y: auto; border-radius: 10px;
     border: 1px solid var(--glass-line); background: var(--bg-blur);
     backdrop-filter: blur(var(--glass-blur)); box-shadow: var(--glass-shadow); }
-  .ad-ac button { display: flex; width: 100%; gap: 8px; align-items: center; border: 0;
+  .ops-ac button { display: flex; width: 100%; gap: 8px; align-items: center; border: 0;
     background: none; color: var(--text); font: inherit; font-size: 0.8rem;
     padding: 8px 11px; text-align: left; cursor: pointer; }
-  .ad-ac button:hover { background: var(--glass-hi); }
-  .ad-ac i { width: 7px; height: 7px; border-radius: 2px; flex: 0 0 auto; }
-  .ad-ac .ad-sub { margin-left: auto; color: var(--text-3); font-family: var(--font-mono);
+  .ops-ac button:hover { background: var(--glass-hi); }
+  .ops-ac i { width: 7px; height: 7px; border-radius: 2px; flex: 0 0 auto; }
+  .ops-ac .ops-sub { margin-left: auto; color: var(--text-3); font-family: var(--font-mono);
     font-size: 0.66rem; }
 
   /* ---- Panels ---- */
@@ -647,6 +698,84 @@
   /* A room that is not built yet. Deliberately quiet and deliberately not a
      spinner or a skeleton: nothing is loading and nothing is coming in a
      moment, and animating either would say otherwise. */
+  /* ── the tools panel ────────────────────────────────────────────────────
+     A sidebar and a body. The sidebar is the only navigation, so it keeps its
+     width and the body takes the rest; at phone width it becomes a row of
+     chips above the body rather than a column stealing half the screen. */
+  .tp-wrap { display: grid; grid-template-columns: 208px minmax(0, 1fr);
+    gap: 18px; align-items: start; padding: 4px 0 40px; }
+  .tp-side { display: flex; flex-direction: column; gap: 2px; position: sticky;
+    top: 8px; }
+  .tp-pick { display: flex; align-items: center; gap: 9px; text-align: left;
+    padding: 9px 10px; border: 0; border-radius: 9px; background: transparent;
+    color: var(--text-2); font: inherit; font-size: 0.82rem; cursor: pointer; }
+  .tp-pick svg { width: 17px; height: 17px; flex: none; opacity: 0.8; }
+  .tp-pick:hover { background: var(--surface-2); color: var(--text); }
+  .tp-pick[aria-selected="true"] { background: var(--accent-soft); color: var(--text);
+    box-shadow: inset 2px 0 0 var(--accent); }
+  .tp-pick[aria-selected="true"] svg { opacity: 1; color: var(--accent); }
+  .tp-body { min-width: 0; }
+  .tp-head { margin: 2px 0 16px; }
+  .tp-head h2 { margin: 0 0 4px; font-family: var(--font-display); font-size: 1.06rem;
+    font-weight: 700; letter-spacing: -0.01em; }
+  .tp-head p { margin: 0; font-size: 0.8rem; line-height: 1.6; color: var(--text-3);
+    max-width: 62ch; }
+  /* Two columns where there is room: the form on the left, the preview on the
+     right, so a change to a clock is visible in the cue times without
+     scrolling between them. */
+  .tp-cols { display: grid; grid-template-columns: minmax(0, 380px) minmax(0, 1fr);
+    gap: 18px; align-items: start; }
+  .tp-fld { display: block; margin-bottom: 12px; }
+  .tp-fld > span { display: block; margin-bottom: 5px; font-family: var(--font-mono);
+    font-size: 0.56rem; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--text-3); }
+  .tp-fld select, .tp-fld input, .tp-fld textarea { width: 100%; box-sizing: border-box;
+    background: var(--surface-2); color: var(--text); border: 1px solid var(--surface-3);
+    border-radius: 8px; padding: 8px 10px; font-family: inherit; font-size: 0.8rem; }
+  .tp-fld textarea { min-height: 168px; resize: vertical; line-height: 1.55;
+    font-family: var(--font-mono); font-size: 0.72rem; }
+  .tp-fld select:focus, .tp-fld input:focus, .tp-fld textarea:focus {
+    outline: none; border-color: var(--accent); }
+  .tp-hint { margin: -7px 0 12px; font-size: 0.7rem; line-height: 1.55; color: var(--text-3); }
+  .tp-hint code { font-family: var(--font-mono); font-size: 0.68rem; color: var(--text-2); }
+  .tp-row { display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; }
+  .tp-row .tp-fld { flex: 1 1 120px; margin-bottom: 12px; }
+  .tp-chk { display: flex; align-items: center; gap: 8px; margin: -4px 0 8px;
+    font-size: 0.79rem; color: var(--text-2); cursor: pointer; }
+  .tp-chk input { width: 15px; height: 15px; accent-color: var(--accent);
+    flex: none; cursor: pointer; }
+  .tp-acts { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 2px; }
+  /* The preview. A table because the whole question is "did the right second
+     come out", and a column of times is the only way to see that at a glance. */
+  .tp-prev { border: 1px solid var(--surface-3); border-radius: 10px;
+    background: var(--panel); overflow: hidden; }
+  .tp-prev-h { display: flex; align-items: center; gap: 8px; padding: 8px 11px;
+    border-bottom: 1px solid var(--surface-3); font-size: 0.73rem; color: var(--text-2); }
+  .tp-prev-h b { color: var(--text); font-weight: 650; }
+  .tp-prev-h span { flex: 1; }
+  .tp-cue { display: flex; gap: 10px; padding: 5px 11px; font-size: 0.76rem;
+    border-top: 1px solid color-mix(in srgb, var(--surface-3) 45%, transparent); }
+  .tp-cue:first-of-type { border-top: 0; }
+  .tp-cue-t { font-family: var(--font-mono); font-size: 0.7rem; color: var(--accent);
+    flex: none; font-variant-numeric: tabular-nums; }
+  .tp-cue-x { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; color: var(--text-2); }
+  .tp-scroll { max-height: 52vh; overflow-y: auto; }
+  /* What did NOT become a cue, and why. Never silent: a track shorter than the
+     notes it came from is a thing you discover at the wrong moment. */
+  .tp-skip { border-top: 1px solid var(--surface-3); padding: 8px 11px;
+    font-size: 0.71rem; color: var(--tl-not); }
+  .tp-skip b { display: block; margin-bottom: 3px; color: var(--text-2); font-weight: 600; }
+  .tp-skip div { line-height: 1.5; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
+  .tp-empty { padding: 26px 12px; text-align: center; font-size: 0.79rem;
+    color: var(--text-3); }
+  @media (max-width: 900px) {
+    .tp-wrap { grid-template-columns: 1fr; }
+    .tp-side { position: static; flex-direction: row; flex-wrap: wrap; }
+    .tp-cols { grid-template-columns: 1fr; }
+  }
+
   .panel-soon { max-width: 460px; margin: 12vh auto; text-align: center;
     display: flex; flex-direction: column; align-items: center; gap: 10px; }
   .panel-soon .ps-ico { display: grid; place-items: center; width: 54px; height: 54px;
@@ -2604,7 +2733,12 @@
        warn/pending accent all over the snippet UI, which is why it is not
        simply deleted; untangling that is its own small change. */
     --tl-character: var(--seg-character);
-    --tl-copyright: var(--seg-media);
+    /* `media`, not `copyright`. The tag kind was renamed — the schema's own
+       comment says media sits where copyright did — and this definition kept
+       the old name while .cs-v.add went on asking for var(--tl-media). So the
+       ADDED value in every changeset diff has been colourless since the
+       rename: two dropped declarations, a colour and a border, both silent. */
+    --tl-media:     var(--seg-media);
     --tl-meta:      var(--seg-meta);
     --tl-general:   var(--seg-general);
     /* Not a kind — the OPERATOR. An excluded tag is drawn in the colour of
@@ -2625,6 +2759,17 @@
     --glass-2:      rgba(255, 255, 255, 0.045);   /* a card sitting ON glass */
     --glass-3:      rgba(255, 255, 255, 0.075);   /* its hover */
     --glass-line:   rgba(255, 255, 255, 0.10);
+    /* The hairline under the name 24 rules were already asking for.
+       `var(--border)` appears all over the ops panel, its queues, the model
+       pickers and the log filters, and it was defined nowhere — so every one
+       of those `border: 1px solid var(--border)` declarations was INVALID and
+       dropped, and those cards and controls have never had a border. Nothing
+       says so: an unresolvable var() takes its whole declaration with it, in
+       silence, with no console warning and nothing in the inspector but a
+       border that is not there.
+       An alias rather than a second literal, so there is one hairline in the
+       archive and retheming it stays one edit. */
+    --border:       var(--glass-line);
     --glass-hi:     rgba(255, 255, 255, 0.13);    /* the lit top edge */
     --glass-sunk:   rgba(0, 0, 0, 0.24);          /* an input, pressed into it */
     --glass-blur:   blur(26px) saturate(165%);
@@ -3074,6 +3219,43 @@
   /* Set to a clock this surface cannot resolve. Loud on purpose: whatever you
      type next cannot be converted, and the field will refuse it. */
   .nt-cp.is-gone { border-color: #ffb3b3; color: #ffb3b3; }
+
+  /* ── the capture bar ────────────────────────────────────────────────────
+     Floating and bottom-centred, because it is used while watching something
+     that is not this page. It only ever appears when neither the theater nor
+     the notes column is on screen — when one of them is, the key sends you to
+     the field that is already there — so it never has to share the bottom of
+     the viewport with the theater's timeline.
+
+     z-index 89: over the sheet (50) and the drag hint (88), under the toasts
+     (90), which is the one thing that must never end up behind it — the
+     refusals this field can raise arrive as toasts. */
+  .cap { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+    z-index: 89; width: min(620px, calc(100vw - 28px));
+    background: var(--panel); border-radius: 12px; padding: 9px 11px 8px;
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.1), 0 20px 50px rgba(0,0,0,0.62); }
+  .cap[hidden] { display: none; }
+  .cap-in { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .cap-lab { flex: none; font-family: var(--font-mono); font-size: 0.56rem;
+    letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-3); }
+  .cap-f { flex: 1 1 220px; min-width: 0; resize: none; overflow: hidden;
+    background: var(--surface-2); color: var(--text); font-family: inherit;
+    font-size: 0.78rem; border: 1px solid var(--surface-3); border-radius: 8px;
+    padding: 7px 9px; }
+  .cap-f::placeholder { color: var(--text-3); }
+  .cap-f:focus { outline: none; border-color: var(--accent); }
+  .cap-f:disabled { opacity: 0.5; }
+  .cap-x { flex: none; background: transparent; border: 0; border-radius: 5px;
+    padding: 2px 5px; color: var(--text-3); cursor: pointer; font-size: 0.8rem; }
+  .cap-x:hover { color: var(--text); background: var(--surface-2); }
+  .cap .arm-hint, .cap .wall-hint { flex: 1 0 100%; }
+  /* Which stream this is about to be written to. Said out loud because the bar
+     is reachable from anywhere, including from pages that name no stream at
+     all, and "a note went somewhere" is not a thing you can check later. */
+  .cap-where { margin-top: 6px; font-size: 0.63rem; color: var(--text-3);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cap-where b { color: var(--text-2); font-weight: 600; }
+  .cap-where i { font-style: normal; color: var(--accent); }
   .nt-new textarea { width: 100%; box-sizing: border-box; background: transparent;
     border: 1px dashed rgba(255,255,255,0.16); border-radius: 8px; color: var(--text);
     padding: 7px 9px; font-family: inherit; font-size: 0.76rem; }
@@ -3499,6 +3681,208 @@
     .th-meta, .th-src { display: none; }
   }
 
+  /* A picture in the clip list, which happens in the Review queue and in a
+     search that crosses collections. The frame keeps its layout; what goes is
+     the hover-grow, because there is nothing underneath the poster to reveal —
+     the poster IS the picture — and a still that lurched under the cursor for
+     no payoff would just be noise in a queue somebody is working through. */
+  .snip.is-still .snip-frame { cursor: default; }
+  .snip.is-still:hover .snip-frame img { transform: none; }
+  .snip.is-still .snip-frame img { object-fit: contain;
+    background: color-mix(in srgb, var(--bg) 55%, transparent); }
+  /* Which collection a queued row will go back to. Only ever drawn on a row
+     that is NOT a snippet, so the common case carries no badge at all. */
+  .snip[data-kind]::after { content: attr(data-kind); position: absolute;
+    left: 8px; top: 8px; z-index: 4; font-size: 9px; font-weight: 700;
+    letter-spacing: .04em; text-transform: uppercase; padding: 2px 5px;
+    border-radius: 5px; pointer-events: none;
+    background: color-mix(in srgb, var(--panel) 86%, transparent);
+    border: 1px solid color-mix(in srgb, var(--surface-3) 70%, transparent);
+    color: var(--text-3); }
+
+  /* ══ pictures — memes and the gallery ═══════════════════════════════════
+     Two panels, one component. The difference between them is a word in a
+     query string, so anything that reads as a rule about "memes" here is
+     really a rule about pictures, and the gallery gets it for free.
+
+     The tile is a SQUARE, because a grid of pictures whose rows are all
+     different heights is a grid nobody can scan — the eye needs a lattice to
+     move along. The square is a crop for looking, not a claim about the
+     picture: everything below exists to give the whole thing back the moment
+     you point at it. */
+  .pics { display: grid; gap: 10px; padding: 2px 0 22px;
+          grid-template-columns: repeat(auto-fill, minmax(168px, 1fr)); }
+  .pics-empty { grid-column: 1 / -1; padding: 42px 0; text-align: center;
+                color: var(--text-3); font-size: 13px; }
+
+  /* `margin: 0` is not tidiness. A <figure> carries `margin: 1em 40px` from
+     the UA stylesheet, which took 80px out of every grid track — a 155px
+     column drew a 75px tile — and left the whole lattice half the size it was
+     asked for, with the buttons measuring from the wrong box. */
+  .pic { position: relative; aspect-ratio: 1; margin: 0; border-radius: 11px;
+         background: var(--surface-2); border: 1px solid var(--surface-3);
+         cursor: zoom-in; }
+  /* Not `overflow: hidden` on the tile. The hover has to escape it — that is
+     the entire trick — so the CROP lives on an inner box and the tile itself
+     stays open. */
+  .pic-sq { position: absolute; inset: 0; overflow: hidden; border-radius: inherit; }
+  .pic-sq img { width: 100%; height: 100%; object-fit: cover; display: block;
+                transition: opacity .12s ease; }
+  .pic:hover .pic-sq img { opacity: 0; }
+  .pic-none { position: absolute; inset: 0; display: grid; place-items: center;
+              color: var(--text-3); font-size: 11px; }
+
+  /* The whole picture, from the SAME file the tile is cropping. The poster is
+     aspect-fitted rather than square-cropped precisely so this costs no second
+     request: `cover` above crops it to the lattice, `contain` here gives it
+     back. Grown to 1.4 tiles and never past its own pixels — blowing a 90px
+     reaction face up to 300 is not showing it properly, it is showing it
+     worse. */
+  /* A square made of PADDING, which is the one construction here that cannot
+     be argued with. Two simpler spellings were tried and measured first:
+     `height: 140%` gave the box no height at all, because a percentage height
+     resolves only against a definite containing height and this tile's height
+     comes from its own aspect-ratio; `aspect-ratio: 1` then let the picture's
+     own stated height win over the ratio, so a 600x1500 screenshot rendered
+     1500px tall out of a 219px box and covered the grid.
+     `padding-top` resolves against the containing block's WIDTH, always, and
+     the width here is a plain percentage of a real width. So the outer box is
+     reliably square, and `.pic-pop-in` — abspos with `inset: 0` — turns that
+     into a definite height for the picture to be capped against. */
+  .pic-pop { position: absolute; left: 50%; top: 50%; z-index: 5;
+             width: 140%; height: 0; padding-top: 140%;
+             opacity: 0; pointer-events: none;
+             transform: translate(-50%, -50%) scale(.94);
+             transition: opacity .13s ease, transform .13s cubic-bezier(.2,.9,.3,1.1); }
+  .pic-pop-in { position: absolute; inset: 0;
+                display: flex; align-items: center; justify-content: center; }
+  .pic:hover .pic-pop, .pic.is-lit .pic-pop { opacity: 1;
+             transform: translate(-50%, -50%) scale(1); }
+  /* No stated size at all, and that is the answer rather than a shortcut. An
+     unsized replaced element takes its INTRINSIC size and the two maxes shrink
+     it while preserving the ratio — which is exactly "as large as it really
+     is, never larger than the box". The poster is written with `decrease`, so
+     it is never upscaled and its intrinsic size IS the picture's own: a 96px
+     reaction face therefore renders at 96px inside a 216px box.
+
+     Two sized versions were tried and measured first. Stating the width and
+     height in custom properties looks equivalent and is not — a replaced
+     element with BOTH specified stops preserving its ratio, so the maxes
+     squash it. And the percentage maxes only resolve at all because the
+     wrapper is absolutely positioned with `inset: 0`; inside a grid with an
+     auto row they resolved against a track the picture itself was sizing,
+     which is circular, and a 600x1500 screenshot came out 1500px tall over
+     the top of the grid. */
+  .pic-pop img { display: block; border-radius: 9px;
+                 max-width: 100%; max-height: 100%;
+                 box-shadow: 0 14px 34px -10px rgba(0,0,0,.62),
+                             0 0 0 1px color-mix(in srgb, var(--surface-3) 70%, transparent); }
+  /* The one on top wins the pointer, so a grid of these does not flicker as
+     the cursor crosses a neighbour's grown edge. */
+  .pic:hover { z-index: 6; }
+
+  /* ── the buttons ──────────────────────────────────────────────────────
+     Children of the TILE, not of the thing that grows. That is the whole
+     specification: the picture expands underneath them and they stay exactly
+     where they were, so the second meme you deal with needs no aiming. */
+  .pic-acts { position: absolute; right: 5px; top: 5px; z-index: 8;
+              display: flex; gap: 3px; opacity: 0;
+              transition: opacity .12s ease; }
+  .pic:hover .pic-acts, .pic:focus-within .pic-acts { opacity: 1; }
+  .pic-b { width: 25px; height: 25px; display: grid; place-items: center;
+           border-radius: 7px; border: 1px solid color-mix(in srgb, var(--surface-3) 80%, transparent);
+           background: color-mix(in srgb, var(--panel) 88%, transparent);
+           backdrop-filter: blur(7px); color: var(--text); cursor: pointer;
+           padding: 0; transition: background .12s, color .12s, border-color .12s; }
+  .pic-b:hover { background: var(--panel); border-color: var(--accent); color: var(--accent); }
+  .pic-b.danger:hover { border-color: var(--tl-not); color: var(--tl-not); }
+  .pic-b svg { width: 13px; height: 13px; }
+
+  /* Waiting and removed read the same as they do in the clip list — dashed
+     and tinted — because they mean the same thing and a second visual
+     language for one idea is one more thing to learn. */
+  /* `border: 1px dashed`, never a bare `border-style: dashed`. The width has
+     to be restated or it falls back to `medium` — three pixels — and a tile
+     three pixels smaller than its neighbours moves every absolutely positioned
+     thing inside it. That is measurably what happened: the control strip sat
+     in one place on published tiles and three pixels in from it on removed
+     ones, which is the exact defect the strip is pinned to the square to
+     avoid. Yellow for waiting, red for out, from the same two tokens the clip
+     list uses. */
+  .pic.is-pending { border: 1px dashed color-mix(in srgb, var(--tl-meta) 55%, transparent);
+    background: color-mix(in srgb, var(--tl-meta) 5%, var(--surface-2)); }
+  .pic.is-removed { border: 1px dashed color-mix(in srgb, var(--tl-not) 48%, transparent);
+    background: color-mix(in srgb, var(--tl-not) 5%, var(--surface-2)); }
+  .pic.is-removed .pic-sq img, .pic.is-removed .pic-pop img { filter: grayscale(.55) opacity(.72); }
+  .pic.is-working { opacity: .55; pointer-events: none; }
+
+  /* A moving meme says so on the tile. Without it a gif and a still are the
+     same rectangle until you click one, and the difference is the whole
+     reason it was uploaded. */
+  .pic-tag { position: absolute; left: 5px; bottom: 5px; z-index: 7;
+             font-size: 9px; font-weight: 700; letter-spacing: .04em;
+             text-transform: uppercase; padding: 2px 5px; border-radius: 5px;
+             background: color-mix(in srgb, var(--panel) 86%, transparent);
+             backdrop-filter: blur(7px); color: var(--text-3);
+             border: 1px solid color-mix(in srgb, var(--surface-3) 70%, transparent); }
+
+  /* ── the opened row ───────────────────────────────────────────────────
+     Full width, inserted after the last tile of the row the click was in
+     rather than immediately after the tile itself — which would leave the
+     rest of that row as a hole. Same trick every image grid on the web uses,
+     and it is worth the one line of arithmetic that finds the column count. */
+  .pic-open { grid-column: 1 / -1; display: grid; gap: 16px;
+              grid-template-columns: minmax(0, 1.35fr) minmax(230px, .65fr);
+              padding: 14px; border-radius: 13px; background: var(--surface-2);
+              border: 1px solid var(--surface-3); position: relative; }
+  .pic-open-img { display: grid; place-items: center; min-width: 0;
+                  min-height: 170px;
+                  background: color-mix(in srgb, var(--bg) 55%, transparent);
+                  border-radius: 10px; padding: 8px; }
+  /* 55vh, not 70: the row has to fit its metadata beside it on one screen, or
+     opening a picture becomes a scroll away from the thing you opened it to
+     read. Big enough to look at, small enough to still be a row. */
+  .pic-open-img img, .pic-open-img video {
+    max-width: 100%; max-height: 55vh; width: auto; height: auto;
+    display: block; border-radius: 7px; }
+  .pic-open-side { display: flex; flex-direction: column; gap: 9px; min-width: 0; }
+  .pic-open-t { font-size: 15px; font-weight: 650; line-height: 1.3; word-break: break-word; }
+  /* An absent description reads as absent. Blank would leave the row looking
+     unfinished, and a filename turned into a title would read as a name
+     somebody chose — which is the thing this replaced. */
+  .snip-title.is-none, .pic-open-t.is-none { color: var(--text-3); font-weight: 500;
+    font-style: italic; }
+  .up-opt { font-weight: 400; color: var(--text-3); margin-left: 4px; }
+  /* Which Discord channels a picture may be taken from. Said before somebody
+     pastes a link, not after — a rule you only learn by breaking it is a rule
+     people stop trying to follow. */
+  .up-chan { margin: 0 2px 10px; padding: 8px 10px; border-radius: 8px;
+    font-size: 0.71rem; line-height: 1.5; color: var(--text-3);
+    background: var(--glass-sunk); }
+  .up-chan b { color: var(--text-2); font-weight: 600; }
+  .snip-from { position: absolute; left: 6px; bottom: 6px; z-index: 4;
+    pointer-events: none; }
+  .pic-open-t[data-rvtitle] { cursor: text; }
+  .pic-open-meta { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px;
+                   font-size: 11.5px; color: var(--text-3); align-items: baseline; }
+  .pic-open-meta b { font-weight: 600; color: var(--text-3); opacity: .8; }
+  .pic-open-meta span { color: var(--text); word-break: break-word; }
+  .pic-open-x { position: absolute; right: 9px; top: 9px; width: 26px; height: 26px;
+                display: grid; place-items: center; border-radius: 7px;
+                border: 1px solid var(--surface-3); background: var(--panel);
+                color: var(--text-3); cursor: pointer; padding: 0; }
+  .pic-open-x:hover { color: var(--text); border-color: var(--accent); }
+  .pic-open .snip-tr { max-height: 190px; }
+  .pic-open-acts { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; }
+
+  @media (max-width: 700px) {
+    .pics { grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); }
+    .pic-open { grid-template-columns: 1fr; }
+    /* No hover on a touch screen, so the grown overlay is a thing that can
+       only ever be triggered by the tap that is also opening the row. */
+    .pic-pop { display: none; }
+  }
+
   /* ── last word on [hidden] ────────────────────────────────────────────
      An author `display` outranks the UA stylesheet's [hidden] rule, so any
      element with one silently ignores the attribute. That has now cost four
@@ -3682,46 +4066,71 @@
 
 
     <section class="panel" id="panel-admin" role="tabpanel" aria-labelledby="tab-admin" tabindex="0" hidden>
-      <div class="ad-intro">
+      <div class="ops-intro">
         <b>Gates decide who can see what.</b> A gate is a word. Put it on a taglet
         and every snippet carrying that taglet disappears for anyone without the
         matching grant — out of the lists, the search, the tag vocabulary and the
         media routes alike, answering 404 rather than 403 so the snippet's
         existence is not the thing that leaks.
       </div>
-      <div class="ad-grid">
-        <section class="ad-card">
+      <div class="ops-grid">
+        <section class="ops-card">
           <h3>Gated taglets</h3>
-          <p class="ad-note">Any taglet can gate. Naming a gate that nobody holds
+          <p class="ops-note">Any taglet can gate. Naming a gate that nobody holds
             hides those snippets from everyone but editors.</p>
-          <div id="ad-gates" class="ad-rows"></div>
-          <div class="ad-add">
-            <input type="text" id="ad-gate-q" placeholder="Search a taglet to gate…"
+          <div id="ops-gates" class="ops-rows"></div>
+          <div class="ops-add">
+            <input type="text" id="ops-gate-q" placeholder="Search a taglet to gate…"
                    autocomplete="off" spellcheck="false">
-            <div class="ad-ac" id="ad-gate-ac" hidden></div>
+            <div class="ops-ac" id="ops-gate-ac" hidden></div>
           </div>
         </section>
 
-        <section class="ad-card">
+        <section class="ops-card">
           <h3>Who holds what</h3>
-          <p class="ad-note">A grant is the same word as the gate. Nothing else
+          <p class="ops-note">A grant is the same word as the gate. Nothing else
             about the person changes — their role decides what they can DO, a
             grant decides what they can SEE.</p>
-          <div id="ad-people" class="ad-rows"></div>
+          <div id="ops-people" class="ops-rows"></div>
+        </section>
+
+        <section class="ops-card">
+          <h3>Retracted tags</h3>
+          <p class="ops-note">Retracting a tag hides it; it does not remove it.
+            The row keeps owning its name for good, so nothing else can ever be
+            minted under that name — and typing the name again brings this one
+            back rather than making a new one. Destroying it here is the only
+            thing that frees the name, and it is the one action on this page
+            that cannot be undone.</p>
+          <div id="ops-dead" class="ops-rows"></div>
         </section>
       </div>
 
-      <section class="ad-card" style="margin-top:16px">
+      <!-- Ahead of the transcription card on purpose: that card is one of the
+           three machines this one lists, and reading about the whole set
+           before reading about one of them is the right order. -->
+      <section class="ops-card" style="margin-top:16px">
+        <h3>Models</h3>
+        <p class="ops-note">Three machines that read things nobody has typed:
+          speech in a clip, words on a picture, and what a picture is of. Each
+          slot names a model; none of them are downloaded here. Whisper runs in
+          this container because it is one static binary — the other two are
+          Python, so they live in a sidecar that loads a model when a job needs
+          one and lets it go again when it has been idle.</p>
+        <div id="ml-body"></div>
+      </section>
+
+      <section class="ops-card" style="margin-top:16px">
         <h3>Transcription</h3>
-        <p class="ad-note">Runs after approval, in the same single slot the
+        <p class="ops-note">Runs after approval, in the same single slot the
           converter uses — so a snippet nobody can watch yet always goes first.
           Nothing here is on anybody's critical path.</p>
         <div id="tq-body"></div>
       </section>
 
-      <section class="ad-card" style="margin-top:16px">
+      <section class="ops-card" style="margin-top:16px">
         <h3>The recorder</h3>
-        <p class="ad-note">The three things this box is not allowed to do
+        <p class="ops-note">The three things this box is not allowed to do
           itself: download a link, move an approved file into the media tree,
           delete a master. They are written down here and the Pi comes and
           takes them — nothing is pushed to it, so a queue that stops going
@@ -3729,9 +4138,9 @@
         <div id="rq-body"></div>
       </section>
 
-      <section class="ad-card" style="margin-top:16px">
+      <section class="ops-card" style="margin-top:16px">
         <h3>The log</h3>
-        <p class="ad-note">Everything anybody has done, newest first. This is the
+        <p class="ops-note">Everything anybody has done, newest first. This is the
           only place a purged snippet's last line can be read — the snippet is in
           no list to open a panel from, so the entry that matters most is the one
           whose subject is gone.</p>
@@ -3758,13 +4167,31 @@
          exist. The demo array, its map, its grid and the sheet template that
          rendered it are gone with it. -->
     <section class="panel" id="panel-images" role="tabpanel" aria-labelledby="tab-images" tabindex="0" hidden>
-      <div class="panel-soon">
-        <span class="ps-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"/></svg></span>
-        <b>The gallery is not here yet</b>
-        <span>Stills and reaction images, tagged the same way everything else
-          here is. Nothing backs it in the API yet, so it holds nothing —
-          rather than holding twelve pictures that were never taken.</span>
+      <!-- The Snippets toolbar, shape for shape, for the third time: search on
+           the left, the way in on the right, the count on its own line under
+           it. Art and stills. Same vocabulary as everything else here, so a
+           tag learned once works in every panel. -->
+      <div class="toolbar">
+        <div class="search snip-search-wrap">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4-4"/></svg>
+          <input type="text" id="gal-search" placeholder="Search titles and tags — or Tab a tag"
+                 autocomplete="off" role="combobox" aria-expanded="false"
+                 aria-controls="gal-ac" aria-autocomplete="list"
+                 aria-label="Search the gallery">
+          <div class="snip-ac" id="gal-ac" role="listbox" hidden></div>
+        </div>
+        <button class="btn-primary snip-up-btn" id="gal-upload" title="Add a picture"
+                aria-expanded="false" aria-controls="up-win">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
+          Add a picture<span class="up-n" id="gal-n" hidden></span>
+        </button>
       </div>
+      <div class="snip-meta-row">
+        <span class="meta" id="gal-count"></span>
+        <div id="gal-filters" class="snip-tags" hidden></div>
+      </div>
+      <div class="pics" id="grid-images"></div>
+      <div id="gal-more" class="snip-sentinel" hidden><span class="snip-spin"></span>loading more…</div>
     </section>
 
     <section class="panel" id="panel-clips" role="tabpanel" aria-labelledby="tab-clips" tabindex="0" hidden>
@@ -3779,11 +4206,31 @@
     </section>
 
     <section class="panel" id="panel-memes" role="tabpanel" aria-labelledby="tab-memes" tabindex="0" hidden>
-      <div class="panel-soon">
-        <span class="ps-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 21a6 6 0 0 0-12 0"/><circle cx="12" cy="11" r="4"/><rect width="18" height="18" x="3" y="3" rx="2"/></svg></span>
-        <b>Memes are not here yet</b>
-        <span>A collection of its own, shaped like the gallery.</span>
+      <!-- The Snippets toolbar, shape for shape, for the third time: search on
+           the left, the way in on the right, the count on its own line under
+           it. Reaction faces and screenshots — and gifs and short clips,
+           because most of what gets used as a reaction moves. -->
+      <div class="toolbar">
+        <div class="search snip-search-wrap">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4-4"/></svg>
+          <input type="text" id="meme-search" placeholder="Search captions and tags — or Tab a tag"
+                 autocomplete="off" role="combobox" aria-expanded="false"
+                 aria-controls="meme-ac" aria-autocomplete="list"
+                 aria-label="Search memes">
+          <div class="snip-ac" id="meme-ac" role="listbox" hidden></div>
+        </div>
+        <button class="btn-primary snip-up-btn" id="meme-upload" title="Add a meme"
+                aria-expanded="false" aria-controls="up-win">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
+          Add a meme<span class="up-n" id="meme-n" hidden></span>
+        </button>
       </div>
+      <div class="snip-meta-row">
+        <span class="meta" id="meme-count"></span>
+        <div id="meme-filters" class="snip-tags" hidden></div>
+      </div>
+      <div class="pics" id="grid-memes"></div>
+      <div id="meme-more" class="snip-sentinel" hidden><span class="snip-spin"></span>loading more…</div>
     </section>
 
     <section class="panel" id="panel-music" role="tabpanel" aria-labelledby="tab-music" tabindex="0" hidden>
@@ -3813,11 +4260,14 @@
       <div class="mu-grid" id="mu-grid"></div>
     </section>
 
+    <!-- A sidebar from the first tool rather than after the third. One tool in
+         a full-width panel and then a retrofit is two layouts; this way the
+         next entry is one line in TOOLS and nothing moves. -->
     <section class="panel" id="panel-tools" role="tabpanel" aria-labelledby="tab-tools" tabindex="0" hidden>
-      <div class="panel-soon">
-        <span class="ps-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.034 12.681a.498.498 0 0 1 .647-.647l9 3.5a.5.5 0 0 1-.033.943l-3.444 1.068a1 1 0 0 0-.66.66l-1.067 3.443a.5.5 0 0 1-.943.033z"/><path d="M5 3a2 2 0 0 0-2 2"/><path d="M19 3a2 2 0 0 1 2 2"/><path d="M5 21a2 2 0 0 1-2-2"/><path d="M9 3h1"/><path d="M9 21h2"/><path d="M14 3h1"/><path d="M3 9v1"/><path d="M21 9v2"/><path d="M3 14v1"/></svg></span>
-        <b>Tools are not here yet</b>
-        <span>Room reserved.</span>
+      <div class="tp-wrap">
+        <nav class="tp-side" id="tp-side" role="tablist" aria-orientation="vertical"
+             aria-label="Which tool"></nav>
+        <div class="tp-body" id="tp-body"></div>
       </div>
     </section>
 
@@ -3925,6 +4375,7 @@
         up to 10 minutes · 200 MB<br>
         links from youtube, twitch, twitter / X, supported discord servers
       </div>
+      <div class="up-chan" id="up-chan" hidden></div>
 
       <div class="up-qh"><span>Yours</span></div>
       <div class="up-q" id="up-q"></div>
@@ -5886,10 +6337,11 @@
              no way to tell the refresh or the clock picker WHICH stream a note
              belonged to, and both fell back to whatever the theater happened
              to have open. */
-          return `<div class="ob-line${can ? ' editable' : ''}" data-nid="${esc(n.id)}"
-            data-sid="${esc(rec.id)}"${
-            can ? ` data-ntedit="${esc(n.id)}"` : ''}>${box}<span class="ob-check">`
-            + `<span class="ob-text${n.d ? ' done' : ''}" title="${esc(n.text)}">${
+          return `<div class="ob-line" data-nid="${esc(n.id)}"
+            data-sid="${esc(rec.id)}">${box}<span class="ob-check">`
+            + `<span class="ob-text${n.d ? ' done' : ''}${can ? ' editable' : ''}"${
+                can ? ` data-ntedit="${esc(n.id)}"` : ''} title="${esc(
+                can ? `${n.text || 'no text yet'}\nClick to edit` : n.text)}">${
                 esc(n.text) || '<i>no text yet</i>'}</span></span>${dot}${ts}</div>`;
         }) + add;
     }
@@ -6264,12 +6716,16 @@
         case 'theater': if (current) openTheater(current.id, 0); break;
         case 'watch': if (current) play(current, srcIdx, null); break;
         case 'copy':
-          if (navigator.clipboard) navigator.clipboard.writeText(currentUrl).catch(() => {});
           // A class, never innerHTML — see .sheet-ico in the stylesheet. A
           // button that gives no sign it worked is a button people press three
-          // times and then distrust.
-          b.classList.add('copied');
-          setTimeout(() => b.classList.remove('copied'), 1300);
+          // times and then distrust. Which is why the flash now waits for the
+          // ANSWER: over plain http `navigator.clipboard` does not exist, and
+          // this flashed "copied" over a clipboard it had never touched.
+          copyText(currentUrl).then((ok) => {
+            if (!ok) return void toast('warn', 'Could not copy', currentUrl, 6000);
+            b.classList.add('copied');
+            setTimeout(() => b.classList.remove('copied'), 1300);
+          });
           break;
         case 'open': window.open(currentUrl, '_blank', 'noopener'); break;
 
@@ -7131,14 +7587,15 @@
             : '<span class="ob-nobox"></span>';
           // The id, not the index. The list is grouped by tag, so a row's
           // position stopped meaning anything the moment that sort landed.
-          return `<div class="nt${canAdd ? ' editable' : ''}" data-thnote="${esc(n.id)}"
-            data-sid="${esc(thS?.id ?? '')}"${
-            canAdd ? ` data-ntedit="${esc(n.id)}"` : ''} title="${esc(
+          return `<div class="nt" data-thnote="${esc(n.id)}"
+            data-sid="${esc(thS?.id ?? '')}" title="${esc(
             none ? 'No timestamp on this note'
             : past ? `${ts} is outside this stream's ${thHms(domainOf(thS))} — the timestamp is wrong, or the duration is`
             : n.exact ? `Measured on ${clockName(n)}`
             : `Imported timestamp, good to about ${n.precision_s ?? '?'}s — nobody recorded which clock`)}">
-            ${box}<span class="nt-x${n.done ? ' done' : ''}">${esc(n.text) || '<i>no text yet</i>'}</span>
+            ${box}<span class="nt-x${n.done ? ' done' : ''}${canAdd ? ' editable' : ''}"${
+            canAdd ? ` data-ntedit="${esc(n.id)}" title="Click to edit this note"` : ''
+            }>${esc(n.text) || '<i>no text yet</i>'}</span>
             <span class="nt-when"><i class="nt-clk ${clockClass(n)}"></i
               ><span class="nt-ts${none ? ' none' : past ? ' past' : n.exact ? '' : ' fuzzy'}">${esc(ts)}</span></span>
             </div>`;
@@ -8562,10 +9019,13 @@
       // most likely to be copying a link to the frame they are looking at.
       const at = Math.round(thAxisNow());
       const url = `${location.origin}${location.pathname}#/w/${thS.id}@${at}`;
-      if (navigator.clipboard) navigator.clipboard.writeText(url).catch(() => {});
-      const b = e.currentTarget; b.classList.add('copied');
-      b.title = 'Copied';
-      setTimeout(() => { b.classList.remove('copied'); b.title = 'Copy link to this moment'; }, 1200);
+      const b = e.currentTarget;
+      copyText(url).then((ok) => {
+        if (!ok) return void toast('warn', 'Could not copy', url, 6000);
+        b.classList.add('copied');
+        b.title = 'Copied';
+        setTimeout(() => { b.classList.remove('copied'); b.title = 'Copy link to this moment'; }, 1200);
+      });
     };
 
     /* Double-clicking a SOURCE sets which one this stream opens with; the
@@ -8821,6 +9281,11 @@
     TH.notes.addEventListener('click', (e) => {
       const mk = e.target.closest('[data-mkseek]');
       if (mk) return void thSeek(Number(mk.dataset.mkseek));
+      /* The text opens the editor instead — see noteClicks(). Checked here
+         rather than left to stopPropagation, because that handler is bound on
+         this same element and listeners on one element all run whatever any of
+         them stops; only the order changes, and this one is registered first. */
+      if (e.target.closest('[data-ntedit]')) return;
       const el = e.target.closest('[data-thnote]');
       if (!el) return;
       const n = (thS.notes || []).find((x) => x.id === el.dataset.thnote);
@@ -8937,6 +9402,61 @@
       return { status: r.status, body: json };
     }
 
+    /** Put a string on the clipboard, or say honestly that it could not.
+     *
+     *  `navigator.clipboard` is a SECURE-CONTEXT api. On https and on
+     *  localhost it exists; over plain http to a LAN address — which is
+     *  exactly how this archive is reached today — the whole object is
+     *  undefined. Every copy button in this file was written as
+     *  `if (navigator.clipboard) …writeText(x)`, which on the NAS meant the
+     *  button flashed "copied" and copied nothing, forever, silently.
+     *
+     *  The fallback is `document.execCommand('copy')` over a hidden textarea.
+     *  It is deprecated and every browser still ships it, because this is the
+     *  case it exists for. It needs a real selection in the document, which is
+     *  why the textarea is appended rather than kept off-screen in a variable.
+     *
+     *  Returns whether it worked, so the caller can tell the truth either way
+     *  rather than claiming a copy it cannot verify.
+     */
+    async function copyText(text) {
+      const v = String(text ?? '');
+      if (!v) return false;
+      try {
+        if (navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(v);
+          return true;
+        }
+      } catch { /* denied, or not focused — fall through and try the old way */ }
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = v;
+        // Off-screen but IN the layout: `display:none` cannot be selected, and
+        // a selection is the whole mechanism.
+        ta.setAttribute('readonly', '');
+        ta.style.cssText = 'position:fixed;top:0;left:-9999px;opacity:0';
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, v.length);
+        const ok = document.execCommand('copy');
+        ta.remove();
+        return !!ok;
+      } catch { return false; }
+    }
+
+    /* PATCH's sibling to apiPost. Written out by hand at two call sites before
+       this and now three, which is one more than is worth repeating. */
+    async function apiPatch(path, body) {
+      const r = await fetch(path, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify(body ?? {}),
+      });
+      let json = null;
+      try { json = await r.json(); } catch { /* 204 and friends */ }
+      return { status: r.status, body: json };
+    }
+
     /* ---- toasts ---------------------------------------------------------- */
     const toastBox = Object.assign(document.createElement('div'), { className: 'toasts' });
     document.body.append(toastBox);
@@ -9030,19 +9550,36 @@
           document.getElementById('tab-index').click();
         }
       }
+      /* And Tools, on the same terms. Every tool behind it reads or writes
+         archive state — the first one hands out notes that may not be
+         published — so the endpoints are requireRole('editor') and this is
+         again a door not offered rather than a door locked. */
+      const tpTab = document.getElementById('tab-tools');
+      if (tpTab) {
+        tpTab.hidden = !can.edit;
+        if (!can.edit && tpTab.getAttribute('aria-selected') === 'true') {
+          document.getElementById('tab-index').click();
+        }
+      }
       const role = ME.role ?? 'viewer';
       const signedIn = role !== 'viewer' || ME.id;
       const why = ME.dev_auth
         ? 'Signed in through dev auth — no verification whatsoever'
-        : signedIn ? 'Signed in'
+        : ME.gate && signedIn
+          ? 'Signed in with the server password'
+          : signedIn ? 'Signed in'
         : 'Read-only. There is no sign-in yet: start the server with '
           + 'TENMA_DEV_AUTH=1 to get one during development, or replace '
           + 'identify() in auth.js with real auth.';
+      /* Dev auth offers both directions; the password gate offers only out.
+         There is no signing IN from here under the gate — nothing renders
+         until the session exists, so the door is the page you came from. */
+      const canOut = signedIn && (ME.dev_auth || ME.gate);
       whoBox.innerHTML = `
         ${ME.dev_auth ? '<span class="who-dev" title="TENMA_DEV_AUTH is on — anyone can become anyone">dev auth</span>' : ''}
         ${signedIn ? `<span class="who-name">as <b>${esc(ME.handle ?? '?')}</b></span>` : ''}
         <span class="who-role${can.edit ? ' can-edit' : ''}" title="${esc(why)}">${esc(role)}</span>
-        ${ME.dev_auth
+        ${canOut || (ME.dev_auth && !signedIn)
           ? `<button class="btn-ghost" data-who="${signedIn ? 'out' : 'in'}">${signedIn ? 'sign out' : 'sign in'}</button>`
           : '<span class="who-note" title="' + esc(why) + '">read-only</span>'}`;
     }
@@ -9051,6 +9588,10 @@
       const b = e.target.closest('[data-who]'); if (!b) return;
       if (b.dataset.who === 'out') {
         await apiPost('/api/auth/logout');
+        /* Under the gate there is nothing left to redraw: the session that was
+           just revoked is the only reason any of this answered, so every
+           refresh below would be a 401. Go back to the door instead. */
+        if (ME.gate) return void location.replace('/');
         ME = { role: 'viewer', can: {}, dev_auth: ME.dev_auth };
         renderWho(); await reskin(); refreshOpenViews();
         return;
@@ -10764,27 +11305,31 @@
             box.closest('[data-sid]')?.dataset.sid || n?.stream_id || null);
         }
       });
-      /* Double-click, not a pencil. A single click on a note already seeks to
-         it, and a pencil that only appears on hover is a target you have to go
-         looking for on every row. The rounded outline says the row is editable
-         to anyone who can edit; everyone else sees a plain row. */
-      root.addEventListener('dblclick', (e) => {
-        const row = e.target.closest('[data-ntedit]');
-        if (!row) return;
+      /* A single click, on the TEXT only — and still not a pencil, which only
+         appears on hover and is a target you have to go looking for on every
+         row. The rounded outline says the text is editable to anyone who can
+         edit; everyone else sees a plain row.
+
+         This used to be a double-click on the whole row, under the app-wide
+         rule that anything already clickable gets edited on the second click.
+         Everywhere else that rule is fine, because single-click does nothing.
+         Here it seeks — so editing always seeked first, and the fix was to
+         remember the old position and seek BACK afterwards, which worked and
+         looked like a twitch: the player jumped, then jumped again. Splitting
+         the targets removes the collision instead of paying for it. The
+         timestamp (and the rest of the row) seeks; the text edits. */
+      root.addEventListener('click', (e) => {
+        const hit = e.target.closest('[data-ntedit]');
+        if (!hit) return;
         e.preventDefault();
+        // Before the row's own seek handler, which is bound on the surface
+        // rather than on the row and would otherwise still fire.
         e.stopPropagation();
-        // A double-click is two clicks, and the first one seeked. Put it back.
-        if (seekBefore !== null) { thSeek(seekBefore); seekBefore = null; }
-        const n = find(row.dataset.ntedit);
-        if (n) openNote(row, n, row.dataset.sid || null);
-      });
-      root.addEventListener('mousedown', (e) => {
-        if (e.detail === 1 && e.target.closest('[data-ntedit]')) {
-          seekBefore = Number.isFinite(thAxis) ? thAxis : null;
-        }
+        const n = find(hit.dataset.ntedit);
+        // The row, for the stream id — the text carries the note id only.
+        if (n) openNote(hit, n, hit.closest('[data-sid]')?.dataset.sid || null);
       });
     }
-    let seekBefore = null;
     noteClicks(TH.notes, (id) => (thS?.notes || []).find((n) => n.id === id));
     noteClicks(notesCard, (id) => (selectedVod?.notes || []).find((n) => n.id === id));
 
@@ -11157,6 +11702,7 @@
               value: LIVE_PRECISION_S });
         }
       }
+      const hadFocus = document.activeElement === input;
       input.value = '';
       autoGrow(input);            // back to one line, not a hole where a long note was
       input.disabled = true;
@@ -11165,7 +11711,13 @@
       input.disabled = false;
       // An applied note re-renders the panel and this element is gone; a queued
       // one leaves it focused, and the next note needs a fresh moment.
-      if (document.activeElement === input) armNote(streamId);
+      /* Whether it WAS focused has to be remembered from before, not read
+         after: disabling a focused element moves focus to <body>, so by here
+         the answer is always no. That is why the second note of a burst used
+         to arrive with nothing armed — you typed it into a field that no
+         longer had a moment, and `@` had nothing to spend. isConnected is the
+         re-render case, where refocusing would fight the new element. */
+      if (hadFocus && input.isConnected) { input.focus(); armNote(streamId); }
     }
 
     /* One delegated handler for every add field on the page. The notes view
@@ -11302,6 +11854,769 @@
     bindNoteField(popList, (f) => ({
       notes: f.closest('.pop-item')?._rec?.notes ?? [], src: null,
     }));
+
+
+    /* =====================================================================
+       Tools
+       =====================================================================
+       A sidebar and one tool behind it. The sidebar exists from the first
+       entry rather than being retrofitted at the third: TOOLS is the whole
+       registry, and adding one is an entry plus a mount function.
+
+       Editors and up. Every tool here reads or writes archive state, and the
+       first one hands out notes that may not be published yet.
+     */
+    const TOOLS = [
+      { id: 'srt',
+        name: 'Notes to sub track',
+        icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 3a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2 1 1 0 0 1 1 1v1a2 2 0 0 1-2 2 1 1 0 0 0-1 1v2a1 1 0 0 0 1 1 6 6 0 0 0 6-6V5a2 2 0 0 0-2-2z"/><path d="M5 3a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2 1 1 0 0 1 1 1v1a2 2 0 0 1-2 2 1 1 0 0 0-1 1v2a1 1 0 0 0 1 1 6 6 0 0 0 6-6V5a2 2 0 0 0-2-2z"/></svg>',
+        mount: mountSrtTool },
+      { id: 'clip',
+        name: 'Clip/Rip Studio',
+        icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="6" r="3"/><path d="M8.12 8.12 12 12"/><path d="M20 4 8.12 15.88"/><circle cx="6" cy="18" r="3"/><path d="M14.8 14.8 20 20"/></svg>',
+        mount: mountClipTool },
+    ];
+
+    const tpSide = document.getElementById('tp-side');
+    const tpBody = document.getElementById('tp-body');
+    let tpOn = null;
+
+    function tpRender() {
+      tpSide.innerHTML = TOOLS.map((t) => `
+        <button class="tp-pick" role="tab" data-tool="${esc(t.id)}"
+          aria-selected="${t.id === tpOn ? 'true' : 'false'}">${t.icon}${esc(t.name)}</button>`).join('');
+    }
+
+    function tpOpen(id) {
+      const t = TOOLS.find((x) => x.id === id) ?? TOOLS[0];
+      if (!t) return;
+      tpOn = t.id;
+      tpRender();
+      tpBody.innerHTML = '';
+      t.mount(tpBody);
+    }
+
+    tpSide.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-tool]');
+      if (b) tpOpen(b.dataset.tool);
+    });
+
+    /* Mounted on first open, not at boot: the tool fetches a stream list, and
+       a panel nobody has looked at should not be spending a request. Bound
+       here rather than inside activate(), which runs during boot — before
+       these declarations exist. */
+    document.getElementById('tab-tools')?.addEventListener('click', () => {
+      if (!tpOn) tpOpen();
+    });
+
+
+    /* ---- Clip/Rip Studio --------------------------------------------------
+     *
+     * `ls-rec clip 12:25:42 120s` with the clocks done for you. The archive
+     * works out which master covers the moment and what second inside it to
+     * start at; the Pi runs the ffmpeg; the file lands in quarantine and this
+     * downloads it once and lets the archive remove it.
+     *
+     * TOTAL INCLUDES THE LEAD, which is counter-intuitive and is what the CLI
+     * has always meant. Two conventions for one number would be worse than one
+     * odd convention, so the panel says the arithmetic out loud instead.
+     *
+     * Local masters only. `video_ok` comes from stat() and never from a claim,
+     * so "there is something to cut from" is checked rather than hoped.
+     */
+    function mountClipTool(root) {
+      root.innerHTML = `
+        <div class="tp-head">
+          <h2>Clip/Rip Studio</h2>
+          <p>Cuts a range out of the file the recorder is writing right now, or
+             out of a finished master on the array — its own bytes either way,
+             copied not re-encoded, so it is quick and loses nothing. Pick a
+             moment and the second inside the file is worked out for you.</p>
+        </div>
+        <div class="tp-cols">
+          <div>
+            <label class="tp-fld"><span>Stream</span>
+              <select data-cl="stream"><option value="">loading…</option></select></label>
+            <label class="tp-fld"><span>Cut from</span>
+              <select data-cl="cap"><option value="">pick a stream first</option></select></label>
+            <div class="tp-hint" data-cl="capwhy"></div>
+            <label class="tp-fld"><span>The moment</span>
+              <select data-cl="src">
+                <option value="note">one of this stream's notes</option>
+                <option value="wall">a time I type</option>
+              </select></label>
+            <label class="tp-fld" data-cl="notewrap"><span>Which note</span>
+              <select data-cl="note"><option value="">no notes with times on them</option></select></label>
+            <div data-cl="wallwrap" hidden>
+              <label class="tp-fld"><span>Time of day (the stream's own clock)</span>
+                <input data-cl="wall" placeholder="12:25:42"></label>
+              <label class="tp-fld"><span>Note to leave on the stream <i>(optional)</i></span>
+                <input data-cl="notetext" maxlength="200"
+                  placeholder="what happened here"></label>
+              <div class="tp-hint">A moment worth cutting is worth recording, so
+                this writes a <code>#clip</code> note at that second. Left empty
+                it says so generically. Picking a note above writes nothing —
+                it is already there.</div>
+            </div>
+            <div class="tp-row">
+              <label class="tp-fld"><span>Lead, seconds</span>
+                <input data-cl="lead" type="number" min="0" max="3600" value="60"></label>
+              <label class="tp-fld"><span>Total, seconds</span>
+                <input data-cl="total" type="number" min="1" max="7200" value="120"></label>
+            </div>
+            <div class="tp-hint" data-cl="sums"></div>
+            <div class="tp-acts">
+              <button class="btn-primary" data-cl="go" disabled>Cut and download</button>
+            </div>
+          </div>
+          <div class="tp-prev" data-cl="prev">
+            <div class="tp-empty">Pick a stream and a moment.</div>
+          </div>
+        </div>`;
+
+      const el = (k) => root.querySelector(`[data-cl="${k}"]`);
+      let S = null;             // the stream detail, with captures and notes
+      /* What is recording right now, and when this end last heard it. The
+         clock matters: the live edge is the only thing that can trim a cut
+         short, and predicting the trim before you press needs the SERVER's
+         second rather than this machine's — a PC four minutes fast would
+         otherwise promise a clip that does not exist yet. */
+      let LV = null, LVat = 0;
+      const edgeNow = () => (LV ? LV.now + (Date.now() - LVat) / 1000 : null);
+      /* The recorder never cuts closer than this to the live edge, so neither
+         does the number shown here. CLIP_TAIL_GUARD_S in ls_rec.py. */
+      const EDGE_GUARD = 5;
+
+      const two = (n) => String(n).padStart(2, '0');
+      const hms3 = (s) => {
+        const v = Math.max(0, Math.round(s));
+        return `${two(Math.floor(v / 3600))}:${two(Math.floor(v % 3600 / 60))}:${two(v % 60)}`;
+      };
+      /* Wall clock in the STREAM's zone, which is the only one that matches
+         the times on a phone note or the clock she was streaming under. */
+      const wallOf = (unix) => {
+        const sod = (((unix + (S?.tz_offset_min ?? 0) * 60) % 86400) + 86400) % 86400;
+        return hms3(sod);
+      };
+
+      /** The unix second the cut is about, from whichever input is showing. */
+      function momentAt() {
+        if (!S) return null;
+        if (el('src').value === 'note') {
+          const n = (S.notes ?? []).find((x) => x.id === el('note').value);
+          return n && n.start_s !== null && n.start_s !== undefined
+            ? S.started_at + n.start_s : null;
+        }
+        const m = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(el('wall').value.trim());
+        if (!m) return null;
+        const sod = Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3] ?? 0);
+        if (Number(m[1]) > 23 || Number(m[2]) > 59) return null;
+        /* Resolved against the STREAM's own offset, not through wallToAxis.
+           That helper builds midnight with Date's local getters, so it reads a
+           typed time in whatever zone the BROWSER is in — which is the right
+           answer only while the person typing sits in the same zone the
+           recorder was in. Here the number is displayed back through
+           wallOf(), which uses the stream's offset, so using wallToAxis would
+           make the input and the echo disagree for anybody travelling.
+           Same past-midnight rule: a time earlier in the day than the stream
+           began belongs to the next one, which is most late-night broadcasts. */
+        const startSod = (((S.started_at + (S.tz_offset_min ?? 0) * 60) % 86400) + 86400) % 86400;
+        let delta = sod - startSod;
+        if (delta < 0) delta += 86400;
+        return S.started_at + delta;
+      }
+
+      /* The arithmetic, said out loud. `total` including the lead is the one
+         thing about this tool somebody could get wrong twice, so the panel
+         shows the two wall times it resolves to rather than making you trust
+         a convention. */
+      function sums() {
+        const at = momentAt();
+        const lead = Math.max(0, Number(el('lead').value) || 0);
+        const total = Number(el('total').value) || 0;
+        const capVal = el('cap').value;
+        const isLive = capVal.startsWith('live:');
+        const cap = isLive ? null : (S?.captures ?? []).find((c) => c.id === capVal);
+        const ok = at !== null && (isLive || cap) && total > lead;
+        el('go').disabled = !ok;
+        if (at === null) { el('sums').textContent = 'No moment chosen yet.'; return; }
+        if (total <= lead) {
+          el('sums').innerHTML = `<b>Total must be more than the lead</b> — the clip `
+            + 'would end before the moment it is about.';
+          return;
+        }
+        const from = at - lead;
+        el('sums').innerHTML = `Cuts <b>${esc(wallOf(from))}</b> → `
+          + `<b>${esc(wallOf(from + total))}</b> · ${esc(hms3(total))} long, `
+          + `with the moment ${esc(hms3(lead))} in.`;
+
+        /* The live recording. There is no offset to show — which part file is
+           open and where its frame 0 sits is the recorder's own knowledge and
+           it has not been asked yet — so this says what it WILL be rather
+           than pretending to a number it does not have.
+           What it can do is see the live edge coming. The end of the window
+           against the server's own second says, before you press, whether the
+           last few seconds have happened; the recorder trims rather than
+           waits, and being told afterwards is worse than being told now. */
+        if (isLive) {
+          const edge = edgeNow();
+          const over = edge === null ? 0 : Math.round((from + total) - (edge - EDGE_GUARD));
+          const rec = LV?.[capVal.slice(5)] ?? null;
+          el('prev').innerHTML = `
+            <div class="tp-prev-h"><b>live</b>
+              <span>${esc(capVal.endsWith('YT') ? 'the YouTube recording'
+                                                : 'the Twitch recording')}</span></div>
+            <div class="tp-cue"><span class="tp-cue-t">${esc(wallOf(from))}</span
+              ><span class="tp-cue-x">start of the cut</span></div>
+            <div class="tp-cue"><span class="tp-cue-t">${esc(wallOf(at))}</span
+              ><span class="tp-cue-x">the moment itself</span></div>
+            <div class="tp-cue"><span class="tp-cue-t">${esc(wallOf(from + total))}</span
+              ><span class="tp-cue-x">end of the cut</span></div>
+            <div class="tp-skip">The recorder works out which part file that is
+              and how far into it — only it knows.${rec?.stalled
+                ? ' <b>It is recording but the file has stopped growing.</b>' : ''}</div>`;
+          if (over > 0) {
+            el('prev').innerHTML += `<div class="tp-skip"><b>Length mismatch`
+              + ` (requested end frame was beyond current live edge Δ: ${over}s)</b>`
+              + `<div>You will get ${esc(hms3(Math.max(0, total - over)))} of `
+              + `${esc(hms3(total))}. Wait ${over}s for the whole thing.</div></div>`;
+          }
+          return;
+        }
+        if (!cap) return;
+        /* And where that is inside the file, which is the number the Pi is
+           actually given — shown because an unmeasured master is the common
+           reason this refuses. */
+        const zero = cap.local_start_wall;
+        const box = el('prev');
+        if (zero === null || zero === undefined) {
+          box.innerHTML = '<div class="tp-empty">That master\'s start has never '
+            + 'been measured, so a second inside it cannot be worked out. Set '
+            + 'it on the stream\'s record first.</div>';
+          el('go').disabled = true;
+          return;
+        }
+        const startIn = from - zero;
+        box.innerHTML = `
+          <div class="tp-prev-h"><b>${esc(hms3(startIn))}</b>
+            <span>into ${esc(cap.platform === 'YT' ? 'the YouTube master'
+                                                   : 'the Twitch master')}</span></div>
+          <div class="tp-cue"><span class="tp-cue-t">${esc(hms3(startIn))}</span
+            ><span class="tp-cue-x">start of the cut</span></div>
+          <div class="tp-cue"><span class="tp-cue-t">${esc(hms3(startIn + lead))}</span
+            ><span class="tp-cue-x">the moment itself</span></div>
+          <div class="tp-cue"><span class="tp-cue-t">${esc(hms3(startIn + total))}</span
+            ><span class="tp-cue-x">end of the cut</span></div>`;
+        if (startIn < 0) {
+          box.innerHTML += '<div class="tp-skip"><b>Before the file starts</b>'
+            + '<div>Use a shorter lead.</div></div>';
+          el('go').disabled = true;
+        }
+      }
+
+      async function loadStream(id) {
+        S = null;
+        el('cap').innerHTML = '<option value="">…</option>';
+        el('note').innerHTML = '<option value="">…</option>';
+        if (!id) return;
+        try { S = await api(`/api/streams/${encodeURIComponent(id)}?rail=0`); }
+        catch { return; }
+        /* What is recording this stream right now, asked fresh rather than
+           from a cached badge: this decides whether a source exists at all,
+           and a stale yes is a job the recorder will refuse. */
+        LV = null;
+        try { LV = await api('/api/live'); LVat = Date.now(); } catch { /* offline */ }
+        const running = LV && !LV.stale
+          ? ['TW', 'YT'].filter((p) => LV[p]?.live && LV[p].stream_id === id)
+          : [];
+
+        /* Only masters that are actually there. video_ok is written from
+           stat(), so this is the difference between a file and a claim. */
+        const cuttable = (S.captures ?? []).filter((c) => c.video_ok && c.video_path);
+        /* The running recording first, and selected by default when there is
+           one. Cutting from the stream going on right now is what this tool is
+           mostly for; a finished master is still there and still a click. */
+        const opts = running.map((p) => {
+          const since = LV[p].since;
+          const mins = since ? Math.round(((LV.now ?? since) - since) / 60) : null;
+          return `<option value="live:${p}">${esc(
+            `the live ${p === 'YT' ? 'YouTube' : 'Twitch'} recording`
+            + (mins !== null ? ` · ${mins} min in` : ''))}</option>`;
+        }).concat(cuttable.map((c) => `<option value="${esc(c.id)}">${esc(
+          (c.platform === 'YT' ? 'the YouTube master' : 'the Twitch master')
+          + (c.file_duration_s ? ` · ${hms3(c.file_duration_s)}` : ''))}</option>`));
+        el('cap').innerHTML = opts.length ? opts.join('')
+          : '<option value="">nothing to cut from on this stream</option>';
+        el('capwhy').textContent = running.length
+          ? 'Cutting from the file being written right now. The recorder trims '
+            + 'at the live edge rather than waiting, so a window that runs past '
+            + '"now" comes back short.'
+          : cuttable.length ? ''
+          : 'Nothing to cut from: nothing is recording and neither capture has a '
+            + 'file on the array. This tool does not download from the platform '
+            + '— cliprip-studio does that.';
+        const timed = (S.notes ?? []).filter((n) => n.start_s !== null && n.start_s !== undefined);
+        el('note').innerHTML = timed.length
+          ? timed.map((n) => `<option value="${esc(n.id)}">${esc(
+              `${hms3(n.start_s)} · ${n.text || '(no words)'}`)}</option>`).join('')
+          : '<option value="">no notes with times on them</option>';
+        sums();
+      }
+
+      (async () => {
+        let rows = [];
+        try { rows = (await api('/api/streams?limit=200')).streams ?? []; } catch { /* offline */ }
+        el('stream').innerHTML = '<option value="">pick a stream…</option>'
+          + rows.map((r) => `<option value="${esc(r.id)}">${esc(
+              (r.idx ? `#${r.idx} · ` : '') + (r.title || '(untitled)'))}</option>`).join('');
+        const pre = thS?.id || selectedVod?.id || '';
+        if (pre && rows.some((r) => r.id === pre)) { el('stream').value = pre; loadStream(pre); }
+      })();
+
+      el('stream').onchange = () => loadStream(el('stream').value);
+      el('src').onchange = () => {
+        const wall = el('src').value === 'wall';
+        el('wallwrap').hidden = !wall;
+        el('notewrap').hidden = wall;
+        sums();
+      };
+      for (const k of ['cap', 'note', 'wall', 'lead', 'total']) {
+        el(k).addEventListener('input', sums);
+        el(k).addEventListener('change', sums);
+      }
+
+      /* One button for the whole round trip: queue, wait, download, and let
+         the archive drop the quarantine copy. A clip is a working file — it
+         exists to reach your disk, and a folder of them on the NAS waiting to
+         be tidied is the thing this avoids. */
+      el('go').onclick = async () => {
+        const at = momentAt();
+        if (at === null) return;
+        const fromNote = el('src').value === 'note' ? el('note').value : null;
+        el('go').disabled = true;
+        const was = el('go').textContent;
+        el('go').textContent = 'Queued…';
+        const capVal = el('cap').value;
+        const isLive = capVal.startsWith('live:');
+        const r = await apiPost('/api/clips', {
+          stream_id: el('stream').value,
+          /* One or the other. A live cut names a platform and no capture,
+             because the file it wants has no capture row yet — the row is
+             written when the recording is wrapped up. */
+          ...(isLive ? { live: true, platform: capVal.slice(5) }
+                     : { capture_id: capVal }),
+          at_wall: at,
+          lead_s: Math.max(0, Number(el('lead').value) || 0),
+          total_s: Number(el('total').value) || 0,
+          note_id: fromNote,
+          note_text: fromNote ? null : el('notetext').value,
+        });
+        if (r.status !== 201) {
+          el('go').textContent = was; sums();
+          return void toast('bad', 'Could not queue it',
+            r.body?.error ?? `The archive answered ${r.status}.`, 8000);
+        }
+        const job = r.body.job_id;
+        /* Polled, not pushed. The recorder reports to the archive when it is
+           done and nothing here is listening for that, so asking every couple
+           of seconds is the whole mechanism — and a cut with a stream copy is
+           usually finished before the second ask. */
+        for (let i = 0; i < 150; i++) {
+          await new Promise((x) => setTimeout(x, 2000));
+          let j = null;
+          try { j = (await api(`/api/jobs/${job}`)).job; } catch { continue; }
+          el('go').textContent = j.status === 'claimed' ? 'Cutting…' : 'Queued…';
+          if (j.status === 'failed') {
+            el('go').textContent = was; sums();
+            return void toast('bad', 'The recorder could not cut it',
+              j.error ?? 'no reason given', 9000);
+          }
+          if (j.status === 'done') {
+            /* A plain navigation, not fetch-then-Blob: the file can be
+               hundreds of megabytes and there is no reason to hold it in the
+               tab's memory on the way past. The route sets
+               content-disposition, so this downloads rather than plays. */
+            const a = Object.assign(document.createElement('a'),
+              { href: `/api/clips/${encodeURIComponent(job)}/file` });
+            document.body.append(a); a.click(); a.remove();
+            el('go').textContent = was;
+            /* What it turned out to be, not what was asked for. A live cut is
+               trimmed at the live edge by the recorder, and handing somebody a
+               41-second file under a request for sixty — with a cheerful
+               "done" beside it — is the one outcome this panel must not
+               produce silently. `got` is folded onto the payload by
+               jobLanded(). */
+            const got = j.payload?.got ?? null;
+            const short = got && got.asked_s && got.length_s
+              ? Math.round(got.asked_s - got.length_s) : 0;
+            toast(short >= 1 ? 'applied' : 'good', 'Cut and downloading',
+              short >= 1
+                ? `Length mismatch (requested end frame was beyond current live `
+                  + `edge Δ: ${short}s) — you have ${hms3(got.length_s)} of `
+                  + `${hms3(got.asked_s)}.`
+                : 'The archive drops its copy once the download finishes.',
+              short >= 1 ? 11000 : 6000);
+            if (!fromNote) refreshOpenViews(el('stream').value);
+            sums();
+            return;
+          }
+        }
+        el('go').textContent = was; sums();
+        toast('bad', 'Still waiting',
+          'The recorder has not answered in five minutes. The job is still '
+          + 'queued — look in Admin.', 9000);
+      };
+
+      sums();
+    }
+
+    /* ---- notes -> sub track ------------------------------------------------
+     *
+     * Two ways in, and they were asked for as two modes. They are built as one
+     * surface with an optional paste, because everything after "where do the
+     * cues come from" — the stream, the clock, the cue lengths, the preview,
+     * the file — is the same in both, and two forms would be two places to fix
+     * the same thing.
+     *
+     * Empty paste box: the stream's own notes. Something in it: those lines.
+     * The label says so, and the button changes with it.
+     */
+    function mountSrtTool(root) {
+      root.innerHTML = `
+        <div class="tp-head">
+          <h2>Notes to sub track</h2>
+          <p>An .srt you can drop straight onto a Premiere timeline, with every
+             note as a caption at the moment it was taken. Pick the file you are
+             actually cutting — a note lands in a different place in the YouTube
+             VOD than it does in the local Twitch recording, and this does that
+             arithmetic for you.</p>
+        </div>
+        <div class="tp-cols">
+          <div>
+            <label class="tp-fld"><span>Stream</span>
+              <select data-sr="stream"><option value="">loading…</option></select></label>
+            <label class="tp-fld"><span>Measured from the start of</span>
+              <select data-sr="clock"><option value="axis">the stream's timeline</option></select></label>
+            <div class="tp-hint" data-sr="clockwhy"></div>
+            <label class="tp-fld"><span>Paste from your phone <i>(optional)</i></span>
+              <textarea data-sr="paste" spellcheck="false" autocomplete="off"
+                placeholder="@ 09.09 11:06:54 — Tenma's Homemade Stew&#10;@ 09.09 11:10:00 — cabbage slander"></textarea></label>
+            <div class="tp-hint">Leave it empty to use the notes this stream
+              already has. Dates need no year — the stream's own date and
+              timezone settle both.</div>
+            <label class="tp-fld"><span>Cue length, in seconds</span>
+              <input data-sr="dur" type="number" min="1" max="600" value="10"></label>
+            <label class="tp-chk"><input type="checkbox" data-sr="gap">
+              <span>Gapless — stretch every cue to the next note</span></label>
+            <div class="tp-hint">Off, a cue is <b data-sr="dursay">10</b> seconds
+              and the gaps between them are visible on the track, which is
+              usually what you want. On, the captions form one unbroken band —
+              two notes an hour apart then make an hour-long caption.</div>
+            <label class="tp-fld"><span>Prefix on every caption</span>
+              <input data-sr="prefix" placeholder="e.g. [NOTE] " maxlength="40"></label>
+            <div class="tp-acts">
+              <button class="btn-primary" data-sr="go">Build the track</button>
+              <button class="btn-ghost" data-sr="save" disabled>Download .srt</button>
+              <button class="btn-ghost" data-sr="import" hidden>Keep these as notes</button>
+            </div>
+          </div>
+          <div class="tp-prev" data-sr="prev">
+            <div class="tp-empty">Nothing built yet.</div>
+          </div>
+        </div>`;
+
+      const el = (k) => root.querySelector(`[data-sr="${k}"]`);
+      let last = null;          // the most recent response, which the file comes from
+
+      /* The clock list is built from the stream's OWN sources, so it can only
+         ever offer clocks that exist on it — and it says which ones have never
+         been measured instead of offering a conversion nobody can do. */
+      async function loadClocks(id) {
+        const sel = el('clock');
+        sel.innerHTML = '<option value="axis">the stream\'s timeline</option>';
+        el('clockwhy').textContent = '';
+        if (!id) return;
+        let s = null;
+        try { s = await api(`/api/streams/${encodeURIComponent(id)}?rail=0`); }
+        catch { return; }
+        const seen = [];
+        for (const c of s.captures ?? []) {
+          for (const clock of ['remote', 'local']) {
+            const zero = clock === 'remote'
+              ? (c.remote_start_wall ?? null) : (c.local_start_wall ?? null);
+            const label = clock === 'remote'
+              ? `the ${c.platform === 'YT' ? 'YouTube' : 'Twitch'} VOD`
+              : `the local ${c.platform === 'YT' ? 'YouTube' : 'Twitch'} file`;
+            seen.push({ key: `${c.id}:${clock}`, label, ok: zero !== null });
+          }
+        }
+        for (const o of seen) {
+          const opt = document.createElement('option');
+          opt.value = o.key;
+          opt.textContent = o.label + (o.ok ? '' : ' — never measured');
+          opt.disabled = !o.ok;
+          sel.append(opt);
+        }
+        const missing = seen.filter((o) => !o.ok).length;
+        el('clockwhy').innerHTML = missing
+          ? `${missing} of these has no measured start, so a position inside it `
+            + 'cannot be worked out. Set it on the stream\'s record first.'
+          : '';
+      }
+
+      (async () => {
+        /* The same list the index shows, newest first, which is the order you
+           would look for a stream you just finished watching. */
+        let rows = [];
+        try { rows = (await api('/api/streams?limit=200')).streams ?? []; } catch { /* offline */ }
+        el('stream').innerHTML = '<option value="">pick a stream…</option>'
+          + rows.map((r) => `<option value="${esc(r.id)}">${esc(
+              (r.idx ? `#${r.idx} · ` : '') + (r.title || '(untitled)'))}</option>`).join('');
+        /* Whatever is already open wins. Coming here from the theater with a
+           stream on screen and then having to find it in a dropdown is the
+           kind of small insult that makes a tool go unused. */
+        const pre = thS?.id || selectedVod?.id || '';
+        if (pre && rows.some((r) => r.id === pre)) { el('stream').value = pre; loadClocks(pre); }
+      })();
+
+      el('stream').onchange = () => { last = null; loadClocks(el('stream').value); paint(null); };
+      el('dur').oninput = () => { el('dursay').textContent = el('dur').value || '10'; };
+      el('paste').oninput = () => {
+        el('go').textContent = el('paste').value.trim()
+          ? 'Build from the paste' : 'Build the track';
+      };
+
+      function paint(d) {
+        const box = el('prev');
+        el('save').disabled = !d || !d.cues.length;
+        el('import').hidden = !d || !d.cues.length || !el('paste').value.trim();
+        if (!d) { box.innerHTML = '<div class="tp-empty">Nothing built yet.</div>'; return; }
+        if (!d.cues.length && !d.skipped.length) {
+          box.innerHTML = '<div class="tp-empty">No notes with a time on them.</div>';
+          return;
+        }
+        box.innerHTML = `
+          <div class="tp-prev-h"><b>${d.cues.length}</b>
+            <span>cue${d.cues.length === 1 ? '' : 's'}</span></div>
+          <div class="tp-scroll">${d.cues.map((c) => `
+            <div class="tp-cue"><span class="tp-cue-t">${esc(hmsOf(c.at))}</span
+              ><span class="tp-cue-x">${esc(c.text)}</span></div>`).join('')}</div>
+          ${d.skipped.length ? `<div class="tp-skip"><b>${d.skipped.length} left out</b>${
+            d.skipped.slice(0, 6).map((s) => `<div>${esc(s.line)} — ${esc(s.why)}</div>`).join('')
+          }${d.skipped.length > 6 ? `<div>…and ${d.skipped.length - 6} more</div>` : ''}</div>` : ''}`;
+      }
+
+      /* Local, because the archive's hms() is for durations and this wants a
+         cue time — same shape, but always three fields so a column of them
+         lines up. */
+      const hmsOf = (s) => {
+        const v = Math.max(0, Math.round(s));
+        return `${String(Math.floor(v / 3600)).padStart(2, '0')}:`
+          + `${String(Math.floor(v % 3600 / 60)).padStart(2, '0')}:`
+          + `${String(v % 60).padStart(2, '0')}`;
+      };
+
+      el('go').onclick = async () => {
+        const id = el('stream').value;
+        if (!id) return void toast('bad', 'No stream', 'Pick which stream these belong to.', 4000);
+        el('go').disabled = true;
+        const r = await apiPost('/api/notes/srt', {
+          stream_id: id,
+          clock: el('clock').value,
+          paste: el('paste').value,
+          gap: el('gap').checked,
+          dur: Number(el('dur').value) || 10,
+          prefix: el('prefix').value,
+        });
+        el('go').disabled = false;
+        if (r.status !== 200) {
+          return void toast('bad', 'Could not build it',
+            r.body?.error ?? `The archive answered ${r.status}.`, 7000);
+        }
+        last = r.body;
+        paint(last);
+      };
+
+      /* A Blob and a download attribute, NOT the clipboard: this page is served
+         over plain http on a LAN, where navigator.clipboard does not exist —
+         see copyText(). Downloads are not secure-context gated, so this works
+         where a copy button would silently do nothing. */
+      el('save').onclick = () => {
+        if (!last?.srt) return;
+        const url = URL.createObjectURL(new Blob([last.srt], { type: 'text/plain' }));
+        const a = Object.assign(document.createElement('a'),
+          { href: url, download: last.name || 'notes.srt' });
+        document.body.append(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 4000);
+      };
+
+      /* The paste is the expensive part. Throwing it away after one .srt means
+         doing it again next time, and these notes belong in the archive anyway
+         — so the import is offered rather than assumed, and it writes through
+         the SAME changeset path addNoteFrom uses. `frame: 'stream'` with no
+         anchor is the honest description: a wall time converted against a known
+         started_at IS a position on the axis, measured against nothing else. */
+      el('import').onclick = async () => {
+        if (!last?.cues?.length) return;
+        const id = el('stream').value;
+        const base = Math.max(0, ...((thS?.id === id ? thS.notes : null) ?? []).map((x) => x.ord ?? 0));
+        const ch = [];
+        last.cues.forEach((c, i) => {
+          const nid = ulid26();
+          ch.push(
+            { target_type: 'note', target_id: nid, op: 'create', field: 'stream_id', value: id },
+            { target_type: 'note', target_id: nid, op: 'create', field: 'ord', value: base + i + 1 },
+            { target_type: 'note', target_id: nid, op: 'create', field: 'text', value: c.text },
+            { target_type: 'note', target_id: nid, op: 'create', field: 'offset_s',
+              value: Math.max(0, Math.round(c.axis)) },
+            { target_type: 'note', target_id: nid, op: 'create', field: 'frame', value: 'stream' },
+            { target_type: 'note', target_id: nid, op: 'create', field: 'done', value: 0 },
+            /* The wall time it was written at, kept in the column meant for a
+               typed expression that says more than offset_s can. `11:06:54
+               wall` re-parses and converts back to the same second, so the
+               note's line survives an edit instead of being re-read as a
+               position five hours in. Not `raw`: that is the vault importer's
+               receipt and is deliberately not changeset-writable. */
+            ...(c.stamp ? [{ target_type: 'note', target_id: nid, op: 'create',
+                             field: 'stamp', value: c.stamp }] : []),
+          );
+        });
+        el('import').disabled = true;
+        await submit(ch, `imported ${last.cues.length} notes from a paste`,
+          { after: () => refreshOpenViews(id) });
+        el('import').disabled = false;
+        el('paste').value = '';
+        el('go').textContent = 'Build the track';
+        paint(last);
+      };
+    }
+
+    /* ---- one key, from anywhere -------------------------------------------
+       Everything under `@` — the moment frozen on focus, the live clock, the
+       error bar on it — has existed since the theater got its note field, and
+       none of it was reachable from where you actually are while a stream is
+       running. armNote()'s live branch was written for the case where the
+       broadcast is NOT on screen: you are watching on your phone or in
+       YouTube's own tab. The only way to spend the number it freezes was to
+       open the archive, open the theater, and click into that stream's field —
+       three navigations before the clock even arms. So the feature built for
+       watching elsewhere could only be used from the one place that means you
+       are not.
+
+       This is a doorway, not a second mechanism. The bar holds a
+       [data-notenew] field like the other four surfaces, bound through the
+       same bindNoteField and written by the same addNoteFrom, so `@`, `@-30`,
+       `#clip 02` and `>` mean exactly here what they mean in the theater.
+
+       And when a better-placed field is already on screen, the key sends you
+       there instead of floating a worse copy of it over the top. */
+    const CAP_KEY = 'n';
+    const cap = Object.assign(document.createElement('div'),
+      { className: 'cap', hidden: true });
+    cap.innerHTML = `<div class="cap-in">
+        <span class="cap-lab">note</span>
+        <textarea rows="1" class="cap-f" data-notenew="" autocomplete="off"
+          spellcheck="false" placeholder="@ what just happened"
+          title="One line: an optional #tag, an optional number, the text, and an optional timestamp in brackets at the end. Start the line with @ to stamp it at the moment this opened — @-30 for thirty seconds earlier, @+15 for later. Enter saves and stays open for the next one; Escape closes."
+        ></textarea>
+        <button class="cap-x" type="button" aria-label="Close">&#10005;</button>
+        <span class="arm-hint" data-armhint hidden></span>
+        <span class="wall-hint" data-wallhint hidden></span>
+      </div>
+      <div class="cap-where"></div>`;
+    document.body.append(cap);
+    const capF = cap.querySelector('.cap-f');
+    bindNoteField(cap, () => ({ notes: [], src: null }));
+    cap.querySelector('.cap-x').onclick = () => capClose();
+
+    /** The best note field already on screen, or null. */
+    function capField() {
+      for (const root of [TH.root.hidden ? null : TH.notes, notesCard]) {
+        const f = root?.querySelector('[data-notenew]');
+        /* offsetParent, not [hidden]: the notes column is collapsed by CSS at
+           narrow widths and when no stream is selected, and a field inside a
+           collapsed column is not a field anybody can be sent to. */
+        if (f && f.offsetParent) return f;
+      }
+      return null;
+    }
+
+    /** The stream a floating capture lands on, and the words for which. */
+    function capTarget() {
+      const L = liveNow();
+      for (const k of ['YT', 'TW']) {
+        const s = L?.[k];
+        // The same pair liveFor() insists on: without started_at there is no
+        // axis zero, so there is nothing for `@` to be measured from.
+        if (s?.live && s.stream_id && Number.isFinite(s.started_at)) {
+          return { id: s.stream_id, label: s.title || '(untitled)', how: 'live now' };
+        }
+      }
+      // Nothing running. The selected stream is still a reasonable target for
+      // a note with no timestamp in it, which is most of them.
+      if (selectedVod?.id) {
+        return { id: selectedVod.id, label: selectedVod.title || '(untitled)',
+                 how: 'selected' };
+      }
+      return null;
+    }
+
+    function capOpen() {
+      /* The theater's field sits at the top of its panel where it can read the
+         player, and the notes column's sits under the list you are reading.
+         Both are bound to this same grammar. A bar floating over either would
+         be a second field for one job, and the theater fills 94vh — it would
+         have to cover the timeline to appear at all. */
+      const near = capField();
+      if (near) {
+        near.scrollIntoView({ block: 'nearest' });
+        near.focus();          // focusin is what arms it — see armNote()
+        return;
+      }
+      const t = capTarget();
+      if (!t) {
+        return void toast('bad', 'Nothing to note',
+          'Nothing is recording, no stream is open in the theater, and none is '
+          + 'selected — so there is nothing for a note to be about yet.', 6000);
+      }
+      capF.dataset.notenew = t.id;
+      cap.querySelector('.cap-where').innerHTML =
+        `on <b>${esc(t.label)}</b> · <i>${esc(t.how)}</i>`;
+      cap.hidden = false;
+      /* focus() AFTER data-notenew is set: bindNoteField reads the stream off
+         the field to decide whether `@` has anything to spend, and arming is
+         what focus does. */
+      capF.focus();
+    }
+
+    function capClose() {
+      cap.hidden = true;
+      capF.value = '';
+      autoGrow(capF);
+    }
+
+    addEventListener('keydown', (e) => {
+      if (e.key !== CAP_KEY || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+      /* Anything with a caret in it keeps its own letters — the bar included,
+         so `n` types an n once you are in it, and the way out is Escape. */
+      if (document.activeElement?.closest(
+        'input, textarea, select, [contenteditable=""], [contenteditable="true"]')) return;
+      if (popOpen()) return;                 // a popover owns the keys
+      if (!ME.can?.suggest) return;          // same right the fields themselves need
+      e.preventDefault();
+      capOpen();
+    });
+
+    /* On the bar, so it runs before the sheet's Escape and the theater's, both
+       of which are bound on window and would close a whole view out from under
+       a half-typed note. The theater's is capture-phase and would win anyway —
+       but the bar never opens over the theater, because capField() sends you to
+       the theater's own field instead. */
+    cap.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape') return;
+      e.stopPropagation();
+      capClose();
+    });
 
     /* =====================================================================
        Inline editing — one table, one handler, two surfaces
@@ -12028,7 +13343,7 @@
      * The bytes go to quarantine and a promote job carries them into the media
      * tree, which is why the message says the recorder still has to move it:
      * `thumb_path` is written here as the destination it WILL have, exactly the
-     * way an accepted snippet's `video_path` is, so nothing downstream needs a
+     * way an accepted snippet's `file_path` is, so nothing downstream needs a
      * second state to understand. Until the Pi has run, the card keeps whatever
      * still it had rather than showing a hole. */
     function wireUpload(panel, key) {
@@ -12513,6 +13828,132 @@
        ===================================================================== */
     const TQ = { on: true, ready: false, timer: null };
 
+
+    /* ---- the models --------------------------------------------------------
+       Three slots, drawn from one endpoint. Nothing here downloads anything and
+       nothing polls: the sidecar is a container that is usually idle, and
+       waking it every five seconds to repeat itself would be the panel costing
+       more than the feature. `Check` is a button because asking is a thing
+       somebody does when they want to know. */
+    const ML = { tasks: [], sidecar: null };
+
+    const mlBytes = (n) => !n ? ''
+      : n >= (1 << 30) ? `${(n / (1 << 30)).toFixed(1)} GB`
+      : `${Math.round(n / (1 << 20))} MB`;
+
+    async function loadModels() {
+      if (!ME.can?.admin) return;
+      let d;
+      try { d = await api('/api/models'); } catch { return; }
+      ML.tasks = d.tasks ?? [];
+      ML.sidecar = d.sidecar ?? null;
+      const box = document.getElementById('ml-body');
+      if (!box) return;
+
+      /* Said once, at the top. Every "absent" below means the same thing while
+         this is true, and three copies of it would read as three faults. */
+      const dark = ML.sidecar?.configured ? '' : `<div class="ml-dark">
+        <b>There is no sidecar yet</b> — reading pictures and smart search both
+        need one, and jobs for them queue and wait rather than failing.<br>
+        Point <code>TENMA_ML_URL</code> at it once the container is up; whisper
+        runs in this container and is unaffected.</div>`;
+
+      box.innerHTML = dark + ML.tasks.map((t) => {
+        /* A picker over the catalogue, plus whatever is actually set even when
+           this build has never heard of it — an admin may name a model the
+           archive does not know, because the sidecar is what decides whether
+           it exists, and a list that silently dropped the current value would
+           change the setting by drawing it. */
+        const opts = [...(t.options ?? [])];
+        if (t.slug && !opts.some((o) => o.slug === t.slug)) {
+          opts.unshift({ slug: t.slug, name: t.name, bytes: t.bytes });
+        }
+        const local = t.runner === 'local';
+        const state = t.state ?? 'unknown';
+        const q = t.queue && (t.queue.waiting || t.queue.failed)
+          ? `${t.queue.waiting || 0} waiting${t.queue.failed ? ` · ${t.queue.failed} failed` : ''}`
+          : t.queue ? 'nothing waiting' : '';
+
+        return `<div class="ml-row${t.enabled ? '' : ' is-off'}" data-mltask="${esc(t.task)}">
+          <div class="ml-top">
+            <span class="ml-label">${esc(t.label)}</span>
+            <span class="ml-state ${esc(state)}">${esc(state)}</span>
+            ${t.bytes ? `<span class="ops-sub">${esc(mlBytes(t.bytes))}</span>` : ''}
+            <span class="ml-what">${esc(t.what)}</span>
+          </div>
+          <div class="ml-pick">
+            <select data-mlslug${local ? ' disabled title="Set by TENMA_WHISPER_MODEL"' : ''}>
+              ${opts.map((o) => `<option value="${esc(o.slug)}"${
+                o.slug === t.slug ? ' selected' : ''}>${esc(o.name ?? o.slug)}${
+                o.bytes ? ` · ${esc(mlBytes(o.bytes))}` : ''}</option>`).join('')}
+            </select>
+            <button type="button" data-mlcheck>Check</button>
+            ${t.on === null ? '' : `<button type="button" data-mlpause${
+              t.on ? '' : ' class="is-off"'}>${t.on ? 'Pause' : 'Paused'}</button>`}
+            <button type="button" data-mlenable${
+              t.enabled ? '' : ' class="is-off"'}>${t.enabled ? 'On' : 'Off'}</button>
+          </div>
+          ${t.note ? `<div class="ml-note">${esc(t.note)}</div>` : ''}
+          <div class="ml-note">Writes into ${esc(t.into)}.</div>
+          ${t.state_note ? `<div class="ml-why">${esc(t.state_note)}</div>`
+            : t.ready === false ? `<div class="ml-why">${esc(t.why ?? '')}</div>` : ''}
+          ${q ? `<div class="ml-q">${esc(q)}</div>` : ''}
+        </div>`;
+      }).join('');
+    }
+
+    document.getElementById('ml-body')?.addEventListener('click', (e) => {
+      const row = e.target.closest('[data-mltask]');
+      if (!row) return;
+      const task = row.dataset.mltask;
+      const t = ML.tasks.find((x) => x.task === task);
+      const send = async (path, body, ok) => {
+        const r = await apiPost(path, body);
+        if (r.status >= 400) return void toast('bad', 'Not changed', r.body?.error ?? '');
+        if (ok) toast('applied', ok, '', 2600);
+        loadModels();
+      };
+      if (e.target.closest('[data-mlcheck]')) {
+        return void send(`/api/models/${encodeURIComponent(task)}/check`, {}, null);
+      }
+      if (e.target.closest('[data-mlpause]')) {
+        /* Per task. One endpoint for both would have meant the Transcription
+           row's Pause stopping OCR — the two switches are separate on the
+           server for the good reason that the two queues are, and collapsing
+           them here would have undone that at the last step. */
+        const path = { ocr: '/api/ocr/pause', transcribe: '/api/transcribe/pause' }[task];
+        if (!path) return;
+        return void send(path, { on: !t?.on }, t?.on ? 'Paused' : 'Running again');
+      }
+      if (e.target.closest('[data-mlenable]')) {
+        return void (async () => {
+          const r = await apiPatch(`/api/models/${encodeURIComponent(task)}`,
+                                   { enabled: !t?.enabled });
+          if (r.status >= 400) return void toast('bad', 'Not changed', r.body?.error ?? '');
+          loadModels();
+        })();
+      }
+    });
+
+    document.getElementById('ml-body')?.addEventListener('change', (e) => {
+      const sel = e.target.closest('[data-mlslug]');
+      if (!sel) return;
+      const task = sel.closest('[data-mltask]')?.dataset.mltask;
+      if (!task) return;
+      (async () => {
+        const r = await apiPatch(`/api/models/${encodeURIComponent(task)}`,
+                                 { slug: sel.value });
+        if (r.status >= 400) return void toast('bad', 'Not changed', r.body?.error ?? '');
+        /* Deliberately says what has NOT happened. Choosing a model is a line
+           in a table; the sidecar has to fetch it, and somebody who read this
+           as "downloaded" would wonder why the first job took four minutes. */
+        toast('applied', 'Model set',
+          'Nothing is downloaded yet — the sidecar fetches it the first time it '
+          + 'is asked for.', 5000);
+        loadModels();
+      })();
+    });
+
     async function loadTranscribe() {
       if (!ME.can?.admin) return;
       let d;
@@ -12550,7 +13991,7 @@
           j.status === 'paused' ? ' is-paused' : ''}">
           <span class="tq-tag${live ? ' run' : ''}">${tag}</span>
           <span class="tq-what">${esc(j.title ?? 'a snippet that is gone')}${
-            j.duration_s ? ` <span class="ad-sub">${esc(dur(j.duration_s))}</span>` : ''}${
+            j.duration_s ? ` <span class="ops-sub">${esc(dur(j.duration_s))}</span>` : ''}${
             j.error && j.status === 'failed' ? `<br><span class="tq-why">${esc(j.error)}</span>` : ''}</span>
           <span class="tq-acts">${acts}</span>
         </div>`;
@@ -12558,11 +13999,11 @@
 
       box.innerHTML = dark + `<div class="tq-head">
           <span class="tq-state ${d.on ? 'is-on' : 'is-off'}">${d.on ? 'running' : 'paused'}</span>
-          ${d.model ? `<span class="ad-sub">${esc(d.model)}</span>` : ''}
+          ${d.model ? `<span class="ops-sub">${esc(d.model)}</span>` : ''}
           <button class="tq-switch${d.on ? '' : ' is-off'}" type="button" data-tqswitch
             >${d.on ? 'Pause all transcription' : 'Resume transcription'}</button>
         </div>`
-        + (rows || '<div class="ad-empty">Nothing queued.</div>');
+        + (rows || '<div class="ops-empty">Nothing queued.</div>');
     }
 
     /* Polled only while the Admin panel is open and only for an admin. A queue
@@ -12686,7 +14127,7 @@
           <span class="rq-kind ${esc(j.kind)}">${esc(j.kind)}</span>
           <span class="tq-tag${live ? ' run' : ''}">${tag}</span>
           <span class="tq-what">${what}
-            <span class="ad-sub">${esc(since(j.finished_at ?? j.claimed_at ?? j.created_at, d.now))}${
+            <span class="ops-sub">${esc(since(j.finished_at ?? j.claimed_at ?? j.created_at, d.now))}${
               j.attempts > 1 ? ` · try ${j.attempts}` : ''}</span>${
             j.error ? `<br><span class="tq-why">${esc(j.error)}</span>` : ''}</span>
           <span class="tq-acts">${acts}</span>
@@ -12699,16 +14140,16 @@
          right roots. The cost is that a quiet week says "5d ago", which is
          honest — it IS the last time anything was proved. */
       const who = d.worker
-        ? `<span class="ad-sub">${esc(d.worker.name)} · last took something
+        ? `<span class="ops-sub">${esc(d.worker.name)} · last took something
              ${esc(since(d.worker.last_seen, d.now))} ago</span>`
-        : '<span class="ad-sub">no worker has ever taken a job from this archive</span>';
+        : '<span class="ops-sub">no worker has ever taken a job from this archive</span>';
 
       box.innerHTML = warn + fix + `<div class="tq-head">
           <span class="tq-state ${idleFor > 180 ? 'is-off' : d.running ? 'is-on' : ''}"
             >${idleFor > 180 ? 'stalled'
                 : d.running ? 'working' : d.waiting ? 'waiting' : 'idle'}</span>
           ${who}
-        </div>` + (rows || '<div class="ad-empty">Nothing asked of it.</div>');
+        </div>` + (rows || '<div class="ops-empty">Nothing asked of it.</div>');
     }
 
     /* Polled only while the panel is open and only for an admin — same reason
@@ -12865,7 +14306,7 @@
       el.innerHTML = `<div class="hist-head"><b>History</b>
           <span class="sub">${esc(snip.title)}</span>
           <button class="hist-x" type="button" data-histx aria-label="Close">✕</button></div>
-        <div class="hist-body"><div class="ad-empty">Reading…</div></div>`;
+        <div class="hist-body"><div class="ops-empty">Reading…</div></div>`;
       document.body.append(el);
       histWin = el;
 
@@ -12887,13 +14328,13 @@
         events = (await api(`/api/snippets/${encodeURIComponent(snip.id)}/history`)).events ?? [];
       } catch {
         el.querySelector('.hist-body').innerHTML =
-          '<div class="ad-empty">Could not read the history.</div>';
+          '<div class="ops-empty">Could not read the history.</div>';
         return;
       }
       if (histWin !== el) return;            // closed while we were asking
       el.querySelector('.hist-body').innerHTML = events.length
         ? `<div class="lg">${events.map((e) => logRow(e)).join('')}</div>`
-        : '<div class="ad-empty">Nothing recorded. This snippet predates the log.</div>';
+        : '<div class="ops-empty">Nothing recorded. This snippet predates the log.</div>';
     }
 
     addEventListener('keydown', (e) => { if (e.key === 'Escape') closeHistory(); });
@@ -12912,7 +14353,7 @@
       if (LG.loading) return;
       LG.loading = true;
       const list = document.getElementById('lg-list');
-      if (reset) { LG.next = null; list.innerHTML = '<div class="ad-empty">Reading…</div>'; }
+      if (reset) { LG.next = null; list.innerHTML = '<div class="ops-empty">Reading…</div>'; }
       const qs = new URLSearchParams({ limit: '60' });
       if (LG.next && !reset) qs.set('before', LG.next);
       if (LG.who) qs.set('actor', LG.who);
@@ -12925,7 +14366,7 @@
         LG.next = d.next;
         document.getElementById('lg-more-wrap').hidden = !d.next;
         if (!list.children.length) {
-          list.innerHTML = '<div class="ad-empty">Nothing matches.</div>';
+          list.innerHTML = '<div class="ops-empty">Nothing matches.</div>';
         }
         /* The pickers are built from what is actually in the log rather than
            from a hardcoded list of verbs — so a verb added later appears here
@@ -12965,7 +14406,7 @@
        same word held by a person. Matching them is the whole mechanism, which
        is why both are drawn as the same chip.
        ===================================================================== */
-    const AD = { gates: [], people: [], roster: [], loading: false, booted: false };
+    const AD = { gates: [], people: [], roster: [], dead: [], loading: false, booted: false };
 
     async function loadAdmin() {
       if (AD.loading || !ME.can?.admin) return;
@@ -12978,9 +14419,17 @@
           api('/api/grants'),
           api('/api/admin/people'),
         ]);
+        loadModels();
         AD.gates = g.gates ?? [];
         AD.people = g.people ?? [];
         AD.roster = p.people ?? [];
+        /* Its own call with its own catch, and pointedly NOT folded into the
+           Promise.all above. Everything in that pair is load-bearing for the
+           panel, so one rejection there paints nothing at all — which is a
+           whole admin screen lost to a list of tombstones being unavailable.
+           This one degrades to an empty card. */
+        try { AD.dead = (await api('/api/tags?retracted=1&limit=500')).tags ?? []; }
+        catch { AD.dead = []; }
         adPaint();
         loadLog({ reset: true });
         loadTranscribe();
@@ -12998,23 +14447,23 @@
     const adWords = () => [...new Set(AD.gates.map((g) => g.name))].sort();
 
     const adKey = (name, onRemove) =>
-      `<span class="ad-key">${esc(name)}${onRemove
+      `<span class="ops-key">${esc(name)}${onRemove
         ? `<button type="button" ${onRemove} title="Remove" aria-label="Remove ${esc(name)}">×</button>`
         : ''}</span>`;
 
     function adPaint() {
       const words = adWords();
-      const gates = document.getElementById('ad-gates');
+      const gates = document.getElementById('ops-gates');
       gates.innerHTML = AD.gates.length
-        ? AD.gates.map((g) => `<div class="ad-row" data-gateword="${esc(g.name)}">
+        ? AD.gates.map((g) => `<div class="ops-row" data-gateword="${esc(g.name)}">
             ${adKey(g.name, `data-ungate="${esc(g.name)}"`)}
-            <span class="ad-sub">${g.taglets.map(esc).join(', ')}</span>
-            <span class="ad-give"><span class="ad-sub">${g.clips} snippet${
+            <span class="ops-sub">${g.taglets.map(esc).join(', ')}</span>
+            <span class="ops-give"><span class="ops-sub">${g.clips} snippet${
               g.clips === 1 ? '' : 's'}</span></span>
           </div>`).join('')
-        : '<div class="ad-empty">No taglet gates anything. Everything published is public.</div>';
+        : '<div class="ops-empty">No taglet gates anything. Everything published is public.</div>';
 
-      const people = document.getElementById('ad-people');
+      const people = document.getElementById('ops-people');
       /* Everyone, not only the people who already hold something — the roster
          is the point of the panel. Holders first so the list reads as "who is
          let through", with the rest below as the people you might add. */
@@ -13026,24 +14475,84 @@
         ? rows.map((p) => {
           const mine = held.get(p.id) ?? [];
           const free = words.filter((w) => !mine.includes(w));
-          return `<div class="ad-row" data-person="${esc(p.id)}">
-            <span class="ad-who">${esc(p.handle)}</span>
-            <span class="ad-sub">${esc(p.role)}</span>
+          return `<div class="ops-row" data-person="${esc(p.id)}">
+            <span class="ops-who">${esc(p.handle)}</span>
+            <span class="ops-sub">${esc(p.role)}</span>
             ${mine.map((w) => adKey(w, `data-ungrant="${esc(w)}"`)).join('')}
-            <span class="ad-give">${free.length
+            <span class="ops-give">${free.length
               ? `<select data-grant aria-label="Grant a gate to ${esc(p.handle)}">
                    <option value="">grant…</option>
                    ${free.map((w) => `<option value="${esc(w)}">${esc(w)}</option>`).join('')}
                  </select>`
               : words.length
-                ? '<span class="ad-sub">holds every gate</span>'
+                ? '<span class="ops-sub">holds every gate</span>'
                 : '<select disabled><option>no gates yet</option></select>'}</span>
           </div>`;
         }).join('')
-        : '<div class="ad-empty">Nobody has signed in yet.</div>';
+        : '<div class="ops-empty">Nobody has signed in yet.</div>';
+
+      /* Newest death first, which is the order in which you are likely to have
+         meant to do something about them. The counts are what the purge is
+         about to take with it, so they are on the row rather than behind the
+         confirm — a tombstone with forty streams still pointing at it is a
+         different decision from an empty one. */
+      const dead = document.getElementById('ops-dead');
+      dead.innerHTML = AD.dead.length
+        ? AD.dead.map((t) => {
+          const bits = [
+            t.streams ? `${t.streams} stream${t.streams === 1 ? '' : 's'}` : null,
+            t.snippets ? `${t.snippets} snippet${t.snippets === 1 ? '' : 's'}` : null,
+            t.blocks ? `${t.blocks} block${t.blocks === 1 ? '' : 's'}` : null,
+          ].filter(Boolean);
+          return `<div class="ops-row" data-dead="${esc(t.id)}">
+            <span class="ops-who">${esc(t.name)}</span>
+            <span class="ops-sub">${esc(bits.length ? bits.join(', ') : 'nothing points at it')}</span>
+            <span class="ops-give"><button type="button" class="btn-ghost"
+              data-purge="${esc(t.id)}">destroy</button></span>
+          </div>`;
+        }).join('')
+        : '<div class="ops-empty">No retracted tags. Every name is in use or free.</div>';
     }
 
-    document.getElementById('ad-people').addEventListener('click', (e) => {
+    /* Two phases, both here. The route answers a preview to a body with no
+       `confirm` and refuses the real thing if the counts it is handed do not
+       match what it just read — so this asks, shows a person the number, and
+       sends back exactly what it was told. A stale panel cannot destroy more
+       than it displayed. */
+    document.getElementById('ops-dead').addEventListener('click', async (e) => {
+      const b = e.target.closest('[data-purge]');
+      if (!b) return;
+      const id = b.dataset.purge;
+      b.disabled = true;
+      try {
+        const prev = await apiPost(`/api/tags/${encodeURIComponent(id)}/purge`, {});
+        if (prev.status !== 200) {
+          return void toast('bad', 'Could not read that tag',
+                            prev.body?.error ?? `The archive answered ${prev.status}.`);
+        }
+        const c = prev.body.counts, name = prev.body.tag?.name ?? 'that tag';
+        const owns = [
+          `${c.streams} stream${c.streams === 1 ? '' : 's'}`,
+          `${c.snippets} snippet${c.snippets === 1 ? '' : 's'}`,
+          `${c.blocks} block${c.blocks === 1 ? '' : 's'}`,
+          `${c.children} child tag${c.children === 1 ? '' : 's'}`,
+        ].join(', ');
+        if (!confirm(`Destroy "${name}" for good?\n\n${owns} point at it and will `
+                   + `lose it.\n\nThis cannot be undone. It is also the only thing `
+                   + `that frees the name "${name}" to be minted again.`)) return;
+        const done = await apiPost(`/api/tags/${encodeURIComponent(id)}/purge`,
+          { confirm: { streams: c.streams, snippets: c.snippets, blocks: c.blocks } });
+        if (done.status !== 200) {
+          return void toast('bad', 'The purge was refused',
+            done.body?.error ?? `The archive answered ${done.status}.`, 9000);
+        }
+        toast('applied', `Destroyed ${name}`, 'That name is free to mint again.', 6000);
+        AD.dead = AD.dead.filter((t) => t.id !== id);
+        adPaint();
+      } finally { b.disabled = false; }
+    });
+
+    document.getElementById('ops-people').addEventListener('click', (e) => {
       const rm = e.target.closest('[data-ungrant]');
       if (!rm) return;
       const id = rm.closest('[data-person]')?.dataset.person;
@@ -13059,7 +14568,7 @@
       })();
     });
 
-    document.getElementById('ad-people').addEventListener('change', (e) => {
+    document.getElementById('ops-people').addEventListener('change', (e) => {
       const sel = e.target.closest('[data-grant]');
       if (!sel || !sel.value) return;
       const id = sel.closest('[data-person]')?.dataset.person;
@@ -13079,8 +14588,8 @@
        this disappears", and picking the taglet by name with its use count in
        front of you is the difference between meaning it and guessing. */
     {
-      const q = document.getElementById('ad-gate-q');
-      const ac = document.getElementById('ad-gate-ac');
+      const q = document.getElementById('ops-gate-q');
+      const ac = document.getElementById('ops-gate-ac');
       let timer = null, gen = 0;
 
       const shut = () => { ac.hidden = true; ac.innerHTML = ''; };
@@ -13097,7 +14606,7 @@
         ac.innerHTML = open.length
           ? open.map((t) => `<button type="button" data-gate="${esc(t.id)}"
               data-name="${esc(t.name)}"><i style="background:var(--tl-${esc(t.kind)})"></i>${
-              esc(t.name)}<span class="ad-sub">${t.uses ?? 0}</span></button>`).join('')
+              esc(t.name)}<span class="ops-sub">${t.uses ?? 0}</span></button>`).join('')
           : '<button type="button" disabled>Nothing there that is not already gated.</button>';
         ac.hidden = false;
       };
@@ -13132,7 +14641,7 @@
       });
 
       document.addEventListener('click', (e) => {
-        if (!e.target.closest('#ad-gate-q, #ad-gate-ac')) shut();
+        if (!e.target.closest('#ops-gate-q, #ops-gate-ac')) shut();
       });
     }
 
@@ -13146,7 +14655,7 @@
        rows on a two-core NAS, and a half-applied ungate is worse than a slow
        one — the rows that did land are visible immediately, so a failure part
        way through is reported against what actually happened. */
-    document.getElementById('ad-gates').addEventListener('click', (e) => {
+    document.getElementById('ops-gates').addEventListener('click', (e) => {
       const rm = e.target.closest('[data-ungate]');
       if (!rm) return;
       const word = rm.dataset.ungate;
@@ -13242,6 +14751,17 @@
     const SNIP = { q: '', scope: 'all', tags: [], next: null, loading: false,
                    booted: false, focus: null };
     const snipCache = new Map();          // id -> row, for the seek handlers
+
+    /** One row, from whichever surface is holding it.
+     *
+     *  There are two caches and there is a reason for both: `snipCache` is the
+     *  clip list's and is CLEARED on every reset, and the picture boards keep
+     *  their own so that reloading Snippets cannot leave an open meme with no
+     *  record behind it. The shared editing handlers below should not have to
+     *  know which panel they are being used in, so they ask this. */
+    const rowOf = (id) => snipCache.get(id)
+      ?? picBoards().find((b) => b.cache.has(id))?.cache.get(id)
+      ?? null;
 
     const TAG_OP = { and: '+', or: '~', not: '-' };
     const snipTagMode = (slug) => SNIP.tags.find((t) => t.slug === slug)?.mode ?? null;
@@ -13480,6 +15000,16 @@
 
       const { pending, removed, working } = snipState(s, review);
 
+      /* Where a linked picture came from, on the row a verdict is given on.
+         That is the whole point of the channel allowlist: a reviewer sees the
+         provenance without opening anything. `source` carries the name the
+         archive was configured with, which is the only name anybody here has
+         for a Discord channel — the URL does not contain the server at all. */
+      const came = s.source
+        ? `<span class="snip-from"><span class="kind-pill"
+             title="Where this came from">${esc(s.source)}</span></span>`
+        : '';
+
       const sound = s.audio_only
         ? `<span class="kind-pill" title="No picture — this one is sound"><svg width="9" height="9"
              viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"
@@ -13492,17 +15022,28 @@
           ? `<span class="kind-pill" title="Stored as a GIF — converted to video only so it plays">GIF</span>`
           : '';
 
+      /* A picture in a list built for clips. It keeps the whole row — the
+         verdict, the tags, the title, the history — because it is the same
+         row about the same table, and the queue is the only place a picture
+         can be approved. What it loses is the two things that would be a lie
+         on a still: the play glyph over something that does not play, and the
+         duration pill, which for a jpeg would read 0:00 because ffprobe calls
+         one frame a fortieth of a second. */
+      const still = !!s.still;
       return `<article class="snip${review ? ' rv' : ''}${verdict ? ' hasv' : ''}${
         pending ? ' is-pending' : ''}${removed ? ' is-removed' : ''}${
-        working ? ' is-working' : ''}${s.audio_only ? ' is-sound' : ''}"
-        data-snip="${esc(s.id)}">
+        working ? ' is-working' : ''}${s.audio_only ? ' is-sound' : ''}${
+        still ? ' is-still' : ''}"
+        data-snip="${esc(s.id)}"${s.kind && s.kind !== 'snippet'
+          ? ` data-kind="${esc(s.kind)}"` : ''}>
         <div class="snip-media" style="--ar:${ar}">
           <div class="snip-frame">
             ${s.poster
               ? `<img src="${esc(s.poster)}" alt="" loading="lazy" decoding="async">`
               : ''}
-            <span class="snip-play" aria-hidden="true">${playIcon}</span>
-            ${s.duration_s ? `<span class="snip-dur">${dur(s.duration_s)}</span>` : ''}
+            ${still ? '' : `<span class="snip-play" aria-hidden="true">${playIcon}</span>`}
+            ${came}
+            ${!still && s.duration_s ? `<span class="snip-dur">${dur(s.duration_s)}</span>` : ''}
           </div>
           <button class="snip-shrink" type="button" data-shrink aria-label="Shrink this snippet"
             title="Shrink (Esc)"><svg width="13" height="13" viewBox="0 0 24 24" fill="none"
@@ -13510,8 +15051,10 @@
             d="M9 3v6H3M15 21v-6h6"/></svg></button>
         </div>
         <div class="snip-body">
-          <div class="snip-title${canEd ? ' rv-title' : ''}"${canEd ? ' data-rvtitle' : ''}
-            title="${esc(s.title)}${canEd ? ' — double-click to rename' : ''}">${esc(s.title)}</div>
+          <div class="snip-title${canEd ? ' rv-title' : ''}${
+            s.title ? '' : ' is-none'}"${canEd ? ' data-rvtitle' : ''}
+            title="${esc(s.title)}${canEd ? ' — double-click to rename' : ''}">${
+            esc(s.title) || 'No description'}</div>
           <div class="snip-tags">${snipStrip(s, { review })}</div>
           <div class="sheet-actions snip-acts">
             <a class="btn-ghost sheet-ico" data-act="dl"
@@ -13775,6 +15318,10 @@
          a real click — `force` — because expanded it gets controls and sound
          and becomes an actual player. */
       if (s.audio_only && !force) return;
+      /* And never for a still, force or not. A <video> pointed at a PNG is an
+         element that reports an error and paints nothing, on top of the poster
+         that was already showing the picture correctly. */
+      if (s.still) return;
       const v = document.createElement('video');
       /* So the element paints the waveform rather than nothing. A video paints
          black until it decodes a first frame, and an audio track never gives
@@ -14005,7 +15552,16 @@
        wire: a few hundred taglets is a few KB, the whole list is already
        needed by the picker, and a filter over an array in memory cannot lag
        behind what has been typed the way a race of in-flight requests can. */
-    const AC = { all: null, rows: [], at: -1, open: false, mode: 'and' };
+    /* One autocomplete, three search boxes. `s` is whichever surface last had
+       the caret — Snippets, Memes or the Gallery — and only one input can hold
+       it, so a single instance serving all three is not a shortcut, it is the
+       accurate model. The alternative was three copies of the operator parser,
+       and three copies of a parser is how two of them come to disagree about
+       what `~` means.
+
+       A surface is: { input, ac, state, tagSet, tagDrop, load }. `state`
+       carries `q` and `tags`; the three functions are the panel's own. */
+    const AC = { all: null, rows: [], at: -1, open: false, mode: 'and', s: null };
 
     /* The operator is read off the FRONT of the box while you type, so `-asmr`
        is an exclusion being composed and the list underneath is already drawn
@@ -14051,8 +15607,9 @@
     function acPaint(q, hits) {
       AC.rows = hits;
       if (!hits.length) return acClose();
-      snipAc.dataset.mode = AC.mode;
-      snipAc.innerHTML = hits.map((h, i) => {
+      const { ac, input } = AC.s;
+      ac.dataset.mode = AC.mode;
+      ac.innerHTML = hits.map((h, i) => {
         const t = h.t;
         // The matched run is bolded in the taglet's own colour, so the reason
         // a row is in the list is visible without re-reading what was typed.
@@ -14074,16 +15631,17 @@
       + `<div class="snip-ac-hint" role="presentation"><span><b>Tab</b> add</span><span><b>-</b>
            exclude</span><span><b>~</b> any of</span><span><b>⇧</b>-click a tag
            to exclude</span></div>`;
-      snipAc.hidden = false;
+      ac.hidden = false;
       AC.open = true;
-      snipSearch.setAttribute('aria-expanded', 'true');
+      input.setAttribute('aria-expanded', 'true');
     }
 
     function acClose() {
-      snipAc.hidden = true; snipAc.innerHTML = '';
+      if (!AC.s) return;
+      AC.s.ac.hidden = true; AC.s.ac.innerHTML = '';
       AC.open = false; AC.at = -1; AC.rows = [];
-      delete snipAc.dataset.mode;
-      snipSearch.setAttribute('aria-expanded', 'false');
+      delete AC.s.ac.dataset.mode;
+      AC.s.input.setAttribute('aria-expanded', 'false');
     }
 
     function acMove(d) {
@@ -14092,12 +15650,12 @@
       // The extra slot is "no selection", so arrowing past the end returns you
       // to the plain text search instead of wrapping straight to the top.
       if (AC.at === AC.rows.length) AC.at = -1;
-      [...snipAc.querySelectorAll('.snip-ac-row')].forEach((el, i) => {
+      [...AC.s.ac.querySelectorAll('.snip-ac-row')].forEach((el, i) => {
         el.classList.toggle('at', i === AC.at);
         el.setAttribute('aria-selected', String(i === AC.at));
       });
       if (AC.at >= 0) {
-        snipAc.querySelectorAll('.snip-ac-row')[AC.at]?.scrollIntoView({ block: 'nearest' });
+        AC.s.ac.querySelectorAll('.snip-ac-row')[AC.at]?.scrollIntoView({ block: 'nearest' });
       }
     }
 
@@ -14109,77 +15667,608 @@
        left empty so the next tag can be typed straight after it, which is what
        makes "several tags next to each other" a thing you can actually type. */
     function acPick(t, mode = 'and') {
-      snipSearch.value = '';
-      SNIP.q = '';
-      clearTimeout(snipTimer);
+      const surf = AC.s;
+      surf.input.value = '';
+      surf.state.q = '';
+      clearTimeout(surf.timer);
       acClose();
-      snipTagSet(t, mode);
+      surf.tagSet(t, mode);
     }
 
-    let snipTimer;
-    snipSearch.addEventListener('input', (e) => {
-      clearTimeout(snipTimer);
-      const p = acParse(e.target.value);
-      if (p.term.length >= 2) {
-        acLoad().then((all) => {
-          // The box may have moved on while the vocabulary was loading.
-          const now = acParse(snipSearch.value);
-          if (now.term !== p.term || now.mode !== p.mode) return;
-          AC.at = -1; AC.mode = p.mode;
-          acPaint(p.term, acMatch(p.term, all));
-        });
-      } else acClose();
-      /* A prefixed token is a tag being composed, not prose. Running `-asmr`
-         as a text search would fill the list with exactly the clips it is
-         trying to take away, so free text happens only when nothing is being
-         composed. */
-      const q = p.op ? '' : p.term;
-      if (q === SNIP.q) return;
-      snipTimer = setTimeout(() => { SNIP.q = q; loadSnips({ reset: true }); }, 180);
-    });
+    /** Wire one search box to the shared autocomplete.
+     *
+     *  Called once per collection. Everything below used to name `snipSearch`
+     *  and `SNIP` directly; the only real change is that it now names the
+     *  surface it was handed, and the surface is set on focus. The debounce
+     *  timer lives ON the surface rather than in this scope, because a timer
+     *  started in Memes and fired after a switch to Snippets would otherwise
+     *  run the wrong panel's search with the wrong panel's text. */
+    function bindSearch(surf) {
+      const { input, ac, state } = surf;
+      const claim = () => { if (AC.s !== surf) { acClose(); AC.s = surf; } };
+      input.addEventListener('focus', claim);
 
-    snipSearch.addEventListener('keydown', (e) => {
-      if (e.key === 'ArrowDown') { e.preventDefault(); return acMove(1); }
-      if (e.key === 'ArrowUp') { e.preventDefault(); return acMove(-1); }
-      if (e.key === 'Escape' && AC.open) { e.stopPropagation(); return acClose(); }
-      /* Backspace on an empty box pops the last chip. Every token field works
-         this way and the fingers already know it; without it the only way out
-         of a four-tag expression is four trips to the mouse. */
-      if (e.key === 'Backspace' && !snipSearch.value && SNIP.tags.length) {
+      input.addEventListener('input', (e) => {
+        claim();
+        clearTimeout(surf.timer);
+        const p = acParse(e.target.value);
+        if (p.term.length >= 2) {
+          acLoad().then((all) => {
+            // The box may have moved on while the vocabulary was loading —
+            // or the caret may have moved to another panel's box entirely.
+            if (AC.s !== surf) return;
+            const now = acParse(input.value);
+            if (now.term !== p.term || now.mode !== p.mode) return;
+            AC.at = -1; AC.mode = p.mode;
+            acPaint(p.term, acMatch(p.term, all));
+          });
+        } else acClose();
+        /* A prefixed token is a tag being composed, not prose. Running `-asmr`
+           as a text search would fill the list with exactly the clips it is
+           trying to take away, so free text happens only when nothing is being
+           composed. */
+        const q = p.op ? '' : p.term;
+        if (q === state.q) return;
+        surf.timer = setTimeout(() => { state.q = q; surf.load(); }, 180);
+      });
+
+      input.addEventListener('keydown', (e) => {
+        claim();
+        if (e.key === 'ArrowDown') { e.preventDefault(); return acMove(1); }
+        if (e.key === 'ArrowUp') { e.preventDefault(); return acMove(-1); }
+        if (e.key === 'Escape' && AC.open) { e.stopPropagation(); return acClose(); }
+        /* Backspace on an empty box pops the last chip. Every token field works
+           this way and the fingers already know it; without it the only way out
+           of a four-tag expression is four trips to the mouse. */
+        if (e.key === 'Backspace' && !input.value && state.tags.length) {
+          e.preventDefault();
+          return void surf.tagDrop(state.tags[state.tags.length - 1].slug);
+        }
+        if (e.key !== 'Tab' && e.key !== 'Enter') return;
+        // Shift+Tab is "go back a field" and always was. Tab with no list open
+        // is too: a search box that swallowed Tab would be a keyboard trap.
+        if (e.key === 'Tab' && (e.shiftKey || !AC.open)) return;
+
+        const p = acParse(input.value);
+        /* Tab completes: with nothing arrowed to it takes the top row, which is
+           what the key means everywhere else. Enter is stricter, because it also
+           has to mean "just search for what I typed" — it commits only a row
+           that was chosen, or one whose token carries an operator and therefore
+           cannot be prose. */
+        const at = AC.at >= 0 ? AC.at : (e.key === 'Tab' || p.op) ? 0 : -1;
+        if (at < 0) return;
+        const hit = AC.rows[at];
+        if (hit) { e.preventDefault(); return void acPick(hit.t, p.mode); }
+        if (!p.op || !p.term) return;
         e.preventDefault();
-        return void snipTagDrop(SNIP.tags[SNIP.tags.length - 1].slug);
+        toast('bad', 'No such tag', `Nothing in the vocabulary matches \u201c${p.term}\u201d.`, 3500);
+      });
+
+      ac.addEventListener('mousedown', (e) => {
+        // mousedown, not click: blur fires first and would close the list out
+        // from under the pointer before the click could land.
+        const row = e.target.closest('[data-ac]');
+        if (!row) return;
+        e.preventDefault();
+        claim();
+        const hit = AC.rows.find((h) => h.t.slug === row.dataset.ac);
+        if (hit) acPick(hit.t, acParse(input.value).mode);
+      });
+
+      input.addEventListener('blur', () => setTimeout(() => {
+        if (AC.s === surf) acClose();
+      }, 120));
+    }
+
+    /* Snippets is a surface like the other two, and registering it here rather
+       than leaving it wired by hand is what keeps the three honest. */
+    const SNIP_SURFACE = {
+      input: snipSearch, ac: snipAc, state: SNIP,
+      tagSet: (t, m) => snipTagSet(t, m),
+      tagDrop: (slug) => snipTagDrop(slug),
+      load: () => loadSnips({ reset: true }),
+    };
+    AC.s = SNIP_SURFACE;
+    bindSearch(SNIP_SURFACE);
+
+
+    /* =====================================================================
+       Pictures — Memes and the Gallery
+       =====================================================================
+       Two panels and one component. The archive keeps all three collections in
+       one table told apart by `kind`, and the panels follow: everything below
+       takes a `board`, and a board is a kind plus the four elements its panel
+       owns. The gallery is therefore not a copy of the meme panel, it is the
+       same code called with a different word — which is the only arrangement
+       where a fix to one is a fix to both.
+
+       The tile is a SQUARE. A grid whose rows are all different heights is a
+       grid nobody can scan, and a lattice is what lets the eye move. The square
+       is a crop for LOOKING and not a claim about the picture: pointing at a
+       tile releases the crop and shows the whole thing, grown a little, and
+       never past its own pixels — blowing a 90px reaction face up to 300 is not
+       showing it properly, it is showing it worse.
+
+       The controls are children of the SQUARE rather than of the thing that
+       grows, so the picture expands underneath them and they do not move. That
+       is the difference between dealing with forty memes and aiming at forty
+       memes. */
+    const PIC_BOARDS = {};
+
+    function picBoard(kind, cfg) {
+      const b = {
+        kind, ...cfg,
+        grid: document.getElementById(cfg.gridId),
+        count: document.getElementById(`${cfg.pre}-count`),
+        filters: document.getElementById(`${cfg.pre}-filters`),
+        more: document.getElementById(`${cfg.pre}-more`),
+        panel: document.getElementById(cfg.panelId),
+        // The surface's own search state, shaped exactly like SNIP's so the one
+        // autocomplete can serve it without knowing which panel it is in.
+        q: '', tags: [], next: null, loading: false, booted: false,
+        open: null,          // the id whose row is expanded, or null
+        cache: new Map(),
+      };
+      PIC_BOARDS[kind] = b;
+      return b;
+    }
+
+    const picBoards = () => Object.values(PIC_BOARDS);
+
+    /* ---- filtering ---------------------------------------------------------
+       The same danbooru-ish expression the Snippets panel takes, because it is
+       the same vocabulary and a tag learned in one panel has to mean the same
+       thing in the next. */
+    function picTagSet(b, t, mode, { toggle = false } = {}) {
+      const i = b.tags.findIndex((x) => x.slug === t.slug);
+      if (i < 0) {
+        b.tags.push({ slug: t.slug, name: t.name ?? t.slug,
+                      kind: t.kind ?? 'general', mode });
+      } else if (toggle && b.tags[i].mode === mode) b.tags.splice(i, 1);
+      else b.tags[i].mode = mode;
+      picPaintFilters(b);
+      picLoad(b, { reset: true });
+    }
+    function picTagDrop(b, slug) {
+      b.tags = b.tags.filter((t) => t.slug !== slug);
+      picPaintFilters(b);
+      picLoad(b, { reset: true });
+    }
+    function picPaintFilters(b) {
+      b.filters.hidden = !b.tags.length;
+      const why = { and: 'required', or: 'any one of the ~ tags is enough',
+                    not: 'excluded' };
+      b.filters.innerHTML = b.tags.map((t) => `<span class="tl-wrap"><button
+        class="tl tl-f" type="button" data-tlmode="${esc(t.slug)}" data-mode="${t.mode}"
+        data-kind="${esc(t.kind)}" aria-pressed="true"
+        title="${esc(t.name)} — ${why[t.mode]}; click to change"><span
+        class="tl-op" aria-hidden="true">${TAG_OP[t.mode]}</span>${esc(t.name)}</button><button
+        class="tl-x" type="button" data-tldrop="${esc(t.slug)}"
+        title="Drop ${esc(t.name)}" aria-label="Drop ${esc(t.name)}">×</button></span>`).join('')
+        + (b.tags.length > 1
+            ? `<button class="tl tl-clear" type="button" data-tlclear>clear all</button>` : '');
+    }
+
+    /* ---- one tile ----------------------------------------------------------
+       Both images come off the SAME file. The poster the server writes for a
+       still is aspect-fitted rather than square-cropped, precisely so the grown
+       version costs no second request: `object-fit: cover` crops it into the
+       lattice, `contain` in the overlay gives it back whole. */
+    function picTile(b, s) {
+      const pending = s.status === 'proposed';
+      const removed = s.status === 'rejected';
+      const label = s.title || 'Untitled';
+
+      const face = s.poster
+        ? `<div class="pic-sq"><img src="${esc(s.poster)}" alt="${esc(label)}"
+              loading="lazy" decoding="async"></div>
+           <div class="pic-pop" aria-hidden="true"><span class="pic-pop-in"><img
+              src="${esc(s.poster)}" alt="" decoding="async"></span></div>`
+        /* No poster yet. A moving meme gets one from the normalize worker a
+           few seconds later; saying so is better than a grey square that
+           reads as a broken image. */
+        : `<div class="pic-sq"><span class="pic-none">${
+             s.normalize_status === 'queued' || s.normalize_status === 'running'
+               ? 'converting…' : 'no preview'}</span></div>`;
+
+      // What it IS, when that is not what it looks like. A gif and a still are
+      // the same rectangle in a grid until one of them is pointed at.
+      const moving = s.is_gif ? 'GIF' : s.still ? '' : 'VIDEO';
+
+      return `<figure class="pic${pending ? ' is-pending' : ''}${removed ? ' is-removed' : ''}"
+        data-pic="${esc(s.id)}" tabindex="0" role="button"
+        aria-label="${esc(label)} — open">
+        ${face}
+        ${moving ? `<span class="pic-tag">${moving}</span>` : ''}
+        <div class="pic-acts">${picActs(b, s)}</div>
+      </figure>`;
+    }
+
+    const PIC_ICON = {
+      link: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+        stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg>`,
+      dl: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+        stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><path d="m7 11 5 5 5-5"/><path d="M4 20h16"/></svg>`,
+      yes: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6"
+        stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>`,
+      no: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6"
+        stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>`,
+      hide: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+        stroke-linecap="round" stroke-linejoin="round"><path d="M10.7 5.1A9.7 9.7 0 0 1 12 5c6.4 0 10 7 10 7a13 13 0 0 1-2 2.9"/><path d="M6.6 6.6A13 13 0 0 0 2 12s3.6 7 10 7a9.7 9.7 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3.2 3.2 0 0 0 4.2 4.2"/><path d="m2 2 20 20"/></svg>`,
+      show: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+        stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7Z"/></svg>`,
+      bin: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+        stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>`,
+    };
+
+    /** The strip that sits on the square.
+     *
+     *  Link and download always — those are what a picture is FOR, and neither
+     *  depends on who is looking. After them, whatever verb this row's state
+     *  actually has: a waiting picture wants a verdict, a published one wants
+     *  taking back out, a removed one wants putting back or destroying. The
+     *  same four verbs the clip list uses, spelled the same way, because they
+     *  are the same decisions about the same table.
+     */
+    function picActs(b, s) {
+      const bt = (act, icon, title, cls = '') =>
+        `<button class="pic-b${cls}" type="button" data-picact="${act}"
+          title="${esc(title)}" aria-label="${esc(title)}">${icon}</button>`;
+      const out = [
+        bt('link', PIC_ICON.link, 'Copy a link to the picture'),
+        `<a class="pic-b" href="/media/snippet/${esc(s.id)}?dl=1" download
+            data-picact="dl" title="Download" aria-label="Download"
+            >${PIC_ICON.dl}</a>`,
+      ];
+      const decide = !!ME.can?.['review.decide'];
+      const edit = !!ME.can?.edit;
+      if (decide && s.status === 'proposed') {
+        out.push(bt('approve', PIC_ICON.yes, 'Publish'));
+        out.push(bt('reject', PIC_ICON.no, 'Reject', ' danger'));
+      } else if (edit && s.status === 'confirmed') {
+        out.push(bt('unlist', PIC_ICON.hide, 'Retract — take it out of the archive. Reversible.'));
+      } else if (edit && s.status === 'rejected') {
+        out.push(bt('relist', PIC_ICON.show, 'Put it back in the archive'));
+        if (ME.can?.admin) {
+          out.push(bt('purge', PIC_ICON.bin, 'Delete the file for good', ' danger'));
+        }
       }
-      if (e.key !== 'Tab' && e.key !== 'Enter') return;
-      // Shift+Tab is "go back a field" and always was. Tab with no list open
-      // is too: a search box that swallowed Tab would be a keyboard trap.
-      if (e.key === 'Tab' && (e.shiftKey || !AC.open)) return;
+      return out.join('');
+    }
 
-      const p = acParse(snipSearch.value);
-      /* Tab completes: with nothing arrowed to it takes the top row, which is
-         what the key means everywhere else. Enter is stricter, because it also
-         has to mean "just search for what I typed" — it commits only a row
-         that was chosen, or one whose token carries an operator and therefore
-         cannot be prose. */
-      const at = AC.at >= 0 ? AC.at : (e.key === 'Tab' || p.op) ? 0 : -1;
-      if (at < 0) return;
-      const hit = AC.rows[at];
-      if (hit) { e.preventDefault(); return void acPick(hit.t, p.mode); }
-      if (!p.op || !p.term) return;
-      e.preventDefault();
-      toast('bad', 'No such tag', `Nothing in the vocabulary matches “${p.term}”.`, 3500);
-    });
+    /* ---- loading -----------------------------------------------------------
+       `kind` is the only difference from loadSnips(). Everything else — the
+       operators, the cursor, the count — is the same request. */
+    async function picLoad(b, { reset = false } = {}) {
+      if (b.loading) return;
+      b.loading = true;
+      if (reset) picClose(b, { silent: true });
+      const qs = new URLSearchParams({ kind: b.kind, include: 'lines', limit: '48' });
+      if (b.q) qs.set('q', b.q);
+      for (const t of b.tags) {
+        qs.append(t.mode === 'not' ? 'taglet_not'
+                : t.mode === 'or' ? 'taglet_any' : 'taglet', t.slug);
+      }
+      if (!reset && b.next) qs.set('before', b.next);
+      try {
+        const d = await api('/api/snippets?' + qs);
+        if (reset) { b.grid.innerHTML = ''; b.cache.clear(); }
+        for (const s of d.snippets) b.cache.set(s.id, s);
+        b.grid.insertAdjacentHTML('beforeend',
+          d.snippets.map((s) => picTile(b, s)).join(''));
+        b.next = d.next;
+        b.more.hidden = !d.next;
+        b.count.textContent = d.count
+          ? `${d.count} ${d.count === 1 ? b.one : b.many}` : '';
+        if (!b.grid.children.length) {
+          b.grid.innerHTML = `<div class="pics-empty">Nothing matches${
+            b.q || b.tags.length ? ' that filter' : ' yet'}.</div>`;
+        }
+        picWatch(b, d.snippets);
+      } catch (e) { offline(e); } finally { b.loading = false; }
+    }
 
-    snipAc.addEventListener('mousedown', (e) => {
-      // mousedown, not click: blur fires first and would close the list out
-      // from under the pointer before the click could land.
-      const row = e.target.closest('[data-ac]');
-      if (!row) return;
-      e.preventDefault();
-      const hit = AC.rows.find((h) => h.t.slug === row.dataset.ac);
-      if (hit) acPick(hit.t, acParse(snipSearch.value).mode);
-    });
+    /** Come back for the tiles that had nothing to show yet.
+     *
+     *  A still is finished the moment it lands — the server writes its
+     *  thumbnail in-process. A moving meme is not: the normalize worker gets
+     *  to it seconds later, and until it does the tile says "converting…".
+     *  Without this it says that until the panel is reloaded, which reads as
+     *  a thumbnail that never arrives rather than as one that is coming.
+     *
+     *  Bounded, and only ever asks about the tiles that are actually waiting.
+     *  A grid of four hundred settled pictures schedules nothing at all. */
+    function picWatch(b, rows, tries = 0) {
+      clearTimeout(b.watchT);
+      const waiting = (rows ?? [...b.cache.values()])
+        .filter((s) => !s.poster && (s.normalize_status === 'queued'
+                                  || s.normalize_status === 'running'));
+      if (!waiting.length || tries > 8) return;
+      b.watchT = setTimeout(async () => {
+        const still = [];
+        for (const s of waiting) {
+          let row = null;
+          try { row = (await api(`/api/snippets/${encodeURIComponent(s.id)}`))?.snippet ?? null; }
+          catch { /* the panel will find out on its next load */ }
+          if (!row) continue;
+          b.cache.set(row.id, row);
+          const el = b.grid.querySelector(`[data-pic="${CSS.escape(row.id)}"]`);
+          if (el && row.poster) el.outerHTML = picTile(b, row);
+          else if (!row.poster) still.push(row);
+        }
+        // Backing off, because the thing being waited on is an encode and the
+        // box doing it is the box being asked.
+        picWatch(b, still, tries + 1);
+      }, Math.min(1500 * (tries + 1), 8000));
+    }
 
-    snipSearch.addEventListener('blur', () => setTimeout(acClose, 120));
+    /** Repaint one tile from the server, leaving every other tile alone.
+     *
+     *  A verdict changes what a tile looks like and nothing about where it is.
+     *  Reloading the page to show that would scroll the reader back to the top
+     *  of a grid they were halfway down — which is the thing that makes a
+     *  reviewer stop using the grid and go to the queue instead. */
+    async function picRefresh(b, id) {
+      const el = b.grid.querySelector(`[data-pic="${CSS.escape(id)}"]`);
+      if (!el) return;
+      let row = null;
+      try { row = (await api(`/api/snippets/${encodeURIComponent(id)}`))?.snippet ?? null; }
+      catch { /* gone, or no longer visible to this reader */ }
+      if (!row) { el.remove(); if (b.open === id) picClose(b); return; }
+      b.cache.set(id, row);
+      el.outerHTML = picTile(b, row);
+      if (b.open === id) picOpenRow(b, id, { keep: true });
+    }
+
+    /* ---- the opened row ----------------------------------------------------
+       Full width, under the row the click was in. Inserted after the LAST tile
+       of that row rather than after the tile itself, which would leave the rest
+       of the row as a hole — the one line of arithmetic below is what every
+       image grid on the web does and it is worth it. */
+    function picClose(b, { silent = false } = {}) {
+      b.grid.querySelector('.pic-open')?.remove();
+      const was = b.open;
+      b.open = null;
+      if (was && !silent) {
+        b.grid.querySelector(`[data-pic="${CSS.escape(was)}"]`)?.focus?.();
+      }
+    }
+
+    function picOpenRow(b, id, { keep = false } = {}) {
+      const tile = b.grid.querySelector(`[data-pic="${CSS.escape(id)}"]`);
+      const s = b.cache.get(id);
+      if (!tile || !s) return;
+      b.grid.querySelector('.pic-open')?.remove();
+      b.open = id;
+
+      const tiles = [...b.grid.querySelectorAll('.pic')];
+      /* The column count, read off the grid rather than guessed from a
+         breakpoint: `auto-fill` decides it from the container's width, so the
+         only place the real answer exists is the computed style. */
+      const cols = Math.max(1,
+        getComputedStyle(b.grid).gridTemplateColumns.split(' ').filter(Boolean).length);
+      const i = tiles.indexOf(tile);
+      const last = tiles[Math.min(tiles.length - 1, i - (i % cols) + cols - 1)] ?? tile;
+      last.insertAdjacentHTML('afterend', picOpenHtml(b, s));
+      if (!keep) {
+        const row = b.grid.querySelector('.pic-open');
+        row?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        row?.querySelector('.pic-open-x')?.focus?.();
+      }
+    }
+
+    function picOpenHtml(b, s) {
+      const canEd = !!ME.can?.edit;
+      const dims = s.width && s.height ? `${s.width} × ${s.height}` : null;
+      /* A moving meme gets a real player here and nowhere else. On the tile it
+         would be forty videos on one screen, which is forty range requests
+         against the NAS for pictures nobody has clicked. */
+      const moving = !s.still;
+      const media = moving
+        ? `<video src="${esc(s.video)}" ${s.poster ? `poster="${esc(s.poster)}"` : ''}
+             controls loop playsinline preload="metadata"></video>`
+        : `<img src="${esc(s.video)}" alt="${esc(s.title || '')}" decoding="async">`;
+
+      const rows = [
+        ['added', s.added_at ? muDate(s.added_at) : null],
+        ['size', dims],
+        ['runs', s.duration_s > 0 ? dur(s.duration_s) : null],
+        ['source', s.source || null],
+        ['from', s.source_url || null],
+      ].filter(([, v]) => v);
+
+      /* Whatever words are ON the picture. Written by the OCR pass into the
+         same column a clip's speech goes in, so it is searched by the index
+         that already exists and corrected by the editor that already exists —
+         there is no second "caption" field to disagree with it. */
+      const said = (s.lines ?? []).map((l) => l.text).join(' ').trim();
+
+      return `<div class="pic-open" data-picopen="${esc(s.id)}" data-snip="${esc(s.id)}">
+        <div class="pic-open-img">${media}</div>
+        <div class="pic-open-side">
+          <div class="pic-open-t${s.title ? '' : ' is-none'}" title="${esc(s.title || '')}"
+            >${esc(s.title || 'No description')}</div>
+          ${rows.length ? `<div class="pic-open-meta">${rows.map(([k, v]) =>
+            `<b>${esc(k)}</b><span>${esc(v)}</span>`).join('')}</div>` : ''}
+          <div class="snip-tags">${snipStrip(s)}</div>
+          ${said ? `<div class="snip-tr">${esc(said)}</div>` : ''}
+          <div class="pic-open-acts">${picActs(b, s)}</div>
+        </div>
+        <button class="pic-open-x" type="button" data-picclose
+          title="Close (Esc)" aria-label="Close"><svg width="13" height="13"
+          viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+          ><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+      </div>`;
+    }
+
+    /* ---- the verbs ---------------------------------------------------------
+       Every one of them is an endpoint the clip list already calls. Nothing
+       here is a picture-specific route, because a picture is a row in the same
+       table and the decisions about it are the same decisions. */
+    async function picVerb(b, id, act) {
+      const tile = b.grid.querySelector(`[data-pic="${CSS.escape(id)}"]`);
+      const s = b.cache.get(id);
+      if (!s) return;
+
+      if (act === 'link') {
+        /* `share` when the server offered one — a URL that ends in .png, which
+           is what an unfurler looks at and what a Save-image-as offers as the
+           name. A moving meme has no unambiguous extension, so it falls back
+           to the archive's own page for the row. */
+        const url = s.share ? location.origin + s.share : momentUrl(s.id);
+        const ok = await copyText(url);
+        return void (ok
+          ? toast('ok', 'Link copied', url, 2600)
+          : toast('warn', 'Could not copy', url, 6000));
+      }
+
+      tile?.classList.add('is-working');
+      let r;
+      try {
+        r = act === 'purge'
+          ? await apiPost(`/api/snippets/${encodeURIComponent(id)}/purge`, {})
+          : await apiPost('/api/snippets/review', { ids: [id], decision:
+              act === 'approve' || act === 'relist' ? 'approve' : 'reject' });
+      } catch (e) { r = { status: 0, body: { error: e.message } }; }
+      tile?.classList.remove('is-working');
+
+      if (r.status >= 300 || !r.status) {
+        return void toast('bad', 'That did not go through',
+                          r.body?.error ?? 'the archive said no', 5000);
+      }
+      if (act === 'purge') {
+        tile?.remove();
+        if (b.open === id) picClose(b, { silent: true });
+        b.cache.delete(id);
+        return void toast('ok', 'Deleted', 'The file is gone.', 3000);
+      }
+      await picRefresh(b, id);
+    }
+
+    /* The debounced repaint after an upload lands. Same shape and the same
+       reason as loadSnipsSoon(): the row is visible to its submitter the
+       moment the POST answers, and a grid that did not show it would look
+       like the upload had gone nowhere. */
+    const picSoonT = {};
+    function picLoadSoon(kind) {
+      const b = PIC_BOARDS[kind];
+      if (!b || !b.booted) return;
+      clearTimeout(picSoonT[kind]);
+      picSoonT[kind] = setTimeout(() => {
+        if (b.loading) return picLoadSoon(kind);
+        picLoad(b, { reset: true });
+      }, 1200);
+    }
+
+    /* ---- wiring ------------------------------------------------------------ */
+    function picMount(b) {
+      bindSearch({
+        input: document.getElementById(`${b.pre}-search`),
+        ac: document.getElementById(`${b.pre}-ac`),
+        state: b,
+        tagSet: (t, m) => picTagSet(b, t, m),
+        tagDrop: (slug) => picTagDrop(b, slug),
+        load: () => picLoad(b, { reset: true }),
+      });
+
+      b.grid.addEventListener('click', (e) => {
+        const drop = e.target.closest('[data-tldrop]');
+        if (drop) return void picTagDrop(b, drop.dataset.tldrop);
+
+        const act = e.target.closest('[data-picact]');
+        if (act) {
+          e.stopPropagation();
+          // The download is a real link and stays one: an <a download> gives
+          // the browser's own save dialog, which a fetch cannot.
+          if (act.dataset.picact === 'dl') return;
+          e.preventDefault();
+          const owner = act.closest('[data-pic], [data-picopen]');
+          const id = owner?.dataset.pic ?? owner?.dataset.picopen;
+          return void (id && picVerb(b, id, act.dataset.picact));
+        }
+        if (e.target.closest('[data-picclose]')) return void picClose(b);
+
+        /* A tag chip inside the opened row filters THIS panel. Shift is
+           exclude, matching the clip list — the modifier means the same thing
+           in both places or it means nothing in either. */
+        const tl = e.target.closest('[data-tl]');
+        if (tl) {
+          e.stopPropagation();
+          const t = { slug: tl.dataset.tl, name: tl.textContent.trim(),
+                      kind: tl.dataset.kind };
+          return void picTagSet(b, t, e.shiftKey ? 'not' : 'and', { toggle: true });
+        }
+
+        const tile = e.target.closest('.pic');
+        if (!tile) return;
+        if (b.open === tile.dataset.pic) return void picClose(b);
+        picOpenRow(b, tile.dataset.pic);
+      });
+
+      b.grid.addEventListener('keydown', (e) => {
+        const tile = e.target.closest('.pic');
+        if (!tile || (e.key !== 'Enter' && e.key !== ' ')) return;
+        e.preventDefault();
+        if (b.open === tile.dataset.pic) picClose(b);
+        else picOpenRow(b, tile.dataset.pic);
+      });
+
+      /* Escape closes the opened row, from anywhere inside the panel. The ×
+         takes focus when the row opens, so this is reachable without the
+         mouse having to find it again. */
+      b.panel.addEventListener('keydown', (e) => {
+        if (e.key !== 'Escape' || !b.open) return;
+        e.stopPropagation();
+        picClose(b);
+      });
+
+      b.filters.addEventListener('click', (e) => {
+        if (e.target.closest('[data-tlclear]')) {
+          b.tags = [];
+          picPaintFilters(b);
+          return void picLoad(b, { reset: true });
+        }
+        const drop = e.target.closest('[data-tldrop]');
+        if (drop) return void picTagDrop(b, drop.dataset.tldrop);
+        const mode = e.target.closest('[data-tlmode]');
+        if (!mode) return;
+        // Click cycles and → or → not → off, the same order the chip's own
+        // title says it will.
+        const NEXT = { and: 'or', or: 'not', not: null };
+        const cur = b.tags.find((t) => t.slug === mode.dataset.tlmode);
+        if (!cur) return;
+        const next = NEXT[cur.mode];
+        if (!next) return void picTagDrop(b, cur.slug);
+        cur.mode = next;
+        picPaintFilters(b);
+        picLoad(b, { reset: true });
+      });
+
+      /* Tagging, detaching and canonizing a suggestion, on the opened row.
+         The same binding the clip list and the review queue get, because it is
+         the same vocabulary hung on the same table — a gallery that could not
+         be tagged would be a gallery nothing could be found in. */
+      bindSnipEditing(b.grid);
+
+      new IntersectionObserver((entries) => {
+        for (const e of entries) {
+          if (e.isIntersecting && b.next && !b.loading) picLoad(b);
+        }
+      }, { root: null, rootMargin: '600px 0px', threshold: 0 }).observe(b.more);
+
+      document.getElementById(b.tabId).addEventListener('click', () => {
+        if (b.booted) return;
+        b.booted = true;
+        picLoad(b, { reset: true });
+      });
+    }
+
+    for (const [kind, cfg] of Object.entries({
+      meme: { pre: 'meme', gridId: 'grid-memes', panelId: 'panel-memes',
+              tabId: 'tab-memes', one: 'meme', many: 'memes' },
+      gallery: { pre: 'gal', gridId: 'grid-images', panelId: 'panel-images',
+                 tabId: 'tab-images', one: 'picture', many: 'pictures' },
+    })) picMount(picBoard(kind, cfg));
 
     /* ---- the upload window -------------------------------------------------
        Anchored under the Add-clip button, floating over the list, and it never
@@ -14202,6 +16291,44 @@
        instead of after it, which is the entire point of the shape. */
     const upWin = document.getElementById('up-win');
     const upBtn = document.getElementById('snip-upload');
+    /* One window, three ways in. The flow is identical for all three — bytes
+       first, name and tags after — so a second copy of it for pictures would
+       have been a second copy of the drag handling, the progress meter, the
+       duplicate card and the per-item form, to change four strings and an
+       `accept` attribute. What varies lives in UP_COPY below; the window is
+       re-dressed on open and anchored under whichever button was pressed. */
+    const UP_BTN = {
+      snippet: upBtn,
+      meme: document.getElementById('meme-upload'),
+      gallery: document.getElementById('gal-upload'),
+    };
+    const UP_BADGE = {
+      snippet: document.getElementById('up-n'),
+      meme: document.getElementById('meme-n'),
+      gallery: document.getElementById('gal-n'),
+    };
+    /* Pictures have no link row, and that is the archive's shape rather than
+       an omission: only a snippet can be fetched from a URL. A row that
+       accepted a link and then had the server refuse the kind would be a
+       control that exists to disappoint. */
+    const UP_COPY = {
+      snippet: { title: 'Add to the archive', drop: 'Drop a snippet here',
+                 accept: 'video/*,audio/*', links: true,
+                 hint: 'youtube · twitch · x.com',
+                 limits: 'up to 10 minutes · 200 MB<br>links from youtube, twitch, '
+                         + 'twitter / X, and images from discord',
+                 maxBytes: 200 * 1024 * 1024, maxS: 600 },
+      meme: { title: 'Add a meme', drop: 'Drop a meme here',
+              accept: 'image/png,image/jpeg,image/webp,image/gif,video/*', links: true,
+              hint: 'right-click an image in discord → copy link',
+              limits: 'png · jpeg · webp · gif · short video<br>up to 60 seconds · 25 MB',
+              maxBytes: 25 * 1024 * 1024, maxS: 60 },
+      gallery: { title: 'Add a picture', drop: 'Drop a picture here',
+                 accept: 'image/png,image/jpeg,image/webp,image/gif,video/*', links: true,
+                 hint: 'right-click an image in discord → copy link',
+                 limits: 'png · jpeg · webp · gif<br>up to 25 MB',
+                 maxBytes: 25 * 1024 * 1024, maxS: 60 },
+    };
     const upQ = document.getElementById('up-q');
     const upEmpty = document.getElementById('up-empty');
     const upDrop = document.getElementById('up-drop');
@@ -14214,10 +16341,14 @@
       moved: false,        // dragged by hand: stop following the button
       items: new Map(),    // local key -> record
       seq: 0,
+      kind: 'snippet',     // which collection this session of the window feeds
     };
 
-    const UP_MAX_BYTES = 200 * 1024 * 1024;
-    const UP_MAX_S = 600;
+    /* Both caps again on this side, per collection, matching the server's own
+       table. Only so a 900 MB file is refused in the same second it is chosen
+       rather than after four minutes of uploading it — the server is the one
+       that decides. */
+    const upCap = () => UP_COPY[UP.kind];
 
     /* The height has to be measured from wherever the window's top ended up,
        not from the viewport. A fixed `max-height: 78vh` is right for a window
@@ -14239,7 +16370,7 @@
     function upPlace() {
       if (window.innerWidth <= 560) { upWin.style.maxHeight = ''; return; }
       if (!UP.moved) {
-        const r = upBtn.getBoundingClientRect();
+        const r = (UP_BTN[UP.kind] ?? upBtn).getBoundingClientRect();
         const w = upWin.offsetWidth || 424;
         // Right-aligned to the button, because the button is at the right end
         // of the toolbar and a left-aligned window would hang off the page.
@@ -14250,29 +16381,88 @@
       upFit();
     }
 
-    function upOpen() {
-      if (UP.open) return;
+    /** Re-dress the window for a collection.
+     *
+     *  Called on every open rather than once, because the same window serves
+     *  three buttons and the one thing worse than the wrong label is the wrong
+     *  `accept` filter — a file chooser offering videos to somebody adding a
+     *  reaction face. */
+    function upDress() {
+      const c = upCap();
+      upWin.dataset.kind = UP.kind;
+      upWin.querySelector('.up-title').textContent = c.title;
+      upWin.querySelector('.up-drop-t b').textContent = c.drop;
+      document.getElementById('up-file').setAttribute('accept', c.accept);
+      upWin.querySelector('.up-limits').innerHTML = c.limits;
+      for (const el of upWin.querySelectorAll('.up-or, .up-link-row')) el.hidden = !c.links;
+      /* The placeholder is the instruction. On a picture the link that works
+         is not the one people reach for first — "Copy Message Link" is right
+         next to it in the same menu and gives something with no file in it. */
+      document.getElementById('up-url').placeholder = c.hint ?? '';
+      /* And WHICH channels, by the names the archive was given. Said here
+         rather than discovered by pasting a link and getting a 403 — the list
+         is short, it is the answer to "can I take this one", and a control
+         that only tells you its rules after you break them is a control
+         people stop using. */
+      const chans = document.getElementById('up-chan');
+      if (chans) {
+        const list = ME.discord ?? [];
+        chans.hidden = !c.links;
+        /* Whoever holds `link.any` is not bound by the list, so telling them
+           what it contains would be telling them a rule that is not theirs.
+           They are told what it means for everybody else instead, because
+           they are usually the person maintaining it. */
+        const any = !!ME.can?.['link.any'];
+        chans.innerHTML = any
+          ? `You can link a picture from any Discord channel.${list.length
+              ? ` Everyone else is limited to ${list.length} named `
+                + `channel${list.length === 1 ? '' : 's'}.`
+              : ' Nobody else can link one at all — no channels are named yet.'}`
+          : !list.length
+            ? '<b>Discord links are off.</b> Nobody has named a channel they may '
+              + 'come from, so any picture link would be an upload from anywhere.'
+            : `Pictures from ${list.map((x) => `<b>${esc(x)}</b>`).join(', ')}.`;
+      }
+      /* Only this collection's cards. A meme you added two minutes ago has no
+         business in the list under the Snippets button — the window says
+         "yours", and yours in THIS panel is what it has to mean. */
+      for (const it of UP.items.values()) it.el.hidden = it.kind !== UP.kind;
+      upCount();
+    }
+
+    function upOpen(kind = UP.kind) {
+      const same = UP.open && kind === UP.kind;
+      UP.kind = UP_COPY[kind] ? kind : 'snippet';
+      if (same) return;
+      // A window dragged into place for one collection should not follow the
+      // next button; a window that has never been dragged should.
+      upDress();
       upWin.hidden = false;
       upPlace();
       // One frame between `hidden = false` and `.open` or the transition has
       // nothing to animate from — display:none cancels it outright.
       requestAnimationFrame(() => upWin.classList.add('open'));
       UP.open = true;
-      upBtn.setAttribute('aria-expanded', 'true');
-      document.getElementById('up-url')?.focus?.();
+      for (const [k, b] of Object.entries(UP_BTN)) {
+        b?.setAttribute('aria-expanded', String(k === UP.kind));
+      }
+      (upCap().links ? document.getElementById('up-url') : null)?.focus?.();
     }
 
     function upClose() {
       if (!UP.open) return;
       upWin.classList.remove('open');
       UP.open = false;
-      upBtn.setAttribute('aria-expanded', 'false');
+      for (const b of Object.values(UP_BTN)) b?.setAttribute('aria-expanded', 'false');
       setTimeout(() => { if (!UP.open) upWin.hidden = true; }, 210);
     }
 
-    const upToggle = () => (UP.open ? upClose() : upOpen());
+    const upToggle = (kind) =>
+      (UP.open && kind === UP.kind ? upClose() : upOpen(kind));
 
-    upBtn.addEventListener('click', upToggle);
+    for (const [kind, b] of Object.entries(UP_BTN)) {
+      b?.addEventListener('click', () => upToggle(kind));
+    }
     document.getElementById('up-close').addEventListener('click', upClose);
     // Escape closes it, but only when nothing inside is mid-sentence — the
     // transcript box is a textarea people paste into, and losing the window
@@ -14419,7 +16609,11 @@
     /* Checked here so a Vimeo link is refused in the same second rather than
        after a round trip — the server checks it again, and the recorder checks
        it a third time against the allowlist that actually matters. */
-    const UP_HOSTS = /(?:^|\.)(?:youtube\.com|youtu\.be|twitch\.tv|twitter\.com|x\.com|discord\.com)$/i;
+    /* `cdn.discordapp.com`, not `discord.com`. A message link carries no file
+       — resolving one needs a bot in that server — while the attachment URL
+       Discord's own right-click "Copy Link" gives you is a plain signed file
+       the recorder downloads directly. */
+    const UP_HOSTS = /(?:^|\.)(?:youtube\.com|youtu\.be|twitch\.tv|twitter\.com|x\.com|cdn\.discordapp\.com|media\.discordapp\.net)$/i;
     async function upTakeUrl() {
       const box = document.getElementById('up-url');
       const raw = box.value.trim();
@@ -14428,14 +16622,20 @@
       let host = '';
       try { host = new URL(raw).hostname; } catch { /* not a URL at all */ }
       if (!host || !UP_HOSTS.test(host)) {
+        /* Discord gets its own sentence, because the wrong one is the one
+           people reach for: a message link is what you get from "Copy Message
+           Link" and it is not a file. */
         return toast('bad', 'Not a supported link',
-          'youtube, twitch, twitter / X and supported discord servers.');
+          /discord/i.test(host)
+            ? 'Right-click the image itself and Copy Link — a message link has '
+              + 'no file in it.'
+            : 'youtube, twitch, twitter / X, and images from discord.', 6000);
       }
       box.value = '';
       const it = upRow({ name: raw.replace(/^https?:\/\//, '').slice(0, 60), link: true });
       upState(it, 'asking the recorder…');
 
-      const r = await apiPost('/api/uploads/link', { url: raw });
+      const r = await apiPost('/api/uploads/link', { url: raw, kind: it.kind });
       if (r.status === 409) {
         it.el.classList.add('done');
         return upDupe(it, r.body ?? {}, 'that link is already in the archive');
@@ -14502,7 +16702,8 @@
          was below the fold of a window you had to scroll every single time. */
       upQ.prepend(el);
       upEmpty.hidden = true;
-      const it = { key, el, name, id: null, tags: [], auto: true, sent: false, xhr: null };
+      const it = { key, el, name, id: null, kind: UP.kind, tags: [], auto: true,
+                   sent: false, xhr: null };
       UP.items.set(key, it);
       upCount();
       return it;
@@ -14514,11 +16715,17 @@
       if (cls) it.el.classList.add(cls);
     }
 
+    /* One badge per button, each counting its OWN collection. A single number
+       on three buttons would tell the Memes button about a clip. */
     function upCount() {
-      const n = [...UP.items.values()].filter((i) => !i.sent).length;
-      upBadge.hidden = !n;
-      upBadge.textContent = String(n);
-      upEmpty.hidden = UP.items.size > 0;
+      for (const [kind, badge] of Object.entries(UP_BADGE)) {
+        if (!badge) continue;
+        const n = [...UP.items.values()]
+          .filter((i) => !i.sent && i.kind === kind).length;
+        badge.hidden = !n;
+        badge.textContent = String(n);
+      }
+      upEmpty.hidden = [...UP.items.values()].some((i) => i.kind === UP.kind);
     }
 
     function upForget(it) {
@@ -14538,14 +16745,22 @@
       // Both caps again on this side. The server enforces them for real — this
       // is only so a 900 MB file is refused in the same second it is chosen
       // rather than after four minutes of uploading it.
-      if (file.size > UP_MAX_BYTES) {
-        upState(it, `too big — ${(file.size / 1048576).toFixed(0)} MB, the cap is 200 MB`, 'sad');
+      const cap = upCap();
+      if (file.size > cap.maxBytes) {
+        upState(it, `too big — ${(file.size / 1048576).toFixed(0)} MB, the cap is `
+          + `${Math.round(cap.maxBytes / 1048576)} MB`, 'sad');
         it.el.classList.add('done');
         return;
       }
-      const secs = await upDuration(file).catch(() => null);
-      if (secs && secs > UP_MAX_S + 1) {
-        upState(it, `too long — ${dur(secs)}, the cap is 10 minutes`, 'sad');
+      /* Skipped for a still, which has no duration to read — and asking for
+         one means handing a PNG to a <video> element, which fails, which is
+         caught, which is a wasted round trip through an error path on every
+         single picture. */
+      const secs = /^image\//.test(file.type) && file.type !== 'image/gif'
+        ? null : await upDuration(file).catch(() => null);
+      if (secs && secs > cap.maxS + 1) {
+        upState(it, `too long — ${dur(secs)}, the cap is ${cap.maxS >= 120
+          ? `${Math.round(cap.maxS / 60)} minutes` : `${cap.maxS} seconds`}`, 'sad');
         it.el.classList.add('done');
         return;
       }
@@ -14580,6 +16795,10 @@
       it.xhr = x;
       x.open('POST', '/api/uploads');
       x.setRequestHeader('content-type', file.type || 'application/octet-stream');
+      // Which collection. A header rather than a query string for the same
+      // reason the name is one: the body is the file and the URL is shared
+      // with the browser's own history.
+      x.setRequestHeader('x-upload-kind', it.kind ?? 'snippet');
       // Display text only — the server names the file itself. Latin-1 header
       // encoding means a non-ASCII filename throws on setRequestHeader, and
       // the name is cosmetic, so it is dropped rather than defended.
@@ -14628,7 +16847,10 @@
     function upLanded(it, snip) {
       it.id = snip.id;
       it.el.classList.add('done');
-      it.el.querySelector('.up-name').textContent = snip.title;
+      /* A picture arrives with no title — the filename it came from is the
+         only thing anybody can use to tell one card from another until a
+         description is typed. */
+      it.el.querySelector('.up-name').textContent = snip.title || it.name;
       upThumb(it, snip);
       /* The form opens regardless. Typing a title is not blocked on ffmpeg,
          and making somebody wait for an encode before they can name the thing
@@ -14636,8 +16858,10 @@
          requests in the first place. */
       upFormFor(it, snip);
       upWatch(it, snip);
-      // It is visible to this person now, so the list should show it now.
-      loadSnipsSoon();
+      // It is visible to this person now, so the list should show it now —
+      // whichever list that is.
+      if (snip.kind && snip.kind !== 'snippet') picLoadSoon(snip.kind);
+      else loadSnipsSoon();
     }
 
     function upThumb(it, snip) {
@@ -14715,13 +16939,31 @@
     /* ---- the form ---------------------------------------------------------- */
 
     function upFormFor(it, snip) {
+      /* A clip and a picture want different things from this form, and the
+         difference is not cosmetic.
+
+         A clip NEEDS a title: it is a row in a list of a thousand and the
+         title is the only handle anyone has on it, so the field arrives
+         pre-filled with whatever the filename suggested. A picture is a tile
+         you can see. Its filename is `IMG_20260910_142311`, and pre-filling
+         that produced a row labelled with gibberish that read as a name
+         somebody had chosen. So the field starts EMPTY, says description, and
+         may be left alone.
+
+         And a picture gets no transcribe switch. Whisper is never queued for
+         a row with no audio track, so the switch promised something that
+         could not happen — and its `on` state clears the transcript, which on
+         a picture is what OCR wrote there. */
+      const pic = it.kind && it.kind !== 'snippet';
       const f = document.createElement('div');
       f.className = 'up-form';
       f.innerHTML = `
         <div class="up-f">
-          <label class="up-lb" for="upt-${it.key}">Title</label>
+          <label class="up-lb" for="upt-${it.key}">${
+            pic ? 'Description <span class="up-opt">(optional)</span>' : 'Title'}</label>
           <input type="text" id="upt-${it.key}" maxlength="300" data-uptitle
-                 value="${esc(snip.title ?? '')}" placeholder="What happens in it">
+                 value="${pic ? '' : esc(snip.title ?? '')}" placeholder="${
+                   pic ? 'add a short description…' : 'What happens in it'}">
         </div>
         <div class="up-f">
           <label class="up-lb">Taglets</label>
@@ -14731,7 +16973,10 @@
           </div>
           <div data-upac></div>
         </div>
-        <div class="up-f">
+        ${pic ? `<div class="up-f">
+          <div class="up-note2">Any words ON the picture are read for you, so a
+            meme can be found by what it says.</div>
+        </div>` : `<div class="up-f">
           <div class="up-sw-row">
             <label class="up-lb">Transcribe it for me</label>
             <button class="up-sw" type="button" role="switch" aria-checked="true"
@@ -14740,7 +16985,7 @@
           <div class="up-note2" data-upnote>We will run it through whisper after it is approved.</div>
           <textarea data-uptr rows="4" hidden
             placeholder="Paste what is said, if you already have it"></textarea>
-        </div>
+        </div>`}
         <div class="up-foot2">
           <span class="up-why" data-upwhy></span>
           <button class="up-send" type="button" data-upsend>Save</button>
@@ -14869,7 +17114,10 @@
       });
       box.addEventListener('click', (e) => { if (!e.target.closest('button')) tagIn.focus(); });
 
-      sw.addEventListener('click', () => {
+      /* Absent on a picture. Guarded rather than branched on the kind again —
+         what this block is about is the switch, and "there is no switch" is
+         the honest condition for skipping it. */
+      sw?.addEventListener('click', () => {
         it.auto = !it.auto;
         sw.setAttribute('aria-checked', String(it.auto));
         ta.hidden = it.auto;
@@ -14887,10 +17135,14 @@
     }
 
     async function upSave(it, f) {
+      const pic = it.kind && it.kind !== 'snippet';
       const send = f.querySelector('[data-upsend]');
       const why = f.querySelector('[data-upwhy]');
       const title = f.querySelector('[data-uptitle]').value.trim();
-      if (!title) {
+      /* Only a clip. On a picture the field is a description, and having
+         nothing to say about a reaction face is the normal case rather than
+         an unfinished form. The server holds the same line. */
+      if (!title && !pic) {
         why.textContent = 'it needs a title'; why.classList.add('bad');
         return f.querySelector('[data-uptitle]').focus();
       }
@@ -14901,8 +17153,13 @@
          only the known ones here would silently drop exactly the names the
          person went to the trouble of typing. */
       const body = { title, taglets: it.tags.map((t) => (t.ok ? t.slug : t.name)) };
-      if (it.auto) body.auto_transcribe = true;
-      else body.transcript = f.querySelector('[data-uptr]').value;
+      /* Neither field on a picture. There is no switch to read and no textarea
+         to read it from — and `auto_transcribe: true` would clear the
+         transcript, which on a picture is where OCR puts the words. */
+      if (!pic) {
+        if (it.auto) body.auto_transcribe = true;
+        else body.transcript = f.querySelector('[data-uptr]').value;
+      }
 
       const r = await fetch(`/api/uploads/${encodeURIComponent(it.id)}`, {
         method: 'PATCH',
@@ -14926,9 +17183,23 @@
 
       it.sent = true;
       upState(it, 'saved — an editor will look at it');
+      /* The card goes back to showing what it knows: the description if one
+         was written, otherwise the file it came from. Blank would be worse
+         than either — the row is still about a specific upload. */
+      const named = it.el.querySelector('.up-name');
+      if (named) named.textContent = title || it.name;
       f.remove();
       upCount();
-      loadSnips({ reset: true });
+      /* The collection this went INTO, not whichever one the Snippets panel
+         happens to be showing. This was `loadSnips()` unconditionally, which
+         is why a meme's tags and description only appeared after a reload:
+         the save refreshed a list the picture was not in. */
+      if (pic) {
+        const b = PIC_BOARDS[it.kind];
+        // `booted` too, or opening the tab afterwards fetches the same page
+        // again on top of the one this just drew.
+        if (b) { b.booted = true; picLoad(b, { reset: true }); }
+      } else loadSnips({ reset: true });
     }
 
     /* ---- withdrawing ------------------------------------------------------- */
@@ -14990,7 +17261,7 @@
         const snip = snipCache.get(id);
         return void (async () => {
           try {
-            await navigator.clipboard.writeText(url);
+            if (!await copyText(url)) throw new Error('no clipboard');
             /* Says what the link WILL do, because that is the part somebody is
                about to be wrong about. A proposed clip has an address that
                works perfectly for its author and 404s for the person they are
@@ -15765,7 +18036,12 @@
       try {
         const fresh = (await api(`/api/snippets/${id}`)).snippet;
         snipCache.set(id, fresh);
-        for (const row of document.querySelectorAll(`.snip[data-snip="${CSS.escape(id)}"]`)) {
+        // The picture boards keep their own row caches, so that a Snippets
+        // reload — which clears snipCache — cannot leave an open meme with no
+        // record behind it. Both get the fresh copy.
+        for (const b of picBoards()) if (b.cache.has(id)) b.cache.set(id, fresh);
+        for (const row of document.querySelectorAll(
+               `.snip[data-snip="${CSS.escape(id)}"], .pic-open[data-snip="${CSS.escape(id)}"]`)) {
           const strip = row.querySelector('.snip-tags');
           if (!strip) continue;
           /* The row knows whether it is a review row — snipRowHtml stamps `rv`
@@ -15942,9 +18218,9 @@
         const sg = e.target.closest('[data-tlsugg]');
         if (sg && ME.can?.edit) {
           e.preventDefault(); e.stopPropagation();
-          const sid = sg.closest('.snip')?.dataset.snip;
+          const sid = sg.closest('.snip, .pic-open')?.dataset.snip;
           if (!sid) return;
-          return void openTagletPicker(sg, sid, snipCache.get(sid)?.taglets ?? [],
+          return void openTagletPicker(sg, sid, rowOf(sid)?.taglets ?? [],
             { seed: sg.dataset.tlsugg });
         }
       });
@@ -15953,13 +18229,18 @@
         const add = e.target.closest('[data-tradd]');
         if (add && ME.can?.edit) { e.preventDefault(); return void snipAddLine(add); }
       });
+      /* `.snip, .pic-open` because a picture's tags are edited from its opened
+         row, which is not a clip row and should not pretend to be one. Same
+         handler, same endpoints, same changeset — the collection a tag is
+         being hung on has never been this code's business. */
       list.addEventListener('click', (e) => {
         const rm = e.target.closest('[data-tlrm]');
         if (rm) {
           e.stopPropagation();
-          const row = rm.closest('.snip');
+          const row = rm.closest('.snip, .pic-open');
+          if (!row) return;
           const id = row.dataset.snip;
-          const link = snipCache.get(id)?.taglets?.find((t) => t.id === rm.dataset.tlrm);
+          const link = rowOf(id)?.taglets?.find((t) => t.id === rm.dataset.tlrm);
           // The junction row is what gets deleted, and its id is not the
           // taglet's — ask the server which one joins these two.
           return void api(`/api/snippets/${id}`).then((d) => {
@@ -15974,9 +18255,10 @@
         const add = e.target.closest('[data-tladd]');
         if (add) {
           e.stopPropagation();
-          const row = add.closest('.snip');
+          const row = add.closest('.snip, .pic-open');
+          if (!row) return;
           const id = row.dataset.snip;
-          openTagletPicker(add, id, snipCache.get(id)?.taglets ?? []);
+          openTagletPicker(add, id, rowOf(id)?.taglets ?? []);
         }
       }, true);
     }
@@ -16096,7 +18378,14 @@
     async function loadReview({ reset = false } = {}) {
       if (RV.loading) return;
       RV.loading = true;
-      const qs = new URLSearchParams({ status: RV.view, include: 'lines', limit: '50' });
+      /* `kind=all`, and it is not an enhancement — it is what makes an
+         uploaded meme approvable at all. The list route answers `snippet`
+         when nothing is asked for, which keeps every existing caller
+         answering what it did before pictures existed; the queue is the one
+         caller that must see all three, because it is the only place a
+         verdict is given. */
+      const qs = new URLSearchParams({ status: RV.view, kind: 'all',
+                                       include: 'lines', limit: '50' });
       if (!reset && RV.next) qs.set('before', RV.next);
       try {
         /* Songs on the first page only, and all of them at once. There are
@@ -16148,7 +18437,7 @@
         if (!rvRows().length) {
           rvList.innerHTML = `<div class="snips-empty">${
             RV.view === 'proposed'
-              ? 'Nothing queued. Every clip and every song has been through here.'
+              ? 'Nothing queued. Every clip, picture and song has been through here.'
               : 'Nothing has been removed. Published snippets live in the '
                 + 'Snippets panel, not here.'}</div>`;
         }
@@ -16873,10 +19162,12 @@
       if (act === 'copy') {
         /* The YouTube link, not this page's — the point is sharing the song
            with somebody who has never heard of this archive. */
-        if (navigator.clipboard) navigator.clipboard.writeText(m.url).catch(() => {});
         const b = e.target.closest('[data-muact]');
-        b.classList.add('copied');
-        setTimeout(() => b.classList.remove('copied'), 1200);
+        copyText(m.url).then((ok) => {
+          if (!ok) return void toast('warn', 'Could not copy', m.url, 6000);
+          b.classList.add('copied');
+          setTimeout(() => b.classList.remove('copied'), 1200);
+        });
         return;
       }
 
@@ -17471,10 +19762,12 @@
       const m = row?.dataset.mu ? muCache.get(row.dataset.mu) : null;
       if (m && e.target.closest('[data-muplay]')) return void muPlay(m);
       if (m && e.target.closest('[data-muact="copy"]')) {
-        if (navigator.clipboard) navigator.clipboard.writeText(m.url).catch(() => {});
         const b = e.target.closest('[data-muact]');
-        b.classList.add('copied');
-        setTimeout(() => b.classList.remove('copied'), 1200);
+        copyText(m.url).then((ok) => {
+          if (!ok) return void toast('warn', 'Could not copy', m.url, 6000);
+          b.classList.add('copied');
+          setTimeout(() => b.classList.remove('copied'), 1200);
+        });
         return;
       }
       if (row && !e.target.closest('[data-rvtitle]')) rvFocus(rvRows().indexOf(row));

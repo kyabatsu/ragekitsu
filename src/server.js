@@ -5,7 +5,7 @@
 // decision only ever changes through an applied changeset. There is no PATCH.
 
 import express from 'express';
-import { createHash } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import {
   createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync,
@@ -13,7 +13,7 @@ import {
 } from 'node:fs';
 import { setPriority } from 'node:os';
 import { createGunzip } from 'node:zlib';
-import { dirname, extname, join, resolve, sep } from 'node:path';
+import { basename, dirname, extname, join, resolve, sep } from 'node:path';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
@@ -25,10 +25,13 @@ import {
 } from './db.js';
 import {
   ALL_KINDS, ChangeError, KINDS,
-  apply, axisToPosition, buildTimeline, clocksOf, pinned,
-  classifyMedia, deepLink, hms, moovFirst, normalizeArgs, overBitrate, pcmArgs,
+  apply, axisOf, axisToPosition, buildSrt, buildTimeline, clocksOf,
+  parsePhoneLine, pinned,
+  KIND_DIR, MODEL_CATALOG, MODEL_TASK, MODEL_TASKS, SNIPPET_KINDS, modelInfo,
+  classifyMedia, deepLink, hms, isStill, moovFirst, normalizeArgs,
+  overBitrate, pcmArgs,
   peaksFromPcm, posterArgs, probeMedia, projectNote, propose, recompute, reject,
-  resolveMedia, wavePosterArgs,
+  resolveMedia, stillPosterArgs, wavePosterArgs,
   servedType, sourcesFor, stale, summary, thumbFor, watchSources,
 } from './archive.js';
 import {
@@ -75,11 +78,43 @@ export const CONFIG = {
   // Enables POST /api/auth/token, which mints a session for any handle with no
   // verification whatsoever. Local development only.
   devAuth: ['1', 'true', 'yes'].includes((process.env.TENMA_DEV_AUTH ?? '').toLowerCase()),
+  /* The gate. One secret, one admin, no user management — the smallest thing
+     that can stand between the internet and an archive whose real auth has not
+     been built yet.
+     UNSET IS NOT OPEN. With dev auth off and no password set, nothing can sign
+     in at all and only the public share surface answers. That is the same
+     choice quarantineRoot and ingestToken make: a control with no value
+     configured refuses rather than falls back to permissive. */
+  adminPass: process.env.TENMA_ADMIN_PASS ?? '',
+  /* Which account that password signs you in as.
+     Authorship is by person id, so this is not cosmetic: signing in as a
+     brand-new row would leave every note, upload and changeset you made under
+     dev auth attributed to an account you can no longer reach. Set this to the
+     handle you already use and the existing row is adopted instead. */
+  adminHandle: (process.env.TENMA_ADMIN_HANDLE ?? 'admin').trim() || 'admin',
   // Unset disables ingest outright rather than leaving it open — an
   // unauthenticated writer on the recording path is not a sane default.
   ingestToken: process.env.TENMA_INGEST_TOKEN ?? '',
   pairWindow: Number(process.env.TENMA_PAIR_WINDOW_S ?? 600),
   pageMax: Number(process.env.TENMA_PAGE_MAX ?? 100),
+  /* The machine-learning sidecar: a second container on the docker network
+     that owns Python, the model files and the loading and evicting of them.
+     Unset means there is none, and every task that needs one says so rather
+     than failing in a way that reads like a bug.
+
+     A sidecar and not a bigger image, deliberately. PaddleOCR and CLIP are
+     Python with an ONNX runtime under them — most of a gigabyte on top of a
+     Node app that is currently one dependency — and the models want to be
+     swapped and re-downloaded without rebuilding the thing that serves pages.
+     It also keeps the shape of this archive intact: the container that answers
+     requests gains no new write handles, and the container that holds the
+     models never sees the media tree.
+
+     Host-only. This is dialled from inside the compose network, never from a
+     browser, so it belongs to the same class as TENMA_INGEST_TOKEN: a name
+     the archive is allowed to talk to, and nothing a request can influence. */
+  mlUrl: (process.env.TENMA_ML_URL ?? '').trim().replace(/\/+$/, '') || null,
+  mlTimeoutMs: Number(process.env.TENMA_ML_TIMEOUT_MS) || 120000,
 };
 
 // ---------------------------------------------------------------------------
@@ -114,6 +149,99 @@ export function makeApp(config = CONFIG) {
     // guard reads the same answer.
     req.person = identify(R, req);
     next();
+  });
+
+  /* ---- the gate ----------------------------------------------------------
+   *
+   * Deny by default, ahead of every route and ahead of the static mount. The
+   * archive's real auth — accounts, roles, review by strangers — is a project
+   * of its own; this is the thing that lets the port be opened before that
+   * exists.
+   *
+   * ON whenever dev auth is OFF. Those two are opposites by construction, so
+   * there is no configuration in which both are true and no way to expose the
+   * archive by forgetting a flag: the line that has to be deleted before
+   * anything is reachable is the same line that turns this on.
+   *
+   * WHAT IS PUBLIC is a short explicit list rather than a pattern, because the
+   * list is the security decision and a pattern is a guess about the future.
+   * Three things, and each one is already visibility-checked by the route
+   * behind it — snipVisible() answers the anonymous question, so a proposed or
+   * removed snippet 404s to a stranger exactly as it does today:
+   *
+   *   GET /m/<id>                       the share card and its meta tags
+   *   GET /media/snippet/<id>           the video an unfurl plays
+   *   GET /media/snippet-poster/<id>    its thumbnail
+   *
+   * Plus the doors: the login itself, /api/health (the container's own
+   * healthcheck runs with no session and a gate that failed it would restart
+   * the container forever), and /api/ingest/* which the recorder authenticates
+   * with its own token.
+   *
+   * Everything else — the index, search, the lists, the streams, the theater,
+   * the notes, the tools, every other /api and every other /media — is
+   * refused. A stranger holding one link gets that snippet and no way to find
+   * a second.
+   */
+  const ID_RE = '[A-Za-z0-9]{1,64}';
+  const OPEN_GET = [
+    new RegExp(`^/m/${ID_RE}$`),
+    new RegExp(`^/media/snippet/${ID_RE}(?:/[^/]*)?$`),
+    new RegExp(`^/media/snippet-poster/${ID_RE}$`),
+    /^\/api\/health$/,
+    /* Says whether you are signed in and nothing else when you are not. The
+       login page needs that answer, and refusing it would mean the page could
+       not tell a locked door from a broken server. */
+    /^\/api\/auth\/me$/,
+    /* The WHOLE ingest namespace, not just its POSTs. This line was missing
+       for one round and the two GETs in it — next-index and lookup, both of
+       them there for the recorder and nothing else — were refused by the gate
+       before ever reaching requireIngest. The rule is the namespace: /ingest
+       is authenticated by TENMA_INGEST_TOKEN rather than by a session, and
+       splitting that by verb is a distinction the recorder does not make. */
+    /^\/api\/ingest\//,
+  ];
+  const OPEN_POST = [
+    /^\/api\/auth\/login$/,
+    /^\/api\/auth\/logout$/,
+    /^\/api\/ingest\//,
+  ];
+
+  const gateOn = () => !config.devAuth;
+  /* `atLeast` and not a truthy check on req.person: ANON is an object, so
+     `req.person` is always set and testing it would let everybody through. */
+  const signedIn = (req) => atLeast(req.person, 'viewer') && !!req.person?.id;
+
+  app.use((req, res, next) => {
+    if (!gateOn() || signedIn(req)) return next();
+    const path = req.path;
+    const open = req.method === 'GET' || req.method === 'HEAD'
+      ? OPEN_GET.some((re) => re.test(path))
+      : req.method === 'POST' && OPEN_POST.some((re) => re.test(path));
+    if (open) return next();
+    /* The root gets the door rather than a refusal — there has to be somewhere
+       to knock. It is served a self-contained login page, NOT the archive's
+       own index: the app would boot, call a dozen endpoints, be refused by
+       every one and render as something broken rather than as something
+       locked. */
+    if ((req.method === 'GET' || req.method === 'HEAD') && (path === '/' || path === '/index.html')) {
+      return res.type('html').send(gatePage(req));
+    }
+    /* 404 and not 401 on a GET: "there is nothing here" and "there is
+       something here you may not see" are different disclosures and only the
+       first is a stranger's business. An API call gets 401, because something
+       is going to read the status and should be told the truth. */
+    if (path.startsWith('/api/')) {
+      return res.status(401).json({ error: 'sign in first' });
+    }
+    /* And the door again for anything else a person could be looking at, so a
+       mistyped or stale URL still shows the way in. Only for something asking
+       for a page though — a stylesheet, a favicon or an image would otherwise
+       each be answered with a whole HTML document nothing will render. */
+    if (String(req.headers.accept ?? '').includes('text/html')) {
+      return res.status(404).type('html').send(gatePage(req, 'Nothing here.'));
+    }
+    return res.sendStatus(404);
   });
 
   // -------------------------------------------------------------------------
@@ -574,6 +702,353 @@ export function makeApp(config = CONFIG) {
     });
   });
 
+  /* ---- notes -> a subtitle track ----------------------------------------
+   *
+   * ONE route, two modes, because they differ only in where the cues come
+   * from and everything after that — the clock conversion, the ordering, the
+   * cue lengths, the file — is identical. Two routes would be two places for
+   * the same off-by-a-head-start bug.
+   *
+   *   with `paste`      the lines from a phone, parsed here
+   *   without           the notes (or chapters) this stream already holds
+   *
+   * A preview and the download are the SAME call. The panel renders `cues`,
+   * and the file it saves is the `srt` from the same response — so what you
+   * looked at is what you got, rather than two renderings that can disagree.
+   *
+   * Editor and up: it reads notes that may not be published yet, and the
+   * paste path is a parser somebody could otherwise probe for free.
+   */
+  /* ---- cut a clip out of a master ----------------------------------------
+   *
+   * `ls-rec clip <wall> <total>` by another road: the archive works out which
+   * master covers the moment and what second inside it to start at, the Pi
+   * does the ffmpeg, and the file lands in quarantine for one download.
+   *
+   * LEAD AND TOTAL. `total` INCLUDES the lead, which is counter-intuitive and
+   * deliberate — it is what the CLI has always meant and there is no gain in
+   * having two conventions. at=12:25:42, lead=60, total=120 cuts 12:24:42 to
+   * 12:26:42. lead=0, total=120 cuts 120s forward from the mark.
+   *
+   * LOCAL MASTERS ONLY. The gate is `video_ok`, which is set from stat() and
+   * never from a claim, so "there is a VOD to cut from" is a fact rather than
+   * a hope. A platform VOD would mean a download and a second failure mode;
+   * cliprip-studio already does that job.
+   */
+  app.post('/api/clips', requireRole('editor'), (req, res) => {
+    const b = req.body ?? {};
+    const row = R.prepare(
+      `SELECT id, idx, title, started_at, tz_offset_min, duration_s
+         FROM stream WHERE id = ? AND retracted_at IS NULL`).get(String(b.stream_id ?? ''));
+    if (!row) return res.status(404).json({ error: 'no such stream' });
+
+    /* Two sources, and the difference is who holds the clocks.
+
+       A promoted master is a file on the recorder's mount, and the arithmetic
+       happens HERE because this end owns the capture rows and therefore the
+       only measured answer to "when was frame 0 of that file".
+
+       The part being written right now is the other way round. Which file is
+       open, what wall time its frame 0 is, and how close the live edge has
+       crept live in the daemon's own memory and are not posted anywhere — so
+       the job carries the moment in wall time and the recorder's own planner
+       works out the rest. See _clip_live in ls_jobs.py and _plan_clip in
+       ls_rec.py; that planner is also what `ls-rec clip` uses, which is what
+       keeps a cut made from this panel identical to one typed at the Pi. */
+    const wantLive = !!b.live;
+    const rec = wantLive
+      ? liveRecFor(row.id, b.platform ? String(b.platform).toUpperCase() : null)
+      : null;
+    if (wantLive && !rec) {
+      return res.status(400).json({
+        error: 'nothing is recording this stream right now — pick a master instead' });
+    }
+
+    let cap = null;
+    if (!wantLive) {
+      cap = R.prepare('SELECT * FROM capture WHERE id = ? AND stream_id = ?')
+        .get(String(b.capture_id ?? ''), row.id);
+      if (!cap) return res.status(400).json({ error: 'that capture is not on this stream' });
+      if (!cap.video_ok || !cap.video_path) {
+        return res.status(400).json({
+          error: 'there is no local master for that capture — nothing to cut from' });
+      }
+    }
+
+    const at = Math.round(Number(b.at_wall));
+    if (!Number.isFinite(at)) return res.status(400).json({ error: 'at_wall must be a unix time' });
+    const lead = Math.min(Math.max(Math.round(Number(b.lead_s) || 0), 0), 3600);
+    const total = Math.round(Number(b.total_s));
+    if (!Number.isFinite(total) || total < 1 || total > 7200) {
+      return res.status(400).json({ error: 'total_s must be between 1 and 7200' });
+    }
+    if (total <= lead) {
+      /* Otherwise the cut ends before the moment it is about, which is a
+         request that cannot mean what it says. */
+      return res.status(400).json({
+        error: `total (${total}s) must be more than the lead (${lead}s) — the clip `
+             + 'would end before the moment it is about' });
+    }
+
+    /* The seek, in the master's own seconds. local_start_wall is the wall time
+       of frame 0 of OUR file and is the only thing that can answer this; when
+       nothing has measured it, refuse rather than assume it equals the
+       stream's zero — being wrong here is being wrong by minutes, silently,
+       in a file somebody then cuts with. */
+    let startIn = null;
+    if (!wantLive) {
+      const zero = clocksOf(cap, row.started_at).local;
+      if (zero === null) {
+        return res.status(400).json({
+          error: "that master's start has never been measured, so a second inside "
+               + 'it cannot be worked out. Set local_start_wall on the record first.' });
+      }
+      startIn = (at - lead) - zero;
+      if (startIn < 0) {
+        return res.status(400).json({
+          error: `that starts ${Math.abs(Math.round(startIn))}s before the file does — `
+               + 'use a shorter lead' });
+      }
+      /* Checked when the duration is known, skipped when it is not: a master
+         that has never been probed is still cuttable, and the Pi will say so if
+         the range runs off the end. */
+      if (cap.file_duration_s && startIn >= cap.file_duration_s) {
+        return res.status(400).json({
+          error: `that starts past the end of the file (${hms(cap.file_duration_s)})` });
+      }
+    }
+
+    /* The note, ONLY when the moment was typed. Cutting around a note that
+       already exists and then writing a second one at the same second is two
+       records of one fact, and the list is the thing that suffers. */
+    const fromNote = String(b.note_id ?? '').trim() || null;
+    let noteId = null;
+    if (!fromNote) {
+      const text = String(b.note_text ?? '').trim().slice(0, 2000)
+        /* A placeholder rather than an empty note: the row exists to say a cut
+           was made here, and a blank one says nothing at all. */
+        || `clipped ${hms(total)} from here`;
+      noteId = ulid();
+      try {
+        propose(W, {
+          authorId: req.person?.id ?? null, person: req.person,
+          reason: `noted a clip at ${hms(Math.max(0, at - row.started_at))}`,
+          changes: [
+            { target_type: 'note', target_id: noteId, op: 'create', field: 'stream_id', value: row.id },
+            { target_type: 'note', target_id: noteId, op: 'create', field: 'text', value: text },
+            { target_type: 'note', target_id: noteId, op: 'create', field: 'offset_s',
+              value: Math.max(0, at - row.started_at) },
+            { target_type: 'note', target_id: noteId, op: 'create', field: 'frame', value: 'stream' },
+            { target_type: 'note', target_id: noteId, op: 'create', field: 'tag', value: 'clip' },
+            /* Ticked on arrival, unlike every other #clip note: those mean
+               "cut this", and by the time this row exists the cut is queued. */
+            { target_type: 'note', target_id: noteId, op: 'create', field: 'done', value: 1 },
+            { target_type: 'note', target_id: noteId, op: 'create', field: 'ord',
+              value: (R.prepare('SELECT COALESCE(MAX(ord),0) m FROM note WHERE stream_id = ?')
+                .get(row.id).m ?? 0) + 1 },
+          ],
+        });
+      } catch (e) {
+        /* The clip is the point; the note is bookkeeping. A note that will not
+           write must not cost somebody their cut. */
+        console.error('clip note failed:', e?.message ?? e);
+        noteId = null;
+      }
+    }
+
+    const id = enqueueJob('clip', { by: req.person.id, payload: {
+      /* Everything the Pi needs and nothing it has to look up. On the master
+         path `path` is relative to the media root exactly as it is stored, so
+         the recorder joins it to its own mount rather than trusting a path
+         from here; on the live path there is no path to send at all, and
+         `live` is what tells the worker to go and ask the daemon. */
+      ...(wantLive
+        ? { live: true,
+            /* The label the recorder puts in the clip's own filename. Not the
+               same field as `name` below: that one is what the archive will
+               serve this as, and this one is what it is called on the Pi. */
+            label: String(b.note_text ?? '').trim().slice(0, 60) || null }
+        : { path: cap.video_path, start_s: Math.round(startIn) }),
+      duration_s: total,
+      stream_idx: row.idx ?? null,
+      platform: wantLive ? rec.platform : cap.platform,
+      at_wall: at,
+      lead_s: lead,
+      /* What to call it. The Pi writes into quarantine under this name; the
+         archive then serves it once and removes it. */
+      name: `${slugify(`${row.idx ?? 'clip'} ${row.title ?? ''}`).slice(0, 48)}`
+          + `-${hms(Math.max(0, (at - lead) - row.started_at)).replaceAll(':', '')}`
+          + `-${total}s.mp4`,
+    } });
+    logEvent(req, `asked for a clip to be cut${wantLive ? ' from the live recording' : ''}`,
+             'stream', row.id,
+             { job_id: id, start_s: startIn === null ? null : Math.round(startIn),
+               total_s: total, lead_s: lead, live: wantLive });
+    bumpGeneration(W);
+    res.status(201).json({ job_id: id, note_id: noteId, live: wantLive,
+                           platform: wantLive ? rec.platform : cap.platform,
+                           /* Null on a live cut and that is the honest answer:
+                              the offset into the file is the recorder's to
+                              work out, and it has not been asked yet. */
+                           start_s: startIn === null ? null : Math.round(startIn),
+                           total_s: total });
+  });
+
+  /* The one download, and then it is gone.
+   *
+   * Quarantine is the only place this container may write, which is why the
+   * clip lands there — and why this may delete it afterwards. Removed only
+   * after the response has actually finished: a send that fails halfway must
+   * leave the file to be asked for again, or a dropped connection costs you a
+   * re-cut.
+   */
+  app.get('/api/clips/:id/file', requireRole('editor'), (req, res) => {
+    const j = R.prepare("SELECT * FROM job WHERE id = ? AND kind = 'clip'").get(req.params.id);
+    if (!j) return res.status(404).json({ error: 'no such clip job' });
+    if (j.status !== 'done') {
+      return res.status(409).json({ error: `that clip is ${j.status}`, status: j.status });
+    }
+    if (!j.result_path) return res.status(410).json({ error: 'the recorder kept no file' });
+    if (!config.quarantineRoot) return res.status(503).json({ error: 'no quarantine root is set' });
+    const abs = resolveMedia(config.quarantineRoot, j.result_path);
+    if (!abs || !existsSync(abs)) {
+      return res.status(410).json({ error: 'that clip has already been downloaded' });
+    }
+    const name = (JSON.parse(j.payload ?? '{}').name) || 'clip.mp4';
+    res.type('video/mp4');
+    res.setHeader('content-disposition', `attachment; filename="${name.replace(/"/g, '')}"`);
+    res.sendFile(abs, (err) => {
+      if (err) return;                  // left in place on purpose — see above
+      try { rmSync(abs, { force: true }); } catch { /* already gone */ }
+      W.prepare("UPDATE job SET result_path = NULL, updated_at = ? WHERE id = ?")
+        .run(now(), j.id);
+      bumpGeneration(W);
+    });
+  });
+
+  app.post('/api/notes/srt', requireRole('editor'), (req, res) => {
+    const b = req.body ?? {};
+    const row = R.prepare(
+      `SELECT id, idx, title, started_at, tz_offset_min, duration_s
+         FROM stream WHERE id = ? AND retracted_at IS NULL`).get(String(b.stream_id ?? ''));
+    if (!row) return res.status(404).json({ error: 'no such stream' });
+
+    const caps = R.prepare('SELECT * FROM capture WHERE stream_id = ? ORDER BY platform')
+      .all(row.id);
+    const capsById = new Map(caps.map((c) => [c.id, c]));
+
+    /* `axis` means the stream's own timeline, which is what you want when the
+       thing being cut is itself the archive's zero. Anything else is
+       `<capture_id>:<clock>`, the same key the note editor's picker uses — so
+       the two surfaces cannot drift into naming clocks differently. */
+    const want = String(b.clock ?? 'axis');
+    let target = null;
+    if (want !== 'axis') {
+      const [capId, clock] = want.split(':');
+      const cap = capsById.get(capId);
+      if (!cap) return res.status(400).json({ error: 'that capture is not on this stream' });
+      if (clock !== 'remote' && clock !== 'local') {
+        return res.status(400).json({ error: 'clock must be remote or local' });
+      }
+      /* An unmeasured clock is refused rather than approximated. A local file
+         whose start was never measured cannot place a cue inside it, and a
+         track that is silently wrong by minutes is worse than no track. */
+      if (axisToPosition(cap, row.started_at, clock, 0) === null) {
+        return res.status(400).json({
+          error: `that capture's ${clock} clock has never been measured, so a `
+               + 'position inside it cannot be worked out' });
+      }
+      target = { cap, clock };
+    }
+
+    const onto = (axis) => (target
+      ? axisToPosition(target.cap, row.started_at, target.clock, axis) : axis);
+
+    const prefix = String(b.prefix ?? '').slice(0, 40);
+    const gap = b.gap === true;      // fixed length unless asked otherwise
+    const dur = Math.min(Math.max(Number(b.dur) || 10, 1), 600);
+
+    /* Where a cue has to land to be believable. A mis-read date is the failure
+       this catches: `21.09` can only be day-first, and on a 9 September stream
+       that is twelve days out — a cue at hour 288, which an NLE accepts and
+       draws nowhere. Reported as out of range rather than written. */
+    const span = row.duration_s ?? 86400;
+    const plausible = (axis) => axis !== null && axis >= -300 && axis <= span + 600;
+
+    const cues = [];
+    const skipped = [];
+    if (typeof b.paste === 'string' && b.paste.trim()) {
+      const dayFirst = b.day_first === true ? true : b.day_first === false ? false : null;
+      for (const raw of b.paste.split(/\r?\n/)) {
+        const line = raw.trim();
+        if (!line) continue;
+        const hit = parsePhoneLine(line, {
+          near: row.started_at, tzOffsetMin: row.tz_offset_min ?? 0, dayFirst });
+        if (!hit || !hit.text) { skipped.push({ line, why: 'no timestamp in it' }); continue; }
+        const axis = hit.unix - row.started_at;
+        if (!plausible(axis)) {
+          skipped.push({ line, why: `lands at ${hms(Math.round(axis))}, outside this stream` });
+          continue;
+        }
+        /* The wall time, in the archive's own notation, so an imported note
+           can keep it in `stamp` — the column that exists for a typed
+           expression saying more than offset_s can hold. `raw` would be the
+           obvious home for the line, and it is deliberately NOT writable
+           through a changeset: it is the vault importer's receipt and nothing
+           may edit one. `stamp` is better anyway, because `11:06:54 wall`
+           re-parses through parseNoteLine and converts back to this same
+           second instead of being read as a position. */
+        const sod = (((hit.unix + (row.tz_offset_min ?? 0) * 60) % 86400) + 86400) % 86400;
+        const two = (n) => String(n).padStart(2, '0');
+        const stamp = `${two(Math.floor(sod / 3600))}:${two(Math.floor(sod % 3600 / 60))}`
+                    + `:${two(sod % 60)} wall`;
+        cues.push({ axis, at: onto(axis), text: prefix + hit.text, raw: line, stamp });
+      }
+    } else {
+      const chapters = String(b.source ?? 'notes') === 'chapters';
+      const rows = chapters
+        ? R.prepare(`SELECT * FROM segment WHERE stream_id = ? AND retracted_at IS NULL`)
+          .all(row.id)
+        : R.prepare(`SELECT * FROM note WHERE stream_id = ? AND retracted_at IS NULL`)
+          .all(row.id);
+      for (const r of rows) {
+        const axis = axisOf(r, capsById, row.started_at,
+                            chapters ? 'start_s' : 'offset_s');
+        /* A note with no timestamp is a thought, not a cue. Counted so the
+           panel can say "9 of 14 had a time on them" rather than quietly
+           producing a shorter track than the list it came from. */
+        if (axis === null) {
+          skipped.push({ line: r.text || r.label || '(untitled)', why: 'no timestamp on it' });
+          continue;
+        }
+        const tag = !chapters && r.tag
+          ? `[${r.tag}${r.seq === null || r.seq === undefined
+                ? '' : ' ' + String(r.seq).padStart(2, '0')}] ` : '';
+        const text = chapters ? (r.label || r.kind || 'unnamed') : (r.text || '');
+        if (!text.trim()) { skipped.push({ line: '(no words)', why: 'nothing to show' }); continue; }
+        cues.push({ axis, at: onto(axis), text: prefix + tag + text, raw: null });
+      }
+    }
+
+    const usable = cues.filter((c) => c.at !== null);
+    const srt = buildSrt(usable, { gap, dur });
+    /* Named after the stream and the clock, because these end up in a download
+       folder next to each other and `notes.srt` four times over is how you cut
+       with the wrong one. */
+    const slugged = slugify(`${row.idx ?? ''} ${row.title ?? 'stream'}`).slice(0, 60);
+    res.json({
+      stream: { id: row.id, idx: row.idx, title: row.title,
+                started_at: row.started_at, duration_s: row.duration_s },
+      clock: want,
+      cues: usable.sort((a, b2) => a.at - b2.at)
+        .map((c) => ({ at: c.at, axis: c.axis, text: c.text,
+                       raw: c.raw, stamp: c.stamp ?? null })),
+      skipped,
+      srt,
+      name: `${slugged || 'notes'}-${want === 'axis' ? 'timeline' : want.split(':')[1]}.srt`,
+    });
+  });
+
   app.get('/api/streams/:id', (req, res) => {
     const etag = etagFor('s', req.params.id, req.query.rail);
     if (fresh(req, res, etag)) return res.status(304).end();
@@ -613,9 +1088,25 @@ export function makeApp(config = CONFIG) {
     const wantProposed = String(req.query.status ?? '') === 'all'
       && atLeast(req.person, 'editor');
 
-    const where = ['t.retracted_at IS NULL'];
+    /* ?retracted=1 — the tombstones, and ONLY the tombstones.
+    
+       Admin-only, matching the capability that can destroy one: the reason to
+       look at this list is to decide what to purge, and purge is a
+       `tag.purge`. An editor has no use for it, and a stranger even less.
+    
+       It exists because a retracted tag is not gone and cannot be: UNIQUE(slug)
+       is table-wide, so a tombstone keeps owning its name forever and nothing
+       else can be minted under it. Before this there was no surface anywhere
+       that would admit those rows existed — which is exactly how a mint could
+       report success and produce nothing visible. */
+    const wantDead = String(req.query.retracted ?? '') === '1'
+      && can(req.person, 'tag.purge');
+
+    const where = [wantDead ? 't.retracted_at IS NOT NULL' : 't.retracted_at IS NULL'];
     const params = [];
-    if (!wantProposed) where.push(`t.status = 'confirmed'`);
+    // A tombstone's status is whatever it was when it died and is not a filter
+    // anybody wants applied to a list of things to destroy.
+    if (!wantProposed && !wantDead) where.push(`t.status = 'confirmed'`);
     /* `?surface=` was here, and filtered the vocabulary down to the kinds
        that surface was allowed to offer. It is gone: one vocabulary, searched
        whole, everywhere. The parameter is still ACCEPTED and ignored rather
@@ -633,7 +1124,7 @@ export function makeApp(config = CONFIG) {
          is about to touch — which is the one place a vague warning costs
          something. */
       `SELECT t.id, t.slug, t.name, t.kind, t.thumb_path, t.summary,
-              t.status, t.parent_id, t.seed_url, t.seeded, t.gate,
+              t.status, t.parent_id, t.seed_url, t.seeded, t.gate, t.retracted_at,
               p.name AS parent_name, p.slug AS parent_slug,
               COUNT(DISTINCT st.stream_id) n,
               (SELECT COUNT(*) FROM snippet_taglet sl JOIN snippet sn ON sn.id = sl.snippet_id
@@ -646,7 +1137,8 @@ export function makeApp(config = CONFIG) {
        LEFT JOIN tag p ON p.id = t.parent_id
        WHERE ${where.join(' AND ')}
        GROUP BY t.id
-       ORDER BY ${q ? `(CASE WHEN t.slug LIKE ? THEN 0 ELSE 1 END),` : ''} n DESC, t.name
+       ORDER BY ${q ? `(CASE WHEN t.slug LIKE ? THEN 0 ELSE 1 END),` : ''}
+                ${wantDead ? 't.retracted_at DESC,' : ''} n DESC, t.name
        LIMIT ?`).all(...params, ...(q ? [`${q}%`] : []), limit);
 
     res.json({ tags: rows.map((t) => ({
@@ -660,6 +1152,10 @@ export function makeApp(config = CONFIG) {
       // wrote. Any human edit clears it in the applier.
       seeded: t.seeded === 1,
       gate: t.gate ?? null,
+      /* Only ever set on the ?retracted=1 list, where it is the column the
+         panel sorts by — what died most recently is what you are most likely
+         to have meant to bring back. */
+      retracted_at: t.retracted_at ?? null,
       parent: t.parent_id ? { id: t.parent_id, name: t.parent_name, slug: t.parent_slug } : null,
       streams: t.n, snippets: t.snippets, blocks: t.blocks, inside: t.inside,
     })) });
@@ -744,6 +1240,16 @@ export function makeApp(config = CONFIG) {
   });
 
   app.get('/api/health', (req, res) => {
+    /* Open to anybody, because the container's own healthcheck runs with no
+       session and a gate that refused it would restart the container forever.
+       But what it ANSWERS with is a different question: everything below is a
+       census of the collection — how many streams, how many notes, how much is
+       still uncorrected — and a stranger who can read that knows the size and
+       shape of the archive without being allowed to see any of it. Docker only
+       ever looks at the status code. */
+    if (!atLeast(req.person, 'viewer') || !req.person?.id) {
+      return res.json({ ok: true });
+    }
     const c = (sql) => R.prepare(sql).get().c;
     const states = {};
     for (const r of R.prepare(
@@ -823,7 +1329,26 @@ export function makeApp(config = CONFIG) {
                  .all(p.id ?? '').map((r) => r.name),
                // So the UI knows whether to offer the dev sign-in at all,
                // rather than probing a 404 to find out.
-               dev_auth: !!config.devAuth });
+               dev_auth: !!config.devAuth,
+               /* And whether it is behind the password gate, which is what
+                  makes signing OUT meaningful: with the gate on, the session
+                  is the only reason any of this rendered, so the button has
+                  somewhere to go and the "read-only, there is no sign-in yet"
+                  note is no longer the truth. */
+               gate: !config.devAuth,
+               /* The channels a Discord link may come from, by the names YOU
+                  gave them. Sent so the upload window can say which ones
+                  rather than letting somebody paste a link and find out with
+                  a 403 — the ids stay here, because a list of channel ids is
+                  not something a reader needs and not something worth
+                  handing out.
+                  Nor are the names, to a stranger. This route is on the gate's
+                  open list so the login page can tell a locked door from a
+                  broken server, and that made a list of private channel names
+                  readable by anybody who asked. Only somebody who can actually
+                  upload needs it. */
+               discord: p.id && atLeast(p, 'suggester')
+                 ? [...discordChannels().values()] : [] });
   });
 
   app.post('/api/auth/token', (req, res) => {
@@ -840,6 +1365,104 @@ export function makeApp(config = CONFIG) {
     res.cookie?.(COOKIE, token, { httpOnly: true, sameSite: 'lax', maxAge: TTL * 1000 });
     res.set('Set-Cookie', `${COOKIE}=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${TTL}`);
     res.json({ token, id, role, expires_at: expiresAt });
+  });
+
+  /* ---- the password ------------------------------------------------------
+   *
+   * The door in the gate at the top of this file. One secret, one account, no
+   * registration, no reset, no second factor, nothing to administer — real
+   * accounts replace this rather than extend it.
+   *
+   * Secure follows the SCHEME rather than being hardcoded on. Set
+   * unconditionally, the browser drops the cookie over plain http, which is
+   * how the LAN reaches this today — and the symptom is a password that is
+   * accepted and a sign-in that never happens.
+   */
+  const isHttps = (req) =>
+    String(req.headers['x-forwarded-proto'] || req.protocol || '')
+      .split(',')[0].trim().toLowerCase() === 'https';
+
+  /* One secret and an unlimited guess rate is not one secret.
+   *
+   * Counted per caller AND globally, because behind a tunnel there is only one
+   * caller: cloudflared dials this container from the docker network, so every
+   * request on earth arrives from the same address and per-IP counting
+   * silently becomes a single bucket for the whole internet. The global cap is
+   * the one that actually holds there, and on a site with exactly one account
+   * it costs nothing — the only person it can lock out is you, for a quarter
+   * of an hour, after five wrong guesses.
+   */
+  const LOGIN_TRIES = 5, LOGIN_WINDOW_S = 900;
+  const loginMiss = new Map();          // key -> { n, until }
+
+  const loginBlocked = (key) => {
+    const t = now();
+    for (const [k, v] of loginMiss) if (v.until <= t) loginMiss.delete(k);
+    const mine = loginMiss.get(key), all = loginMiss.get('*');
+    return !!(mine && mine.n >= LOGIN_TRIES)
+        || !!(all && all.n >= LOGIN_TRIES * 4);
+  };
+  const loginMissed = (key) => {
+    const t = now();
+    for (const k of [key, '*']) {
+      const v = loginMiss.get(k);
+      loginMiss.set(k, { n: (v ? v.n : 0) + 1, until: t + LOGIN_WINDOW_S });
+    }
+  };
+
+  /* Hashed to a fixed width before comparing, which is what makes
+     timingSafeEqual usable at all: it THROWS on a length mismatch, so handing
+     it the raw strings would turn a wrong-length guess into a 500 and leak the
+     length of the secret through the status code. */
+  const sameSecret = (a, b) => {
+    if (!a || !b) return false;
+    const h = (s) => createHash('sha256').update(String(s)).digest();
+    return timingSafeEqual(h(a), h(b));
+  };
+
+  app.post('/api/auth/login', (req, res) => {
+    /* Unset is not open. A container that has just had dev auth deleted and
+       has not been given a secret yet has no way in at all, which is the
+       correct state for it to be in. */
+    if (!config.adminPass) {
+      return res.status(503).json({ error: 'no password is set on this server' });
+    }
+    const key = String(req.ip || req.socket?.remoteAddress || '?');
+    if (loginBlocked(key)) {
+      res.set('Retry-After', String(LOGIN_WINDOW_S));
+      return res.status(429).json({ error: 'too many attempts — try again later' });
+    }
+    if (!sameSecret(String(req.body?.password ?? ''), config.adminPass)) {
+      loginMissed(key);
+      // One answer for empty, wrong and too short. There is nothing here worth
+      // learning and no way to find out which of the three it was.
+      return res.status(401).json({ error: 'that is not the password' });
+    }
+    loginMiss.delete(key); loginMiss.delete('*');
+
+    /* The account named by TENMA_ADMIN_HANDLE when it already exists — see the
+       config note; adopting the row is what keeps authorship intact. An admin
+       row wins over a plain one of the same name and the oldest wins after
+       that, so this resolves to the same person every time. */
+    let id = R.prepare(`SELECT id FROM person WHERE handle = ?
+                         ORDER BY (role = 'admin') DESC, created_at ASC LIMIT 1`)
+      .get(config.adminHandle)?.id;
+    if (!id) {
+      id = upsertPerson(W, { provider: 'pass', providerUid: config.adminHandle,
+                             handle: config.adminHandle,
+                             displayName: config.adminHandle,
+                             defaultRole: 'admin' });
+    }
+    /* Forced, both of them. The role because an adopted row may have been
+       anything; `banned` because identify() reads a banned person as ANON, and
+       a correct password that still does not let you in is the worst failure
+       this route has — there is no second account to unban you with. */
+    W.prepare('UPDATE person SET role = ?, banned = 0 WHERE id = ?').run('admin', id);
+    const { token, expiresAt } = issueSession(W, id, String(req.headers['user-agent'] ?? ''));
+    res.set('Set-Cookie', `${COOKIE}=${token}; HttpOnly; SameSite=Lax; Path=/`
+      + `; Max-Age=${TTL}` + (isHttps(req) ? '; Secure' : ''));
+    res.json({ ok: true, id, handle: config.adminHandle, role: 'admin',
+               expires_at: expiresAt });
   });
 
   app.post('/api/auth/logout', (req, res) => {
@@ -912,6 +1535,47 @@ export function makeApp(config = CONFIG) {
     bumpGeneration(W);
   }
 
+  /** A row that changed collections, and the destination that has to follow.
+   *
+   *  `kind` is writable so that a screenshot filed as a meme can be moved to
+   *  the gallery by whoever notices — which is the right affordance and also
+   *  the one that can leave `file_path` naming the folder it USED to be
+   *  going to.
+   *
+   *  Only while it is still in quarantine, and that is the whole design. Then
+   *  `file_path` is a record of where the file WILL go and nothing has read it
+   *  yet, so rewriting it costs nothing and the promote job — which is built
+   *  from the column at accept time — files it correctly first time. Once the
+   *  recorder has moved it, `file_path` names a real file on a read-only
+   *  mount, so it is left exactly as it is: the master keeps living in the
+   *  folder it was filed into, the row keeps resolving, and only the folder
+   *  disagrees with the panel. Chasing that would mean a move job for a
+   *  cosmetic mismatch, on the one tree the archive is deliberately unable to
+   *  write to.
+   */
+  function kindAftercare(csId) {
+    let rows;
+    try {
+      rows = R.prepare(
+        `SELECT target_id, value FROM change
+          WHERE changeset_id = ? AND target_type = 'snippet' AND field = 'kind'`)
+        .all(csId);
+    } catch { return; }
+    for (const r of rows) {
+      const dir = KIND_DIR[String(r.value ?? '')];
+      if (!dir) continue;
+      const s = R.prepare(
+        'SELECT quarantine_path, file_path FROM snippet WHERE id = ?').get(r.target_id);
+      // Already filed by the recorder, or never had a file to file.
+      if (!s?.quarantine_path || !s.file_path) continue;
+      const name = s.file_path.split('/').pop();
+      const want = `${dir}/${name}`;
+      if (want === s.file_path) continue;
+      W.prepare('UPDATE snippet SET file_path = ?, updated_at = ? WHERE id = ?')
+        .run(want, now(), r.target_id);
+    }
+  }
+
   app.post('/api/changesets', requireRole('suggester'), (req, res) => {
     /* The only way any decision in the archive changes — and therefore the
        only place per-change authorisation has to happen. `person` carries both
@@ -933,6 +1597,7 @@ export function makeApp(config = CONFIG) {
       if (out?.status === 'applied') {
         logChangeset(req, out.id);
         posterAftercare(out.id, req.person.id);
+        kindAftercare(out.id);
       }
       res.json(out);
     } catch (e) { return changeError(res, e); }
@@ -1027,6 +1692,7 @@ export function makeApp(config = CONFIG) {
       // The second apply site. A suggester's clear reaches disk HERE and
       // nowhere else, which is the whole point of doing this on apply.
       posterAftercare(req.params.id, req.person.id);
+      kindAftercare(req.params.id);
       return res.json(out);
     } catch (e) { return changeError(res, e); }
   });
@@ -1571,6 +2237,55 @@ export function makeApp(config = CONFIG) {
      accident rather than malice. */
   const UP_MAX_PENDING = Number(process.env.TENMA_UPLOAD_MAX_PENDING) || 20;
 
+  /* Pictures get their own numbers, and much smaller ones. A 200 MB cap is
+     sized for a ten-minute capture; the same cap on the meme panel is an
+     invitation to park a film in it. The duration cap is the one that keeps a
+     "meme" from being a whole video with a funny thumbnail — both picture
+     collections take gifs and short clips, which is most of what a reaction
+     IS, but a minute is the outside of either.
+
+     Pending counts are separate because they measure different things: twenty
+     clips is a lot of quarantine, forty memes is a few megabytes. */
+  const UP_IMG_BYTES = Number(process.env.TENMA_IMAGE_MAX_BYTES) || 25 * 1024 * 1024;
+  const UP_IMG_S = Number(process.env.TENMA_IMAGE_MAX_S) || 60;
+  const UP_IMG_PENDING = Number(process.env.TENMA_IMAGE_MAX_PENDING) || 40;
+
+  /* One row per collection, and the only place the differences between them
+     are written down.
+
+     `stills` and `sound` are what the table is really for, and they are
+     opposites rather than a list of allowed formats: a picture in the
+     Snippets pile is a row with no duration in a list built around duration,
+     and a sound file in the Gallery is a picture that is not one. Neither is
+     a corrupt upload — each is the right file in the wrong panel, and saying
+     which panel takes it is worth more than a flat no. Moving pictures are
+     not a field because all three take them.
+
+     `one` and `noun` exist so the refusals read in the collection's own words
+     rather than calling a meme a clip. */
+  const UP_KIND = {
+    snippet: { bytes: UP_MAX_BYTES, seconds: UP_MAX_S, pending: UP_MAX_PENDING,
+               stills: false, sound: true,
+               one: 'clip', noun: 'clips', elsewhere: 'Memes or Gallery' },
+    meme:    { bytes: UP_IMG_BYTES, seconds: UP_IMG_S, pending: UP_IMG_PENDING,
+               stills: true, sound: false,
+               one: 'meme', noun: 'memes', elsewhere: 'Snippets' },
+    gallery: { bytes: UP_IMG_BYTES, seconds: UP_IMG_S, pending: UP_IMG_PENDING,
+               stills: true, sound: false,
+               one: 'picture', noun: 'pictures', elsewhere: 'Snippets' },
+  };
+
+  /* Which of classifyMedia's answers this collection will take. The four
+     video ones — conformant, remux, audio, video, encode — are a moving
+     picture however they got here, and every collection takes those. */
+  const upTakes = (kind, cls) => {
+    const k = UP_KIND[kind];
+    if (cls === 'broken') return false;
+    if (cls === 'still') return k.stills;
+    if (cls === 'sound' || cls === 'sound-encode') return k.sound;
+    return true;
+  };
+
   /* Our extension table, never the client's. The name is minted here, so the
      extension is always one we chose — which is what keeps sendMedia's
      allowlist load-bearing rather than advisory. Cosmetic either way: the
@@ -1591,6 +2306,17 @@ export function makeApp(config = CONFIG) {
       return acodec ? '.bin' : '.bin';
     }
     if (c.includes('gif')) return '.gif';
+    /* A single picture, named by its CODEC. The container cannot name it:
+       ffprobe calls a jpeg `image2`, which is a family of demuxers rather than
+       a format, and calls a png `png_pipe`. bmp and tiff reach here and get
+       nothing on purpose — the MIME allowlist has no entry for either, so a
+       name we cannot serve is worse than a refusal the route can explain. */
+    if (c.endsWith('_pipe') || c === 'image2') {
+      if (vcodec === 'png' || vcodec === 'apng') return '.png';
+      if (vcodec === 'mjpeg') return '.jpg';
+      if (vcodec === 'webp') return '.webp';
+      return null;
+    }
     if (c.includes('mp4') || c.includes('mov')) return '.mp4';
     if (c.includes('matroska')) {
       return ['vp8', 'vp9', 'av1'].includes(String(vcodec)) ? '.webm' : '.mkv';
@@ -1606,13 +2332,26 @@ export function makeApp(config = CONFIG) {
     const me = req.person?.id ?? null;
     if (!me) return res.status(401).json({ error: 'sign in first' });
 
+    /* Which collection this is going into. A header rather than a query
+       string because the body is the file and the URL is shared with the
+       browser's own history — same reason the name arrives as x-upload-name.
+       ?kind= is accepted too so the route can be driven from a shell. */
+    const kind = String(req.get('x-upload-kind') || req.query.kind || 'snippet');
+    if (!SNIPPET_KINDS.includes(kind)) {
+      return res.status(400).json({
+        error: `kind must be one of ${SNIPPET_KINDS.join(', ')}` });
+    }
+    const K = UP_KIND[kind];
+
     const pending = R.prepare(
       `SELECT count(*) c FROM snippet
-        WHERE author_id = ? AND status = 'proposed' AND retracted_at IS NULL`).get(me).c;
-    if (pending >= UP_MAX_PENDING) {
+        WHERE author_id = ? AND kind = ? AND status = 'proposed'
+          AND retracted_at IS NULL`).get(me, kind).c;
+    if (pending >= K.pending) {
       return res.status(429).json({
-        error: `you already have ${pending} clip${pending === 1 ? '' : 's'} waiting for review`,
-        pending, limit: UP_MAX_PENDING });
+        error: `you already have ${pending} ${pending === 1 ? K.one : K.noun}`
+          + ' waiting for review',
+        pending, limit: K.pending });
     }
 
     const id = ulid();
@@ -1627,7 +2366,7 @@ export function makeApp(config = CONFIG) {
     const meter = new Transform({
       transform(chunk, _enc, cb) {
         bytes += chunk.length;
-        if (bytes > UP_MAX_BYTES) { tooBig = true; return cb(new Error('too big')); }
+        if (bytes > K.bytes) { tooBig = true; return cb(new Error('too big')); }
         hash.update(chunk);
         cb(null, chunk);
       },
@@ -1640,8 +2379,9 @@ export function makeApp(config = CONFIG) {
     } catch {
       scrub();
       return tooBig
-        ? res.status(413).json({ error: `clips are capped at ${Math.round(UP_MAX_BYTES / 1048576)} MB`,
-                                 limit_bytes: UP_MAX_BYTES })
+        ? res.status(413).json({
+            error: `${K.noun} are capped at ${Math.round(K.bytes / 1048576)} MB`,
+            limit_bytes: K.bytes })
         : res.status(400).json({ error: 'the upload did not finish' });
     }
     if (!bytes) { scrub(); return res.status(400).json({ error: 'that was an empty file' }); }
@@ -1653,17 +2393,38 @@ export function makeApp(config = CONFIG) {
        ANSI art and raw bitmaps and will happily describe a blob of nothing as
        `bintext, 1280x10000, duration unknown` rather than say it cannot read
        it — which the old check accepted, because a codec name was present.
-       classifyMedia insists on a positive duration, which every real video has
-       and no hallucinated stream does. */
-    if (!p || classifyMedia(partAbs, p) === 'broken') {
+       classifyMedia insists on a positive duration for anything moving, which
+       every real video has and no hallucinated stream does — and on a
+       recognised still FORMAT for anything that is not, which is what stops
+       that same blob of nothing from arriving in the gallery instead. */
+    const cls = p ? classifyMedia(partAbs, p) : 'broken';
+    if (cls === 'broken') {
       scrub();
-      return res.status(415).json({ error: 'that does not look like a video' });
+      return res.status(415).json({
+        error: `that does not look like ${K.stills ? 'a picture or a video' : 'a video'}` });
     }
-    if (p.duration_s && p.duration_s > UP_MAX_S) {
+    /* The right file in the wrong panel. Worth its own answer rather than a
+       flat 415: the person has a usable file and is one click from the place
+       it goes, and nothing else in the archive can tell them which place that
+       is. */
+    if (!upTakes(kind, cls)) {
       scrub();
+      const what = cls === 'still' ? 'a picture' : 'a sound file';
+      return res.status(415).json({
+        error: `that is ${what} — it belongs in ${K.elsewhere}`,
+        kind, media: cls });
+    }
+    /* A still has no duration to cap and the cap must not be applied to one:
+       ffprobe reports a jpeg as a fortieth of a second, which is under every
+       limit, but a png reports nothing at all and `null > n` is false anyway.
+       Guarding on the class rather than on the number says why. */
+    if (cls !== 'still' && p.duration_s && p.duration_s > K.seconds) {
+      scrub();
+      const cap = K.seconds >= 120
+        ? `${Math.round(K.seconds / 60)} minutes` : `${K.seconds} seconds`;
       return res.status(413).json({
-        error: `clips are capped at ${Math.round(UP_MAX_S / 60)} minutes`,
-        duration_s: p.duration_s, limit_s: UP_MAX_S });
+        error: `${K.noun} are capped at ${cap}`,
+        duration_s: p.duration_s, limit_s: K.seconds });
     }
 
     /* Exact-byte dedupe. Not the interesting duplicate — the perceptual check
@@ -1703,43 +2464,86 @@ export function makeApp(config = CONFIG) {
     // Named by us. Kills traversal, extension games, unicode normalisation and
     // NAS case-collisions in one move — and because `slug` IS the filename
     // stem, minting the name mints the slug, so the rename-collision class
-    // that cost `tidy-snippets` a whole manifest cannot apply to anything
-    // arriving this way.
+    // that cost a whole cleanup manifest back when these files were named by
+    // hand cannot apply to anything arriving this way.
     const ext = UP_EXT(p.container, p.video_codec, p.audio_codec);
+    if (!ext) {
+      scrub();
+      return res.status(415).json({
+        error: 'the archive stores pictures as PNG, JPEG or WebP',
+        video_codec: p.video_codec, container: p.container });
+    }
     const rel = `${id}${ext}`;
     try { renameSync(partAbs, join(config.quarantineRoot, rel)); }
     catch (e) { scrub(); return res.status(500).json({ error: `could not store it: ${e.code}` }); }
 
     /* The submitted name is display text and nothing else — it never touches
        the filesystem, and it is only here so the queue can say "clip_0043.mp4"
-       back to the person who sent it. */
+       back to the person who sent it.
+
+       And for a PICTURE it is not even that. A clip is a line in a list of a
+       thousand and its title is how anybody finds it again, so deriving one
+       from the filename is better than nothing. A meme is a tile you can see;
+       its filename is `IMG_20260910_142311` or `unknown-4.png`, and turning
+       that into a title produces a row labelled with gibberish that reads as
+       a name somebody chose. Empty is the honest starting state, and the
+       submitter can write a few words if the picture wants them. */
     const given = String(req.get('x-upload-name') ?? '').slice(0, 200);
-    const title = given.replace(/\.[a-z0-9]{1,8}$/i, '').replace(/[_-]+/g, ' ').trim()
-      || 'Untitled upload';
+    const title = kind === 'snippet'
+      ? (given.replace(/\.[a-z0-9]{1,8}$/i, '').replace(/[_-]+/g, ' ').trim()
+         || 'Untitled upload')
+      : '';
 
     const t = now();
     W.prepare(
-      `INSERT INTO snippet(id, slug, title, video_path, quarantine_path, duration_s,
+      `INSERT INTO snippet(id, slug, title, kind, file_path, quarantine_path, duration_s,
                            width, height, bytes, added_at, container, video_codec,
                            audio_codec, sha256, transcript_status, status, origin,
                            author_id, created_at, updated_at)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'none','proposed','upload',?,?,?)`)
-      .run(id, id.toLowerCase(), title,
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'none','proposed','upload',?,?,?)`)
+      .run(id, id.toLowerCase(), title, kind,
            // Where it WILL live once an editor approves. The Pi resolves both
            // roots from its own config; this is a record, not an instruction.
-           `snippets/${rel}`, rel,
+           // Quarantine is flat and the media tree is not, which is fine — the
+           // promote job carries both names and makes the parent directory.
+           `${KIND_DIR[kind]}/${rel}`, rel,
            p.duration_s, p.width, p.height, bytes, t,
            p.container, p.video_codec, p.audio_codec, sha, me, t, t);
-    /* Queued before the response, so the row is never briefly a clip nobody
-       has asked to convert. The worker polls seconds later; for the common
-       case — an MP4 that is already conformant — it will have finished
-       writing a poster before the submitter has typed a title.
 
-       `queued` and not `running`: the worker sets that when it actually
-       claims, and a status that lies about what is happening is worse than
-       one that is a few seconds behind. */
-    W.prepare("UPDATE snippet SET normalize_status = 'queued' WHERE id = ?").run(id);
-    enqueueJob('normalize', { snippetId: id, by: me });
+    /* A still is finished the moment it lands. There is no container to remux,
+       no soundtrack to fix and no moov atom to move — the bytes that arrived
+       are the bytes that get served — so the normalize job is skipped rather
+       than queued to do nothing, and normalize_status stays at its 'none'
+       default, which is the truth about it.
+
+       What a still DOES need is the one thing the normalize job would have
+       left behind: a poster. Made here, in-process, because there is nothing
+       else coming that would make it. */
+    if (cls === 'still') {
+      await makePoster({ id, poster_path: null }, p, null,
+                       join(config.quarantineRoot, rel), false, true);
+      /* And the words on it, if there are any. Queued now rather than at
+         approval — the opposite of transcription, because reading a small
+         picture is a fraction of a second where a transcript is minutes, and
+         having the text BEFORE the verdict is worth more than saving it: the
+         reviewer can read what the meme says, and the submitter's own pending
+         row is searchable straight away.
+
+         Nothing claims this until a sidecar answers, so on a deployment with
+         none it simply sits, which is the honest state. */
+      enqueueJob('ocr', { snippetId: id, by: me });
+    } else {
+      /* Queued before the response, so the row is never briefly a clip nobody
+         has asked to convert. The worker polls seconds later; for the common
+         case — an MP4 that is already conformant — it will have finished
+         writing a poster before the submitter has typed a title.
+
+         `queued` and not `running`: the worker sets that when it actually
+         claims, and a status that lies about what is happening is worse than
+         one that is a few seconds behind. */
+      W.prepare("UPDATE snippet SET normalize_status = 'queued' WHERE id = ?").run(id);
+      enqueueJob('normalize', { snippetId: id, by: me });
+    }
     bumpGeneration(W);
 
     /* The bytes arriving, which is a different moment from the submission —
@@ -1747,12 +2551,13 @@ export function makeApp(config = CONFIG) {
        recorded finished submissions would show nothing for the quarantine
        space that was spent. */
     logEvent(req, 'uploaded', 'snippet', id,
-             { name: given || title, bytes, duration_s: p?.duration_s ?? null });
+             { kind, name: given || title, bytes, duration_s: p?.duration_s ?? null });
 
     res.status(201).json({
       snippet: snipRow(R.prepare('SELECT * FROM snippet WHERE id = ?').get(id), { me }),
       // What still has to happen before anyone but the submitter sees it.
-      next: 'normalize',
+      // For a still: nothing. It is already showable and already has a poster.
+      next: cls === 'still' ? null : 'normalize',
     });
   });
 
@@ -1788,7 +2593,14 @@ export function makeApp(config = CONFIG) {
 
     if (title !== undefined) {
       const v = String(title ?? '').trim();
-      if (!v) return res.status(400).json({ error: 'a clip needs a title' });
+      /* Required on a clip and optional on a picture, which is not an
+         inconsistency: a clip is a row in a list and its title is the only
+         handle anyone has on it, while a picture is a tile you can see. On a
+         picture the field is a short description — useful when there is
+         something to say and noise when there is not. */
+      if (!v && s.kind === 'snippet') {
+        return res.status(400).json({ error: 'a clip needs a title' });
+      }
       if (v.length > 300) return res.status(400).json({ error: 'that title is too long' });
       W.prepare('UPDATE snippet SET title = ?, updated_at = ? WHERE id = ?').run(v, t, s.id);
     }
@@ -1845,13 +2657,22 @@ export function makeApp(config = CONFIG) {
        Untimed, because the field is a textarea and the words are all anyone
        has at this point: one line at t=0, which the whole-transcript editor
        can split and retime later. */
-    if (auto_transcribe === true) {
+    /* Never on a still, whatever the panel sent. `auto_transcribe` means
+       "whisper will write one after approval", which for a picture is simply
+       untrue — whisper is never queued for a row with no audio track. What it
+       DOES do is clear the transcript and its lines, and a picture's
+       transcript is what OCR wrote into it, possibly seconds earlier. So the
+       default state of a switch that does not apply would have quietly
+       deleted the words off every meme its submitter saved.
+       Checked here and not only in the panel, for the reason the taglet rule
+       above gives: the panel is not a security boundary. */
+    if (auto_transcribe === true && !isStill(s)) {
       tx(W, () => {
         W.prepare('DELETE FROM snippet_line WHERE snippet_id = ?').run(s.id);
         W.prepare(`UPDATE snippet SET transcript = NULL, transcript_status = 'none',
                                       updated_at = ? WHERE id = ?`).run(t, s.id);
       });
-    } else if (transcript !== undefined) {
+    } else if (auto_transcribe !== true && transcript !== undefined) {
       const v = String(transcript ?? '').trim();
       if (v.length > 20000) return res.status(400).json({ error: 'that transcript is too long' });
       tx(W, () => {
@@ -2172,6 +2993,150 @@ export function makeApp(config = CONFIG) {
     res.json({ on: transcribeOn });
   });
 
+
+  /* ---- the machines, for the panel ---------------------------------------
+     One endpoint for all three slots. The alternative was a second copy of
+     /api/transcribe per task, and three near-identical reports is how two of
+     them come to disagree about what "ready" means. */
+  app.get('/api/models', requireRole('admin'), (req, res) => {
+    const t = now();
+    const queue = (kind) => R.prepare(
+      `SELECT count(*) n,
+              sum(status IN ('approved','claimed')) waiting,
+              sum(status = 'failed') failed
+         FROM job WHERE kind = ? AND (status IN ('approved','claimed','paused')
+                                      OR finished_at > ?)`).get(kind, t - 24 * 3600);
+    const ocr = ocrReady();
+    const wh = whisperReady();
+    res.json({
+      /* Whether there is a sidecar at all, said once. Every `absent` below
+         means something different depending on this, and a panel that had to
+         infer it from three state_notes would infer it three times. */
+      sidecar: config.mlUrl ? { configured: true } : { configured: false },
+      tasks: MODEL_TASKS.map((task) => {
+        const m = modelRow(task);
+        const spec = MODEL_TASK[task];
+        const info = modelInfo(task, m?.slug ?? '');
+        const live = task === 'ocr' ? ocr : task === 'transcribe' ? wh : null;
+        return {
+          task,
+          label: spec.label,
+          what: spec.what,
+          into: spec.into,
+          runner: spec.runner,
+          slug: m?.slug ?? null,
+          name: info.name,
+          note: info.note,
+          bytes: m?.bytes ?? info.bytes ?? null,
+          enabled: !!m?.enabled,
+          state: m?.state ?? 'unknown',
+          state_note: m?.state_note ?? null,
+          checked_at: m?.checked_at ?? null,
+          used_at: m?.used_at ?? null,
+          /* `null` where the task has no runner yet, which is not the same as
+             `false`. Smart search has a model named and nothing that calls it,
+             and the panel should say so rather than draw it as broken. */
+          ready: live ? live.ok : null,
+          why: live ? live.why : 'nothing calls this yet',
+          on: task === 'ocr' ? ocrOn : task === 'transcribe' ? transcribeOn : null,
+          queue: task === 'search' ? null : queue(task === 'ocr' ? 'ocr' : 'transcribe'),
+          /* The menu, so the panel can offer a picker rather than a text box
+             that has to be spelled exactly right. */
+          options: MODEL_CATALOG[task] ?? [],
+        };
+      }),
+    });
+  });
+
+  /** Choose a model, or switch a slot off. */
+  app.patch('/api/models/:task', requireRole('admin'), (req, res) => {
+    const task = String(req.params.task);
+    if (!MODEL_TASKS.includes(task)) return res.status(404).json({ error: 'no such task' });
+    const m = modelRow(task);
+    if (!m) return res.status(404).json({ error: 'no such task' });
+
+    const patch = {};
+    if (req.body?.slug !== undefined) {
+      const slug = String(req.body.slug ?? '').trim();
+      /* The same character class the rest of the archive mints names from.
+         This string is handed to another container as a model to load, so it
+         is the one field here that is worth being narrow about — a name is a
+         name, not a path and not an argument. */
+      if (!/^[A-Za-z0-9_.@+-]{1,120}$/.test(slug)) {
+        return res.status(400).json({ error: 'a model name is letters, digits and _ . @ + -' });
+      }
+      if (slug !== m.slug) {
+        patch.slug = slug;
+        /* Everything remembered about the old model was about the old model.
+           Leaving `loaded` on a slug that has just changed would have the
+           panel claim something is in memory that has never been asked for. */
+        patch.state = 'unknown';
+        patch.state_note = null;
+        patch.bytes = null;
+        patch.checked_at = null;
+      }
+    }
+    if (req.body?.enabled !== undefined) patch.enabled = req.body.enabled ? 1 : 0;
+    if (!Object.keys(patch).length) return res.json({ model: m });
+
+    modelSet(task, patch);
+    logEvent(req, patch.slug ? `set ${task} to ${patch.slug}`
+      : `${patch.enabled ? 'enabled' : 'disabled'} ${task}`, 'setting', `model:${task}`, null,
+      patch.slug ? { was: m.slug } : null);
+    bumpGeneration(W);
+    res.json({ model: modelRow(task) });
+  });
+
+  /** Go and ask the sidecar. By hand, because a poll would be waking an idle
+   *  container to repeat itself; the panel is opened when somebody wants to
+   *  know. */
+  app.post('/api/models/:task/check', requireRole('admin'), async (req, res) => {
+    const task = String(req.params.task);
+    if (!MODEL_TASKS.includes(task)) return res.status(404).json({ error: 'no such task' });
+    res.json({ model: await modelCheck(task) });
+  });
+
+  /** The OCR switch, the same shape and the same non-persistence as the
+   *  transcription one above it. */
+  app.post('/api/ocr/pause', requireRole('admin'), (req, res) => {
+    const want = req.body?.on;
+    ocrOn = typeof want === 'boolean' ? want : !ocrOn;
+    logEvent(req, ocrOn ? 'resumed reading pictures' : 'paused reading pictures',
+             'setting', 'ocr', null);
+    res.json({ on: ocrOn });
+  });
+
+  /** Read this one again. The picture equivalent of retranscribe, and it
+   *  refuses the same thing: a transcript a human has edited is the archive's
+   *  answer, and a machine must not overwrite it without being told twice. */
+  app.post('/api/snippets/:id/reocr', requireRole('editor'), (req, res) => {
+    const s = R.prepare(
+      `SELECT id, kind, container, video_codec, width, height, transcript_status
+         FROM snippet WHERE id = ? AND retracted_at IS NULL`).get(req.params.id);
+    if (!s) return res.status(404).json({ error: 'no such snippet' });
+    /* Stills only, and the check is isStill() rather than the kind: a meme can
+       be a gif, and reading text off a moving picture means choosing which
+       frames to sample and then reconciling four different answers. That is a
+       feature, not a detail, and refusing it plainly beats a job that runs and
+       returns whatever the first frame happened to say. */
+    if (!isStill(s)) {
+      return res.status(400).json({
+        error: 'this one moves — OCR reads single pictures' });
+    }
+    if (s.transcript_status === 'edited' && !req.body?.force) {
+      return res.status(409).json({
+        error: 'somebody has corrected this one — pass force to overwrite it' });
+    }
+    const open = R.prepare(
+      `SELECT id FROM job WHERE snippet_id = ? AND kind = 'ocr'
+         AND status IN ('approved','claimed','paused')`).get(s.id);
+    if (open) return res.json({ job_id: open.id, already: true });
+    const id = enqueueJob('ocr', { snippetId: s.id, by: req.person.id });
+    logEvent(req, 'asked for the text on a picture again', 'snippet', s.id);
+    bumpGeneration(W);
+    res.json({ job_id: id });
+  });
+
   /** One job: pause it, put it back, or stop it. */
   app.post('/api/jobs/:id/:verb', requireRole('admin'), (req, res) => {
     const verb = String(req.params.verb);
@@ -2216,6 +3181,17 @@ export function makeApp(config = CONFIG) {
       if (j.kind === 'fetch' && j.snippet_id) {
         W.prepare(`UPDATE snippet SET fetch_status = 'queued', fetch_note = NULL,
                                       updated_at = ? WHERE id = ?`).run(t, j.snippet_id);
+      }
+      /* Same rule, the two kinds that write a transcript. This block predates
+         both of them and cleared only the fetch column, so a retried OCR job
+         sat queued while its picture still read `failed` with the old reason
+         under it — the panel disagreeing with itself, exactly what the note
+         above is about. Guarded on `failed` so an `edited` transcript is never
+         reset: that is somebody's correction, and runOcr declines it anyway. */
+      if ((j.kind === 'ocr' || j.kind === 'transcribe') && j.snippet_id) {
+        W.prepare(`UPDATE snippet SET transcript_status = 'none', transcript_note = NULL,
+                                      updated_at = ?
+                    WHERE id = ? AND transcript_status = 'failed'`).run(t, j.snippet_id);
       }
       logEvent(req, 'sent a job back to the recorder', 'snippet', j.snippet_id ?? j.id,
                { job_id: j.id, kind: j.kind, attempts: j.attempts });
@@ -2367,9 +3343,130 @@ export function makeApp(config = CONFIG) {
   // queue for an hour before the Pi declines it.
   // -------------------------------------------------------------------------
 
+  /* `cdn.discordapp.com` and not `discord.com`, and the difference is the
+     whole of whether a Discord link works.
+     `discord.com/channels/g/c/m` is a MESSAGE link: it carries no file, and
+     resolving one means a bot sitting in that server. `cdn.discordapp.com/...`
+     is the attachment itself — what Discord's own "Copy Link" gives you — and
+     the recorder already downloads those directly, no yt-dlp and no account.
+     The two lists had drifted into being exact opposites: this one took the
+     shape the recorder refuses and refused the shape the recorder takes. */
   const LINK_HOSTS = (process.env.TENMA_LINK_HOSTS
-    || 'youtube.com,youtu.be,twitch.tv,twitter.com,x.com,discord.com')
+    || 'youtube.com,youtu.be,twitch.tv,twitter.com,x.com,'
+     + 'cdn.discordapp.com,media.discordapp.net')
     .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+
+  /* ── which Discord channels may be pasted from ──────────────────────────
+     A `cdn.discordapp.com` link with no further check is an arbitrary file
+     upload with extra steps: anyone can drop anything into a server they made
+     ten seconds ago, or into a DM with themselves, and copy the link. The
+     host allowlist says nothing about that — every one of those is the same
+     host.
+
+     What the URL DOES carry is the channel id: /attachments/<channel>/<id>/
+     <name>. Not the guild — Discord does not put the server in the URL at all
+     — so "which server is this from" is a question only the API can answer,
+     and answering it means a bot in every server. The channel is enough, and
+     is arguably the better unit: an allowlist of the specific channels worth
+     taking pictures from, rather than a whole server including whatever gets
+     posted in #off-topic.
+
+     The signature covers the path, so the channel id cannot be swapped for an
+     allowlisted one — an edited URL simply stops validating at Discord's end.
+     That is what makes this worth checking rather than decorative.
+
+         TENMA_DISCORD_CHANNELS="123456789012345678=Phase Connect #memes,
+                                 987654321098765432=Tenma's place #art"
+
+     The label is YOURS. Discord will not tell us the server's name without an
+     account, and a reviewer looking at a queued picture needs to know where it
+     came from — so what you call the channel is what gets stored as the row's
+     source. Get the ids from Discord: Settings → Advanced → Developer Mode,
+     then right-click a channel → Copy Channel ID.
+
+     UNSET REFUSES EVERY DISCORD LINK, and that is the point rather than an
+     inconvenience. An archive that took pictures from anywhere the moment
+     somebody forgot a config line would be exactly the open relay this exists
+     to prevent — the same reasoning as TENMA_INGEST_TOKEN, which disables
+     ingest rather than leaving it open. */
+  const DISCORD_HOSTS = new Set(['cdn.discordapp.com', 'media.discordapp.net']);
+
+  /** `id = label` entries into a Map, from either source. */
+  const parseChannels = (entries) => new Map(entries
+    .map((raw) => {
+      const line = raw.trim();
+      /* `#` starts a comment ONLY at the beginning of a line. Every Discord
+         channel is named `#something`, so treating it as a comment marker
+         anywhere would silently eat the label off every entry in the file. */
+      if (!line || line.startsWith('#')) return null;
+      const at = line.indexOf('=');
+      const id = (at < 0 ? line : line.slice(0, at)).trim();
+      const label = at < 0 ? '' : line.slice(at + 1).trim();
+      return /^\d{15,25}$/.test(id) ? [id, label || `channel ${id}`] : null;
+    })
+    .filter(Boolean));
+
+  /* A FILE, because this list is long and grows one channel at a time.
+     Threads are channels in their own right — a picture posted in a thread
+     carries the THREAD's id, not its parent's — so covering a server properly
+     means an entry per thread as well, and fifty of those in a compose
+     environment variable is one unreadable line that needs a container
+     restart every time somebody adds a server.
+
+         TENMA_DISCORD_CHANNELS_FILE=/data/discord-channels.txt
+
+         # Phase Connect
+         1024339912345678901 = #memes
+         1024339912345678902 = #art
+
+     Re-read when its mtime moves, so adding a line is live. The environment
+     variable still works and is the fallback when no file is named; the file
+     wins when both are set, because the file is the one somebody edits.
+
+     Unreadable is treated as empty, which refuses every Discord link. A
+     source-control list that failed OPEN when its file went missing would be
+     the one failure mode this whole mechanism exists to prevent. */
+  const DISCORD_FILE = (process.env.TENMA_DISCORD_CHANNELS_FILE ?? '').trim() || null;
+  const DISCORD_ENV = parseChannels((process.env.TENMA_DISCORD_CHANNELS ?? '').split(','));
+  let chanCache = { at: null, map: new Map() };
+
+  const discordChannels = () => {
+    if (!DISCORD_FILE) return DISCORD_ENV;
+    let at = null;
+    try { at = statSync(DISCORD_FILE).mtimeMs; } catch { /* gone, or never there */ }
+    if (at !== chanCache.at) {
+      let lines = [];
+      try { lines = readFileSync(DISCORD_FILE, 'utf8').split(/\r?\n/); }
+      catch { /* refuse everything rather than fall back to a looser list */ }
+      chanCache = { at, map: parseChannels(lines) };
+    }
+    return chanCache.map;
+  };
+
+  /** Which allowlisted channel this attachment is from, or why not.
+   *
+   *  `/attachments/` only. Discord also serves `/ephemeral-attachments/`,
+   *  which comes from an interaction rather than from anything anybody posted
+   *  in a channel — there is no channel to vouch for it, so it is not a
+   *  source this archive has an opinion about.
+   */
+  const discordChannel = (u) => {
+    const m = /^\/attachments\/(\d{15,25})\//.exec(u.pathname);
+    if (!m) return { ok: false, why: 'that is not a Discord attachment link' };
+    const channels = discordChannels();
+    if (!channels.size) {
+      return { ok: false,
+        why: `no Discord channels are allowed yet — ${DISCORD_FILE
+          ? `nothing readable in ${DISCORD_FILE}`
+          : 'set TENMA_DISCORD_CHANNELS_FILE'}` };
+    }
+    const label = channels.get(m[1]);
+    if (!label) {
+      return { ok: false,
+        why: 'that channel is not one this archive takes pictures from' };
+    }
+    return { ok: true, id: m[1], label };
+  };
 
   /** The URL as the archive will remember it, or null if it is not one we take.
    *
@@ -2398,16 +3495,34 @@ export function makeApp(config = CONFIG) {
       if (id) { u.hostname = 'youtube.com'; u.pathname = '/watch'; u.search = `?v=${id}`; }
     }
 
-    /* ONLY what identifies the video. An earlier version kept `t` and `list`
-       too, which meant the same clip linked from a playlist, or at a
-       timestamp, read as a different submission — measured: the same video
-       pasted twice was accepted twice. Neither changes which video gets
-       downloaded, so neither belongs in the identity. */
-    const keep = new Set(['v']);
-    for (const k of [...u.searchParams.keys()]) if (!keep.has(k)) u.searchParams.delete(k);
-    /* An empty query renders as a trailing "?" that makes two identical URLs
-       compare unequal. */
-    if (![...u.searchParams.keys()].length) u.search = '';
+    /* ONLY what identifies the video, and ONLY on YouTube. An earlier version
+       kept `t` and `list` too, which meant the same clip linked from a
+       playlist, or at a timestamp, read as a different submission — measured:
+       the same video pasted twice was accepted twice. Neither changes which
+       video gets downloaded, so neither belongs in the identity.
+
+       Scoping it to the host it was written for is the correction. Unscoped,
+       it ran on every link — and a Discord attachment URL is SIGNED, with the
+       signature in the query string. `?ex=&is=&hm=` went the way of `t` and
+       `list`, so what got stored was an unsigned URL that Discord answers 404
+       to. Every picture link would have failed, and the reason would have been
+       three characters long and invisible in the stored row. */
+    if (host === 'youtube.com') {
+      const keep = new Set(['v']);
+      for (const k of [...u.searchParams.keys()]) if (!keep.has(k)) u.searchParams.delete(k);
+      /* An empty query renders as a trailing "?" that makes two identical URLs
+         compare unequal. */
+      if (![...u.searchParams.keys()].length) u.search = '';
+    } else if (host === 'media.discordapp.net') {
+      /* Discord's resizing proxy. The same path on `cdn.` is the original, and
+         an archive that quietly kept a 300px-wide copy of a picture because
+         that is the link somebody happened to right-click would be an archive
+         of thumbnails. The size parameters go; the signature stays. */
+      for (const k of ['width', 'height', 'format', 'quality', 'size']) {
+        u.searchParams.delete(k);
+      }
+      u.hostname = 'cdn.discordapp.com';
+    }
     return u.href;
   };
 
@@ -2415,22 +3530,64 @@ export function makeApp(config = CONFIG) {
     const me = req.person?.id ?? null;
     if (!me) return res.status(401).json({ error: 'sign in first' });
 
+    /* Which collection, exactly as the byte route takes it. A picture arrives
+       by link far more often than a clip does — a meme is something you saw
+       somewhere and can point at, where a clip is something you cut — so the
+       one collection that could NOT be linked was the one that most wanted
+       it. */
+    const kind = String(req.get('x-upload-kind') || req.body?.kind || 'snippet');
+    if (!SNIPPET_KINDS.includes(kind)) {
+      return res.status(400).json({
+        error: `kind must be one of ${SNIPPET_KINDS.join(', ')}` });
+    }
+    const K = UP_KIND[kind];
+
     const url = linkUrl(req.body?.url);
     if (!url) {
       return res.status(400).json({
         error: `links from ${LINK_HOSTS.join(', ')} only`, hosts: LINK_HOSTS });
     }
 
+    /* Where it came from, for the one host where "a link" and "a file upload"
+       are the same gesture. Everywhere else the URL names a thing that was
+       published — a video on a channel, a tweet — and the platform is the
+       accountable party. A Discord attachment names a file somebody put
+       somewhere, and the somewhere is the whole of what makes it different
+       from an unrestricted upload endpoint. */
+    let from = null;
+    if (DISCORD_HOSTS.has(new URL(url).hostname)) {
+      const ch = discordChannel(new URL(url));
+      /* `link.any` and not a role test. The exemption is held by whoever can
+         already put a file in by hand — gating them buys no safety and costs
+         them every thread and forum post, which are separate channels whose
+         ids nobody can enumerate in advance. Asked as a capability so that
+         when roles become rows, this call site does not change. */
+      if (!ch.ok && !can(req.person, 'link.any')) {
+        return res.status(403).json({ error: ch.why });
+      }
+      /* The label when there is one even for an exempt submitter — being
+         allowed to skip the list is not a reason to lose the provenance when
+         the channel happens to be on it. */
+      from = ch.ok ? ch.label : null;
+    }
+
     /* The same quota as bytes. A link costs the archive nothing to accept and
        costs the RECORDER a download, so if anything it wants the tighter
-       limit — but one number people can hold in their head beats two. */
+       limit — but one number people can hold in their head beats two.
+
+       Counted per collection, and against the same number the byte route
+       uses. A shared count would mean a full meme queue blocking a clip
+       nobody has even downloaded yet — one panel holding another one closed,
+       which is the thing the per-collection caps exist to avoid. */
     const pending = R.prepare(
       `SELECT count(*) c FROM snippet
-        WHERE author_id = ? AND status = 'proposed' AND retracted_at IS NULL`).get(me).c;
-    if (pending >= UP_MAX_PENDING) {
+        WHERE author_id = ? AND kind = ? AND status = 'proposed'
+          AND retracted_at IS NULL`).get(me, kind).c;
+    if (pending >= K.pending) {
       return res.status(429).json({
-        error: `you already have ${pending} clips waiting for review`,
-        pending, limit: UP_MAX_PENDING });
+        error: `you already have ${pending} ${pending === 1 ? K.one : K.noun}`
+          + ' waiting for review',
+        pending, limit: K.pending });
     }
 
     /* Same link twice. Same disclosure rule as the byte-level dedupe: refuse
@@ -2462,23 +3619,35 @@ export function makeApp(config = CONFIG) {
       } catch { return 'Pending fetch'; }
     })();
 
-    /* video_path is NOT NULL, and a link has no file for as long as the
+    /* file_path is NOT NULL, and a link has no file for as long as the
        recorder takes. Written as the name it WILL have — the same shape an
-       upload uses, where video_path is a destination from the moment the row
+       upload uses, where file_path is a destination from the moment the row
        exists — and rewritten with the real extension when the bytes land.
        Nothing serves from it in between: the row is `proposed` with no
        quarantine_path, so every media route resolves it to nothing. */
     W.prepare(
-      `INSERT INTO snippet(id, slug, title, video_path, source_url, transcript_status,
-                           fetch_status, status, origin, author_id, added_at,
-                           created_at, updated_at)
-       VALUES(?,?,?,?,?,'none','queued','proposed','link',?,?,?,?)`)
-      .run(id, id.toLowerCase(), guess, `snippets/${id}`, url, me, t, t, t);
+      `INSERT INTO snippet(id, slug, title, kind, file_path, source_url, source,
+                           transcript_status, fetch_status, status, origin,
+                           author_id, added_at, created_at, updated_at)
+       VALUES(?,?,?,?,?,?,?,'none','queued','proposed','link',?,?,?,?)`)
+      .run(id, id.toLowerCase(),
+           /* A picture is not named after where it came from, for the same
+              reason it is not named after its file: `cdn.discordapp.com
+              shiina_stare.png` is not a description, and it would read as one
+              somebody chose. A clip keeps its guess — a YouTube id is at
+              least the thing itself. */
+           kind === 'snippet' ? guess : '',
+           kind, `${KIND_DIR[kind]}/${id}`, url,
+           /* The credit line, and its first real writer. `source` was added
+              for exactly this and had nothing filling it: a reviewer looking
+              at a queued picture needs to know where it came from, and the
+              URL is not an answer anybody reads. */
+           from, me, t, t, t);
     /* The job carries the URL and nothing path-like. The recorder resolves
        where to put the file from its own config — the archive never names a
        directory to a worker. */
     const jobId = enqueueJob('fetch', { snippetId: id, url, by: me });
-    logEvent(req, 'linked', 'snippet', id, { source_url: url });
+    logEvent(req, 'linked', 'snippet', id, { source_url: url, from });
     bumpGeneration(W);
 
     res.status(201).json({
@@ -2502,7 +3671,7 @@ export function makeApp(config = CONFIG) {
      probe. The one route that makes them builds the payload out of capture
      rows instead, so the URLs are always ones the archive already recorded. */
   const JOB_KINDS = ['fetch', 'promote', 'purge', 'normalize', 'transcribe',
-                     'music_probe', 'music_fetch'];
+                     'ocr', 'music_probe', 'music_fetch', 'clip'];
   /* What the RECORDER may claim. `normalize` is missing on purpose: it runs in
      this process, against the cache mount, and a Pi that claimed one would
      hold a lease on work it cannot do and cannot see the files for. Kept as a
@@ -2519,15 +3688,24 @@ export function makeApp(config = CONFIG) {
      the archive opening one is the thing this whole arrangement exists to
      avoid. `music_probe` reads facts off a page; `music_fetch` downloads a
      video that an editor has already said yes to. */
+  /* `clip` is the Pi's because the masters are on a mount this process can
+     only read, and cutting one means ffmpeg with a seek — which is the
+     recorder's job in the same way promote is. It is also the FIRST kind whose
+     product is a file the person downloads rather than one the archive
+     ingests, which is why it lands in quarantine: that is the only place this
+     container may write, and a clip is a working file by definition. */
   const PI_KINDS = ['fetch', 'promote', 'purge', 'rescan', 'harvest',
-                    'music_probe', 'music_fetch'];
+                    'music_probe', 'music_fetch', 'clip'];
+  /* `ocr` is not the Pi's either, and for a different reason than normalize:
+     the model lives in a sidecar container on THIS docker network, so a Pi
+     that claimed one would be holding a lease on work it cannot reach. */
   /* A clip that is published and whose master is still in quarantine. Written
      once because two things ask it — the panel, to say how many, and the sweep,
      to do something about them — and a count that disagreed with what the
      button then queued would be worse than either. */
-  const strandedSql = `SELECT id, quarantine_path, video_path FROM snippet
+  const strandedSql = `SELECT id, quarantine_path, file_path FROM snippet
       WHERE status = 'confirmed' AND retracted_at IS NULL
-        AND quarantine_path IS NOT NULL AND video_path IS NOT NULL
+        AND quarantine_path IS NOT NULL AND file_path IS NOT NULL
         AND NOT EXISTS (SELECT 1 FROM job j
                          WHERE j.snippet_id = snippet.id AND j.kind = 'promote'
                            AND j.status IN ('approved', 'claimed'))
@@ -2769,6 +3947,15 @@ export function makeApp(config = CONFIG) {
   });
 
   /** The queue, for a human. */
+  /* One job, by id. The list route filters by status, which cannot answer
+     "is THIS one finished yet" — and polling a 50-row list to find one row is
+     a lot of rows to move to learn one word. */
+  app.get('/api/jobs/:id', requireRole('editor'), (req, res) => {
+    const j = R.prepare('SELECT * FROM job WHERE id = ?').get(req.params.id);
+    if (!j) return res.status(404).json({ error: 'no such job' });
+    res.json({ job: jobRow(j) });
+  });
+
   app.get('/api/jobs', requireRole('editor'), (req, res) => {
     const status = req.query.status ? String(req.query.status) : null;
     const limit = Math.min(Math.max(Number(req.query.limit ?? 50) || 50, 1), config.pageMax);
@@ -2818,11 +4005,11 @@ export function makeApp(config = CONFIG) {
           mark.run(worker, t, t, r.id);
           if (r.payload || !r.snippet_id || !['promote', 'purge'].includes(r.kind)) continue;
           const s = W.prepare(
-            'SELECT quarantine_path, video_path FROM snippet WHERE id = ?').get(r.snippet_id);
+            'SELECT quarantine_path, file_path FROM snippet WHERE id = ?').get(r.snippet_id);
           const p = r.kind === 'promote'
-            ? (s?.quarantine_path && s?.video_path
-                ? { from: s.quarantine_path, to: s.video_path } : null)
-            : (s?.video_path ? { path: s.video_path } : null);
+            ? (s?.quarantine_path && s?.file_path
+                ? { from: s.quarantine_path, to: s.file_path } : null)
+            : (s?.file_path ? { path: s.file_path } : null);
           if (!p) continue;
           r.payload = JSON.stringify(p);
           fill.run(r.payload, t, r.id);
@@ -2856,13 +4043,30 @@ export function makeApp(config = CONFIG) {
     if (job.kind === 'music_fetch') {
       return void musicFetchLanded(job, status, resultPath, error, result);
     }
+    if (job.kind === 'clip') {
+      /* What the cut turned out to BE, folded onto the job's own payload.
+         There is no `result` column on `job` and this does not want one: the
+         payload is already the record of what was asked for, so the answer
+         belongs beside the question rather than in a second place every
+         reader would have to learn to join. It is also the only way the panel
+         can say a clip came back short — a live cut is trimmed at the live
+         edge by the recorder, and without this the UI would hand over a
+         41-second file while still claiming it asked for sixty. */
+      if (status !== 'done' || !result) return;
+      let pay = {};
+      try { pay = JSON.parse(job.payload ?? '{}') || {}; } catch { pay = {}; }
+      pay.got = result;
+      W.prepare('UPDATE job SET payload = ?, updated_at = ? WHERE id = ?')
+        .run(JSON.stringify(pay), now(), job.id);
+      return;
+    }
     if (!job.snippet_id) return;
     const t = now();
 
     if (job.kind === 'promote') {
       if (status !== 'done') return;
       /* The master is in the media tree now, so the row stops claiming it is
-         in quarantine. `video_path` was written at accept time as the
+         in quarantine. `file_path` was written at accept time as the
          destination it WOULD have — clearing quarantine_path is what finally
          makes that true, and is why promote never had to rewrite a path
          everything else reads. */
@@ -2900,11 +4104,17 @@ export function makeApp(config = CONFIG) {
        check all happen in the normalize worker, which is already probing this
        exact file a second later and is off the request path — the recorder
        should not be kept waiting on ffprobe for its own status report. */
+    /* The destination follows the ROW's collection, not the default one. Only
+       snippets can be linked today, so this reads 'snippets' every time — but
+       the alternative is a literal that is silently wrong the day a meme can
+       be, and the row already knows the answer. */
+    const kind = R.prepare('SELECT kind FROM snippet WHERE id = ?')
+      .get(job.snippet_id)?.kind ?? 'snippet';
     W.prepare(
-      `UPDATE snippet SET quarantine_path = ?, video_path = ?, fetch_status = 'done',
+      `UPDATE snippet SET quarantine_path = ?, file_path = ?, fetch_status = 'done',
                           fetch_note = NULL, normalize_status = 'queued', updated_at = ?
         WHERE id = ?`)
-      .run(rel, `snippets/${rel}`, t, job.snippet_id);
+      .run(rel, `${KIND_DIR[kind] ?? 'snippets'}/${rel}`, t, job.snippet_id);
     enqueueJob('normalize', { snippetId: job.snippet_id });
   }
 
@@ -3000,7 +4210,7 @@ export function makeApp(config = CONFIG) {
       // `title` is not decoration: this row is about to become a tombstone, and
       // the log line naming what was destroyed is the only place the name
       // survives in a form anyone will read.
-      `SELECT id, title, status, quarantine_path, video_path, play_path, poster_path
+      `SELECT id, title, status, quarantine_path, file_path, play_path, poster_path
          FROM snippet WHERE id = ?`).get(req.params.id);
     if (!s) return res.status(404).json({ error: 'no such snippet' });
     /* A published clip has to be unlisted first. Not bureaucracy: this is the
@@ -3028,13 +4238,13 @@ export function makeApp(config = CONFIG) {
        is what says it was promoted — an upload that never got there still has
        its bytes in quarantine and was handled above. */
     let job = null;
-    if (!s.quarantine_path && s.video_path) {
+    if (!s.quarantine_path && s.file_path) {
       /* The one name that matters, before the row stops holding it. Two lines
          below this, `retracted_at` is set and the paths are cleared — a purge
          job that had to look the row up afterwards would find a tombstone with
          nothing left to name. */
       job = enqueueJob('purge', { snippetId: s.id, by: req.person.id,
-                                  payload: { path: s.video_path } });
+                                  payload: { path: s.file_path } });
     }
 
     const t = now();
@@ -3154,7 +4364,7 @@ export function makeApp(config = CONFIG) {
     const stranded = R.prepare(strandedSql).all();
     for (const s of stranded) {
       enqueueJob('promote', { snippetId: s.id, by: req.person.id,
-                              payload: { from: s.quarantine_path, to: s.video_path } });
+                              payload: { from: s.quarantine_path, to: s.file_path } });
     }
 
     if (failed.length || stranded.length) {
@@ -3241,8 +4451,8 @@ export function makeApp(config = CONFIG) {
      medium is roughly 3x realtime and veryfast is roughly 10x; at CRF 21 the
      difference on a clip somebody recorded off a stream is not something you
      can see, and the difference in how the site feels for the ten minutes is
-     something everybody can. Slower, prettier settings belong in
-     scripts/normalize-media.js, which runs on a PC nobody is browsing. */
+     something everybody can. Slower, prettier settings belong on a PC nobody
+     is browsing, not in the box that is also serving the page. */
   const NORM = {
     crf: Number(process.env.TENMA_NORMALIZE_CRF) || 21,
     preset: process.env.TENMA_NORMALIZE_PRESET || 'veryfast',
@@ -3317,15 +4527,18 @@ export function makeApp(config = CONFIG) {
    *  A sound clip gets a waveform instead. Never fatal either way: a row
    *  without a picture is worse-looking, not broken.
    */
-  async function makePoster(s, p, playRel, src, audioOnly) {
+  async function makePoster(s, p, playRel, src, audioOnly, still = false) {
     if (!config.cacheRoot) return s.poster_path ?? null;
     try {
+      /* One folder for every kind's thumbnails, on purpose. /cache is derived
+         data that regenerates in about a minute, so nothing in it needs to be
+         findable by collection the way the masters do. */
       mkdirSync(join(config.cacheRoot, 'snippets'), { recursive: true });
       const rel = `snippets/${s.id}.jpg`;
       const from = playRel ? join(config.cacheRoot, playRel) : src;
       const abs = join(config.cacheRoot, rel);
-      const err = audioOnly
-        ? await ffmpeg(wavePosterArgs(from, abs))
+      const err = audioOnly ? await ffmpeg(wavePosterArgs(from, abs))
+        : still             ? await ffmpeg(stillPosterArgs(from, abs))
         : await ffmpeg(posterArgs(from, abs, p.duration_s));
       if (!err) {
         W.prepare('UPDATE snippet SET poster_path = ? WHERE id = ?').run(rel, s.id);
@@ -3420,7 +4633,7 @@ export function makeApp(config = CONFIG) {
        from /media is fine — it is mounted read-only, not unreadable. */
     const src = s.quarantine_path
       ? resolveMedia(config.quarantineRoot, s.quarantine_path)
-      : resolveMedia(config.mediaRoot, s.video_path);
+      : resolveMedia(config.mediaRoot, s.file_path);
     if (!src || !existsSync(src)) {
       normSet(s.id, 'failed', 'the file is not where the row says it is');
       finishJob(job.id, 'failed', null, `missing source for ${s.id}`);
@@ -3461,6 +4674,32 @@ export function makeApp(config = CONFIG) {
         bumpGeneration(W);
         return;
       }
+    }
+
+    /* A picture, which arrived here only because it came by LINK. An upload
+       never queues this job for a still — the route makes its poster in
+       process and stops — but a fetched file reaches quarantine with no sha
+       and no facts, so it comes through here to get them, and then must not
+       go one line further. Everything below encodes: `still` would fall into
+       `encode` and spend two cores turning a PNG into an H.264 video of a
+       PNG.
+       intakeFetched() above has already written the dimensions, the codecs
+       and the hash. What is left is the two things the upload route does
+       after them. */
+    if (base === 'still') {
+      await makePoster({ id: s.id, poster_path: s.poster_path }, p, null, src, false, true);
+      /* `none`, not `done`. There was never anything to normalize, and a
+         column reading `done` would have somebody looking for an output that
+         does not exist. */
+      normSet(s.id, 'none');
+      if (!R.prepare(
+            `SELECT 1 FROM job WHERE snippet_id = ? AND kind = 'ocr'
+               AND status IN ('approved','claimed','paused')`).get(s.id)) {
+        enqueueJob('ocr', { snippetId: s.id, by: job.requested_by ?? null });
+      }
+      finishJob(job.id, 'done', null, null);
+      bumpGeneration(W);
+      return;
     }
 
     /* An export that is the right shape and the wrong size.
@@ -3610,11 +4849,16 @@ export function makeApp(config = CONFIG) {
            waiting on a transcript, which arrives after approval by design.
            Draining normalize before touching transcribe is the whole of that
            priority; it needs no weights. */
-        const job = claimNormalize() ?? claimTranscribe();
+        /* OCR sits between them, and the order is about waiting rather than
+           importance: a picture is a fraction of a second and a clip is
+           minutes, so an OCR job queued behind a half-hour transcription
+           would wait half an hour to do something instant. */
+        const job = claimNormalize() ?? claimOcr() ?? claimTranscribe();
         if (!job || seen.has(job.id)) break;
         seen.add(job.id);
         try {
           if (job.kind === 'normalize') await runNormalize(job);
+          else if (job.kind === 'ocr') await runOcr(job);
           else await runTranscribe(job);
         } catch (e) { finishJob(job.id, 'failed', null, e?.message ?? String(e)); }
         /* Whatever way that went — including the early returns that never
@@ -3623,6 +4867,305 @@ export function makeApp(config = CONFIG) {
         finally { cancelled.delete(job.id); }
       }
     } finally { busy = false; }
+  }
+
+
+  // -------------------------------------------------------------------------
+  // text in pictures
+  //
+  // The same shape as transcription, one layer further out. Whisper is a
+  // static binary this process spawns; PaddleOCR is Python with an ONNX
+  // runtime under it, so it lives in a sidecar container and this asks it over
+  // the docker network. Everything else is deliberately identical — the job
+  // queue, the lease, the switch, and above all the COLUMN: what a picture
+  // says goes into `transcript`, beside what a clip says, so one index
+  // searches both and one editor corrects both.
+  //
+  // Queued at UPLOAD rather than at approval, which is the opposite of
+  // transcription and for a measurable reason. A transcript is minutes of CPU
+  // on a two-core box, so spending it on something an editor is about to
+  // reject is real waste. A small picture through a 16 MB model is a fraction
+  // of a second, and having the words before the verdict is worth more: the
+  // reviewer can read what the meme SAYS, and the submitter's own pending row
+  // is searchable straight away.
+  //
+  // Stills only. Reading text off a moving picture means deciding which frames
+  // to sample and then what to do with four different answers, and that is a
+  // feature rather than a detail — a gif with text on it can be run by hand
+  // once there is something to run.
+  // -------------------------------------------------------------------------
+
+  /** The row for one task, always present — schema.sql seeds all three. */
+  const modelRow = (task) =>
+    R.prepare('SELECT * FROM model WHERE task = ?').get(task) ?? null;
+
+  const modelSet = (task, patch) => {
+    const cols = Object.keys(patch);
+    if (!cols.length) return;
+    W.prepare(`UPDATE model SET ${cols.map((c) => `${c} = ?`).join(', ')}, updated_at = ?
+                WHERE task = ?`).run(...cols.map((c) => patch[c]), now(), task);
+  };
+
+  /** Whether OCR can happen at all, and why not when it cannot.
+   *
+   *  Three separate answers on purpose, because they need three different
+   *  things done about them: no sidecar configured is a compose file, a
+   *  disabled slot is a switch somebody flipped, and an unreachable sidecar is
+   *  a container that is not running. "OCR is not working" would collapse all
+   *  three into a shrug.
+   */
+  const ocrReady = () => {
+    const m = modelRow('ocr');
+    if (!m) return { ok: false, why: 'no ocr slot in the model table' };
+    if (!m.enabled) return { ok: false, why: 'the ocr slot is switched off' };
+    if (!config.mlUrl) return { ok: false, why: 'TENMA_ML_URL is not set — there is no sidecar' };
+    return { ok: true, why: null, model: m };
+  };
+
+  /* Same switch as transcription, same reasoning: in memory, gating the CLAIM
+     and not the enqueue, so a pause loses nothing and a restart ends it. */
+  let ocrOn = true;
+
+  /* How long to leave a sidecar alone after it failed to answer at all.
+   *
+   * Without this, a job put back by the `down` path in runOcr is claimable on
+   * the very next tick, so an ML container that is off means a fetch attempt
+   * every few seconds for as long as it stays off — the tight loop claimOcr's
+   * comment above is about, just with a network call in it instead of a write.
+   * In memory and not in the database, for the same reason the pause switch
+   * is: it is a fact about right now, and a restart should clear it.
+   */
+  const ML_RETRY_S = Math.max(1, Number(process.env.TENMA_ML_RETRY_S) || 30);
+  let ocrQuietUntil = 0;
+
+  /** Claim one OCR job, or null.
+   *
+   *  Nothing is claimed while there is nothing to run it with. The runner
+   *  could put such a job back, and that is what the transcribe path does —
+   *  but a job put back is a job this same pass can claim again, which is a
+   *  tight loop with database writes in it. The jobs sit as queued, the panel
+   *  says why, and they go the moment a sidecar answers.
+   */
+  const OCR_LEASE_S = Math.ceil(config.mlTimeoutMs / 1000) + 120;
+  const claimOcr = () => {
+    if (!ocrOn || !ocrReady().ok) return null;
+    // Backing off from a sidecar that did not answer — see ML_RETRY_S. The
+    // jobs stay queued and the panel keeps saying why; only the asking pauses.
+    if (now() < ocrQuietUntil) return null;
+    const t = now();
+    return tx(W, () => {
+      const j = W.prepare(
+        `SELECT * FROM job
+          WHERE kind = 'ocr'
+            AND (status = 'approved'
+                 OR (status = 'claimed' AND (claimed_at IS NULL OR claimed_at < ?)))
+          ORDER BY created_at LIMIT 1`).get(t - OCR_LEASE_S);
+      if (!j) return null;
+      W.prepare(`UPDATE job SET status = 'claimed', claimed_by = 'server',
+                                claimed_at = ?, attempts = attempts + 1, updated_at = ?
+                  WHERE id = ?`).run(t, t, j.id);
+      return j;
+    });
+  };
+
+  /** Ask the sidecar to read a picture.
+   *
+   *  The whole of the network contract, in one place, so that when the sidecar
+   *  is actually built there is exactly one shape to match:
+   *
+   *      POST {mlUrl}/ocr        multipart: file=<the image>, model=<slug>
+   *      200 { "text": "…", "model": "…", "ms": 123 }
+   *
+   *  Anything else is a failure with the body as the reason. The archive sends
+   *  BYTES rather than a path on purpose — the sidecar has no business having
+   *  the media tree mounted, and a container that cannot see the archive's
+   *  files cannot be talked into reading one it was not handed.
+   */
+  async function askOcr(slug, abs) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), config.mlTimeoutMs);
+    try {
+      const form = new FormData();
+      form.append('model', slug);
+      form.append('file', new Blob([readFileSync(abs)]), basename(abs));
+      const r = await fetch(`${config.mlUrl}/ocr`, {
+        method: 'POST', body: form, signal: ctl.signal });
+      const body = await r.text();
+      if (!r.ok) return { err: `the sidecar said ${r.status}: ${body.slice(0, 300)}` };
+      let d = null;
+      try { d = JSON.parse(body); } catch { return { err: 'the sidecar did not answer JSON' }; }
+      if (typeof d?.text !== 'string') return { err: 'the sidecar answered without any text' };
+      return { text: d.text, model: d.model ?? slug };
+    } catch (e) {
+      /* Named separately because they mean different things to whoever reads
+         the panel: a timeout is a model that is loading or a picture that is
+         enormous, and a refusal is a container that is not up.
+         `down` marks both as facts about the DEPLOYMENT rather than about this
+         picture — see runOcr, which puts such a job back instead of failing
+         it. A sidecar that answers and says something wrong is the other kind
+         and carries no flag. */
+      return { down: true,
+        err: e?.name === 'AbortError'
+          ? `the sidecar did not answer within ${Math.round(config.mlTimeoutMs / 1000)}s`
+          : `could not reach the sidecar: ${e?.message ?? e}` };
+    } finally { clearTimeout(timer); }
+  }
+
+  async function runOcr(job) {
+    const ready = ocrReady();
+    if (!ready.ok) {
+      /* Back to the queue rather than failed, matching transcription. Having
+         no sidecar is a fact about the deployment and not about this picture,
+         and a job marked failed for it would need someone to notice and
+         retry it once the container was up. */
+      W.prepare(`UPDATE job SET status = 'approved', claimed_by = NULL, claimed_at = NULL,
+                                error = ?, updated_at = ? WHERE id = ?`)
+        .run(ready.why, now(), job.id);
+      return;
+    }
+    const s = R.prepare('SELECT * FROM snippet WHERE id = ? AND retracted_at IS NULL')
+      .get(job.snippet_id);
+    if (!s) { finishJob(job.id, 'failed', null, 'that picture is gone'); return; }
+    /* A human has been through it. Re-running would overwrite a correction
+       with a guess, which is the one outcome this must never produce — the
+       editor's version is the archive's answer. */
+    if (s.transcript_status === 'edited') {
+      finishJob(job.id, 'done', null, null);
+      return;
+    }
+
+    const abs = (s.quarantine_path && config.quarantineRoot
+                 && resolveMedia(config.quarantineRoot, s.quarantine_path))
+      || (s.file_path && config.mediaRoot && resolveMedia(config.mediaRoot, s.file_path));
+    if (!abs || !existsSync(abs)) {
+      finishJob(job.id, 'failed', null, 'no file to read');
+      return;
+    }
+
+    const t0 = now();
+    W.prepare(`UPDATE snippet SET transcript_status = 'running', transcript_note = NULL,
+                                  updated_at = ? WHERE id = ?`).run(t0, s.id);
+
+    const out = await askOcr(ready.model.slug, abs);
+    const t = now();
+    /* A container that is down or too slow to answer gets the same treatment
+       as a slot that was never configured: the job goes BACK, and the picture
+       is left alone. This is the case the requeue above was written for and
+       did not cover — `ocrReady()` can only see config, so a compose file with
+       TENMA_ML_URL in it and no container behind it reached here and marked
+       every meme uploaded during the outage `failed`, permanently, each one
+       needing a re-OCR by hand. On a NAS an ML container that restarts is a
+       Tuesday, so this is the common path rather than the exotic one.
+       The model row still records it, because that is where somebody looks to
+       find out why nothing is happening. */
+    if (out.down) {
+      ocrQuietUntil = t + ML_RETRY_S;
+      modelSet('ocr', { state: 'error', state_note: out.err.slice(0, 300), checked_at: t });
+      W.prepare(`UPDATE snippet SET transcript_status = 'none', transcript_note = NULL,
+                                    updated_at = ? WHERE id = ?`).run(t, s.id);
+      W.prepare(`UPDATE job SET status = 'approved', claimed_by = NULL, claimed_at = NULL,
+                                error = ?, updated_at = ? WHERE id = ?`)
+        .run(out.err.slice(0, 300), t, job.id);
+      bumpGeneration(W);
+      return;
+    }
+    if (out.err) {
+      modelSet('ocr', { state: 'error', state_note: out.err.slice(0, 300), checked_at: t });
+      W.prepare(`UPDATE snippet SET transcript_status = 'failed', transcript_note = ?,
+                                    updated_at = ? WHERE id = ?`)
+        .run(out.err.slice(0, 300), t, s.id);
+      finishJob(job.id, 'failed', null, out.err);
+      bumpGeneration(W);
+      return;
+    }
+
+    /* LINES, and not just the column. `transcript` is documented as the flat
+       join of snippet_line and is derived from it — writing the column alone
+       would leave a picture whose words are searchable, visible nowhere, and
+       uneditable, because every surface that shows or corrects a transcript
+       reads the lines. One row per line the model returned, all at t=0, which
+       is what a still's timing honestly is; the whole-transcript editor then
+       works on a meme exactly as it does on a clip, and an editor's correction
+       flips transcript_status to `edited` through the path that already
+       exists rather than through a second one written for pictures.
+       `empty` and not `failed` for a picture with no words on it: it is a real
+       answer — most reaction faces have none — and the difference matters for
+       the re-run list, where `failed` should mean something went wrong rather
+       than that a blank picture was read correctly. */
+    const lines = out.text.split(/\r?\n/)
+      .map((l) => l.replace(/[^\S\n]+/g, ' ').trim())
+      .filter(Boolean);
+    const text = lines.join(' ');
+    tx(W, () => {
+      W.prepare('DELETE FROM snippet_line WHERE snippet_id = ?').run(s.id);
+      const ins = W.prepare(
+        `INSERT INTO snippet_line(id, snippet_id, seq, start_s, end_s, speaker, text)
+         VALUES(?,?,?,0,NULL,NULL,?)`);
+      lines.forEach((l, i) => ins.run(ulid(), s.id, i, l));
+      W.prepare(`UPDATE snippet SET transcript = ?, transcript_status = ?,
+                                    transcript_model = ?, transcript_at = ?,
+                                    transcript_note = NULL, updated_at = ?
+                  WHERE id = ?`)
+        .run(text || null, text ? 'auto' : 'empty', out.model, t, t, s.id);
+    });
+    modelSet('ocr', { state: 'loaded', state_note: null, checked_at: t, used_at: t });
+    finishJob(job.id, 'done', null, null);
+    logEvent(null, 'read the text on a picture', 'snippet', s.id,
+             { model: out.model, chars: text.length, seconds: t - t0 });
+    bumpGeneration(W);
+  }
+
+  /** Ask the sidecar what it has, and remember the answer.
+   *
+   *  Called by the admin panel rather than on a timer. A poll would be asking
+   *  a container that is usually idle to wake up and say the same thing it
+   *  said a minute ago; the panel is opened when somebody wants to know.
+   */
+  async function modelCheck(task) {
+    const m = modelRow(task);
+    if (!m) return null;
+    const spec = MODEL_TASK[task];
+    const t = now();
+    if (spec?.runner === 'local') {
+      /* whisper is not the sidecar's. Its readiness is two paths on this
+         filesystem, which is a question already answered elsewhere — asked
+         here so the panel has one shape for all three rather than a special
+         case it has to know about. */
+      const w = whisperReady();
+      modelSet(task, { state: w.ok ? 'installed' : 'absent',
+                       state_note: w.why, checked_at: t });
+      return modelRow(task);
+    }
+    if (!config.mlUrl) {
+      modelSet(task, { state: 'absent',
+                       state_note: 'TENMA_ML_URL is not set — there is no sidecar',
+                       checked_at: t });
+      return modelRow(task);
+    }
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 8000);
+    try {
+      /*  GET {mlUrl}/models  →  { "models": [{ slug, loaded, bytes }] }
+          The second half of the contract, and the only other call the archive
+          makes. Deliberately a plain GET with no arguments: the sidecar
+          reporting everything it has is one round trip whatever the panel
+          asks about, and it cannot be turned into a probe for anything else. */
+      const r = await fetch(`${config.mlUrl}/models`, { signal: ctl.signal });
+      const d = await r.json();
+      const hit = (d?.models ?? []).find((x) => x?.slug === m.slug);
+      modelSet(task, {
+        state: !hit ? 'absent' : hit.loaded ? 'loaded' : 'installed',
+        state_note: hit ? null : `the sidecar does not have ${m.slug}`,
+        bytes: hit?.bytes ?? m.bytes ?? null,
+        checked_at: t,
+      });
+    } catch (e) {
+      modelSet(task, { state: 'error', checked_at: t,
+        state_note: (e?.name === 'AbortError'
+          ? 'the sidecar did not answer in 8s'
+          : `could not reach the sidecar: ${e?.message ?? e}`).slice(0, 300) });
+    } finally { clearTimeout(timer); }
+    return modelRow(task);
   }
 
   // -------------------------------------------------------------------------
@@ -3791,7 +5334,7 @@ export function makeApp(config = CONFIG) {
     const src = (s.play_path && config.cacheRoot && resolveMedia(config.cacheRoot, s.play_path))
       || (s.quarantine_path && config.quarantineRoot
           && resolveMedia(config.quarantineRoot, s.quarantine_path))
-      || (s.video_path && config.mediaRoot && resolveMedia(config.mediaRoot, s.video_path));
+      || (s.file_path && config.mediaRoot && resolveMedia(config.mediaRoot, s.file_path));
     if (!src || !existsSync(src)) {
       finishJob(job.id, 'failed', null, 'no file to transcribe');
       return;
@@ -4051,6 +5594,30 @@ export function makeApp(config = CONFIG) {
     `SELECT seq, start_s, end_s, speaker, text FROM snippet_line
       WHERE snippet_id = ? ORDER BY seq`);
 
+  /* The filename on a shareable link.
+   *
+   *  Not dlName(): that one names a Save-As dialog and is allowed spaces and
+   *  Japanese, both of which become a screenful of percent-escapes in a URL
+   *  somebody is about to paste into a chat window. A slug and a real
+   *  extension is what reads as a link and what an unfurler treats as an
+   *  image. The route ignores this segment entirely — it is decoration on a
+   *  URL the id alone already resolves.
+   */
+  const shareName = (r) => {
+    const ext = extname(String(r.file_path ?? '')).toLowerCase() || '.png';
+    /* The emptiness is tested BEFORE slugify, not after. slugify() never
+       returns '' — handed nothing it falls through to its hash branch and
+       answers `tag-0`, which is a perfectly good slug and the same one every
+       time. So `slugify(title) || slug` looked like a fallback and was not:
+       every untitled picture in the archive would have shared one link name.
+       Untitled is the ORDINARY state for a picture, so this is the common
+       path rather than an edge. */
+    const stem = r.title
+      ? slugify(String(r.title)).slice(0, 60)
+      : String(r.slug ?? 'image');
+    return encodeURIComponent(stem) + ext;
+  };
+
   const snipRow = (r, { lines = false, me = null } = {}) => (
     /* Read once and used twice — for the strip itself, and for the filter that
        decides which suggestions are still outstanding. Wrapped rather than
@@ -4060,6 +5627,16 @@ export function makeApp(config = CONFIG) {
     id: r.id,
     slug: r.slug,
     title: r.title,
+    /* Which panel this belongs to. Sent on every row rather than assumed from
+       the query, because the Review queue holds all three at once and a row
+       there has to be able to say which collection it will go back to. */
+    kind: r.kind ?? 'snippet',
+    /* The credit line: who drew it, where it was found. Null on every clip in
+       the archive today and sent anyway, because the gallery draws it beside
+       the picture and an absent field and an empty one look different there.
+       What a picture SAYS is not here — that is `transcript`, and it reaches
+       the page through has_transcript and the detail route like any clip's. */
+    source: r.source ?? null,
     /* The client has to be able to tell a published row from one only its
        submitter can see, or the pending clip renders as though it were live. */
     status: r.status,
@@ -4073,6 +5650,20 @@ export function makeApp(config = CONFIG) {
     // server resolves it, so a row can never hand out something that looks like
     // a filesystem path to try things against.
     video: `/media/snippet/${r.id}`,
+    /* The same bytes as `video`, under a name that ends in .png — for the
+       link button, which exists so a meme can be dropped into a chat and
+       show up as a picture rather than as a URL. Only on a still, because
+       that is the only case where the extension of what gets served is not
+       in question: a clip may be handed its original or its normalized copy
+       depending on what the cache holds. */
+    share: isStill(r) ? `/media/snippet/${r.id}/${shareName(r)}` : null,
+    /* Whether this row is a single picture, decided HERE and sent, rather
+       than left for the page to infer. The page cannot infer it: a jpeg
+       probes as 0.04 seconds, so `duration_s > 0` calls it a video on the
+       client for exactly the same reason it did on the server — and the
+       client has no format table to correct itself with. One boolean is
+       cheaper than teaching the browser what `image2` means. */
+    still: isStill(r),
     poster: r.poster_path ? `/media/snippet-poster/${r.id}` : null,
     source_stream_id: r.source_stream_id,
     source_offset_s: r.source_offset_s,
@@ -4130,7 +5721,15 @@ export function makeApp(config = CONFIG) {
   }))(TAGLETS_OF.all(r.id)));
 
   app.get('/api/snippets', (req, res) => {
-    const { q = '', taglet, kind, scope = 'all', include = '' } = req.query;
+    const { q = '', taglet, scope = 'all', include = '' } = req.query;
+    /* `?taglet_kind=` and not `?kind=`, which it used to be. The two are
+       different questions — "clips in the Memes collection" and "clips
+       carrying a tag of kind character" — and one name cannot answer both.
+       The collection wins the short name because it is the one the panels
+       ask for on every page load and the one that matches the column. This
+       filter was reachable but unused: nothing in the page, the scripts or
+       the recorder ever sent it. */
+    const tagletKind = req.query.taglet_kind;
     const limit = Math.min(Math.max(Number(req.query.limit ?? 40) || 40, 1), config.pageMax);
     const before = req.query.before ?? null;
     /* The rows come with their transcripts. A page of 40 clips is a few hundred
@@ -4158,6 +5757,21 @@ export function makeApp(config = CONFIG) {
     const wantStatus = req.query.status ? String(req.query.status) : null;
     if (wantStatus && !mayReview) {
       return res.status(403).json({ error: 'filtering by review status requires review.read' });
+    }
+
+    /* Which collection. `snippet` when nothing is asked for, which is what
+       keeps every existing caller — the panel, the moment link, ls-archive —
+       answering exactly what it did before memes existed.
+
+       `all` is spelled out rather than being what an empty parameter means,
+       because the Review queue is the one caller that wants three collections
+       at once and it should have to say so. A default that meant "everything"
+       would have quietly filled the Snippets panel with reaction faces on the
+       day this deployed. */
+    const wantKind = req.query.kind ? String(req.query.kind) : 'snippet';
+    if (wantKind !== 'all' && !SNIPPET_KINDS.includes(wantKind)) {
+      return res.status(400).json({
+        error: `kind must be one of ${SNIPPET_KINDS.join(', ')}, or all` });
     }
 
     /* Tag filtering is a small boolean expression now, not one slug.
@@ -4188,13 +5802,16 @@ export function makeApp(config = CONFIG) {
        is empty. Listed explicitly so the reason is on the page rather than in
        someone's head. */
     const myGrants = atLeast(req.person, 'editor') ? ['*'] : grantsOf(me).sort();
-    const etag = etagFor('snips', q, tagAll, tagAny, tagNot, kind, scope, limit, myGrants,
+    const etag = etagFor('snips', q, tagAll, tagAny, tagNot, wantKind, tagletKind,
+                         scope, limit, myGrants,
                          before, wantLines, req.query.transcript, wantStatus,
                          mayReview, me);
     if (fresh(req, res, etag, { personal: !!me })) return res.status(304).end();
 
     const where = ['s.retracted_at IS NULL'];
     const params = [];
+
+    if (wantKind !== 'all') { where.push('s.kind = ?'); params.push(wantKind); }
 
     if (wantStatus === 'all') { /* every status; editors only, checked above */ }
     else if (wantStatus) { where.push('s.status = ?'); params.push(wantStatus); }
@@ -4271,10 +5888,10 @@ export function makeApp(config = CONFIG) {
       where.push(`EXISTS (${HAS(`t.slug IN (${tagAny.map(() => '?').join(', ')})`)})`);
       params.push(...tagAny);
     }
-    if (kind) {
+    if (tagletKind) {
       where.push(`EXISTS (SELECT 1 FROM snippet_taglet st JOIN tag t ON t.id = st.tag_id
                            WHERE st.snippet_id = s.id AND t.kind = ? AND t.retracted_at IS NULL)`);
-      params.push(String(kind));
+      params.push(String(tagletKind));
     }
     // ?transcript=failed|none|empty|auto|edited — how you find the clips that
     // need another pass without reading a thousand sidecars off the NAS.
@@ -4543,22 +6160,26 @@ export function makeApp(config = CONFIG) {
       if (want === 'confirmed') {
         for (const r of move) {
           const q = R.prepare(
-            `SELECT quarantine_path, video_path, transcript_status, audio_codec
+            `SELECT quarantine_path, file_path, transcript_status, audio_codec
                FROM snippet WHERE id = ?`).get(r.id);
           if (q?.quarantine_path) {
-            /* Both names, both relative, neither a directory: `from` is the
-               bare filename the accept endpoint minted in quarantine and `to`
-               is the same file as the media tree will refer to it. The
-               recorder joins each to its own root and refuses anything that
-               does not stay inside them — the archive naming a path it does
-               not itself hold a write handle for is a record, not an order.
+            /* Both names relative: `from` is the bare filename the accept
+               endpoint minted in quarantine and `to` is the same file as the
+               media tree will refer to it — which since memes and gallery
+               images arrived means `memes/<name>` as often as `snippets/`.
+               Quarantine stays flat because do_promote takes its source
+               `bare=True`; the destination has always been allowed a
+               directory and the worker makes the parent. The recorder joins
+               each to its own root and refuses anything that does not stay
+               inside them — the archive naming a path it does not itself
+               hold a write handle for is a record, not an order.
 
                Taken now rather than looked up later on purpose: neither
                column moves after accept, and a job that carries its own facts
                cannot be made wrong by an edit made while it sat in the queue. */
             enqueueJob('promote', { snippetId: r.id, by: req.person.id,
                                     payload: { from: q.quarantine_path,
-                                               to: q.video_path } });
+                                               to: q.file_path } });
             promoted++;
           }
           /* Transcription happens AFTER approval, which is the whole reason a
@@ -4978,6 +6599,28 @@ export function makeApp(config = CONFIG) {
     return out;
   }
 
+  /** The recording running for this stream right now, or null.
+   *
+   *  Built on liveState() rather than on `live.recording` directly, so the id
+   *  resolution — remote_id first, then the vault index — stays in one place
+   *  and a clip cannot be aimed at a stream the badge disagrees about.
+   *
+   *  With no platform named, Twitch wins. That is not a preference about
+   *  platforms, it is the recorder's own rule and its reason is good: Twitch
+   *  records at the live edge, so its file holds the moment you just watched,
+   *  while a --live-from-start YouTube capture can be minutes behind and
+   *  simply not have those frames yet. See _pick_stream in ls_rec.py.
+   */
+  const liveRecFor = (streamId, want = null) => {
+    const st = liveState();
+    if (st.stale) return null;
+    for (const p of (want ? [want] : ['TW', 'YT'])) {
+      const r = st[p];
+      if (r?.live && r.stream_id === streamId) return { platform: p, ...r };
+    }
+    return null;
+  };
+
   app.get('/api/live', (req, res) => {
     // Never cached. The entire value of this response is that it is current,
     // and fresh() would hand the page a fifteen-second-old answer.
@@ -5065,7 +6708,14 @@ export function makeApp(config = CONFIG) {
       .trim();
     const tags = taglets.map((t) => clean(t.name).replace(/ /g, '-'))
       .filter(Boolean).slice(0, 6);
-    const title = clean(row.title) || 'clip';
+    /* A title when there is one, and the row's own slug when there is not —
+       which on a picture is the ordinary state, because its filename was
+       gibberish and was deliberately not turned into a name. The slug is the
+       minted id there, so it is ugly and it is UNIQUE: a folder of thirty
+       downloaded memes has thirty names rather than `picture (29).jpg`. The
+       tags still lead, so what makes the name readable is what somebody
+       actually chose to say about it. */
+    const title = clean(row.title) || clean(row.slug) || 'clip';
 
     const ROOM = 120 - ext.length;
 
@@ -5255,13 +6905,44 @@ export function makeApp(config = CONFIG) {
      Not currently reachable: ids are ULIDs and appear in no ungated response.
      But "rejected" is a promise about what the archive serves, and a promise
      kept by the metadata and broken by the media is not kept. */
-  app.get('/media/snippet/:id', (req, res) => {
-    const s = R.prepare(`SELECT id, title, video_path, play_path, quarantine_path,
+  /* Two spellings of one route, and the second exists for one reason: the
+     link a person pastes somewhere else.
+     
+         /media/snippet/01J8.../shiina-stare.png
+     
+     Everything after the id is ignored — the id is still the only thing that
+     names a file and the gate below is still the only thing that decides —
+     but a URL that ENDS in .png is what an unfurler will treat as an image,
+     and it is what a browser's Save-image-as offers as the filename. The
+     alternative is asking every embedder to trust a Content-Type header, and
+     several of the ones people actually paste into do not.
+     
+     No new surface: same handler, same visibility check, same bytes. The
+     trailing segment is never joined to a path. */
+  /* What /media/snippet/<id> will actually answer with, decided the same way
+     the route below decides it.
+     Pulled out because the share card's meta tags have to name the SERVED
+     container rather than the uploaded one: a VP9 upload is handed out as the
+     normalized mp4, and an unfurler told `video/webm` about an mp4 plays
+     nothing at all and says nothing about why. */
+  const playType = (s) => {
+    if (s?.play_path && config.cacheRoot) {
+      const e = extname(s.play_path).toLowerCase();
+      return e === '.webm' ? 'video/webm' : e === '.m4a' ? 'audio/mp4' : 'video/mp4';
+    }
+    return servedType(s?.container, s?.video_codec, s?.audio_codec);
+  };
+
+  const sendSnippetMedia = (req, res) => {
+    /* `slug` and `kind` are not decoration: dlName() falls back to the slug
+       when there is no title, which on a picture is the ordinary case, and
+       without it every untitled meme downloaded under the same name. */
+    const s = R.prepare(`SELECT id, slug, kind, title, file_path, play_path, quarantine_path,
                                 container, video_codec, audio_codec, status, author_id,
                                 normalize_status, fetch_status
                            FROM snippet WHERE id = ? AND retracted_at IS NULL`).get(req.params.id);
     if (!snipVisible(s, req)) return res.status(404).json({ error: 'no such snippet' });
-    if (!s?.video_path) return res.status(404).json({ error: 'no such snippet' });
+    if (!s?.file_path) return res.status(404).json({ error: 'no such snippet' });
 
     /* ?dl=1 — the same bytes, offered as a file with a name on it.
        Handled before the play-path preference below because the answer to
@@ -5275,7 +6956,7 @@ export function makeApp(config = CONFIG) {
       const src = isGif || !s.play_path
         ? (s.quarantine_path
             ? { rel: s.quarantine_path, root: config.quarantineRoot }
-            : { rel: s.video_path, root: config.mediaRoot })
+            : { rel: s.file_path, root: config.mediaRoot })
         : { rel: s.play_path, root: config.cacheRoot };
       if (!src.rel || !src.root) return res.status(404).json({ error: 'not on disk' });
       const taglets = TAGLETS_OF.all(s.id);
@@ -5293,13 +6974,12 @@ export function makeApp(config = CONFIG) {
        holds the masters — which is also what lets the server do the
        conversion at all. */
     if (s.play_path && config.cacheRoot) {
-      const e = extname(s.play_path).toLowerCase();
-      const t = e === '.webm' ? 'video/webm' : e === '.m4a' ? 'audio/mp4' : 'video/mp4';
-      return sendMedia(req, res, s.play_path, { type: t, root: config.cacheRoot });
+      return sendMedia(req, res, s.play_path,
+                       { type: playType(s), root: config.cacheRoot });
     }
 
     /* Nothing has been downloaded yet. Without this the fallthrough below
-       resolves video_path to a file that does not exist and answers "not on
+       resolves file_path to a file that does not exist and answers "not on
        disk", which is true and unhelpful — the clip is not missing, it has
        not arrived. */
     if (s.fetch_status === 'queued' || s.fetch_status === 'running') {
@@ -5345,8 +7025,10 @@ export function makeApp(config = CONFIG) {
     }
     // No recorded codecs at all means a row imported before this existed;
     // fall back to the extension table rather than refusing to serve it.
-    return sendMedia(req, res, s.video_path, { type });
-  });
+    return sendMedia(req, res, s.file_path, { type });
+  };
+  app.get('/media/snippet/:id', sendSnippetMedia);
+  app.get('/media/snippet/:id/:name', sendSnippetMedia);
 
   /* Posters resolve against the CACHE root first, then the media root.
      Two roots because they are written by different things: the importer
@@ -6209,6 +7891,19 @@ export function makeApp(config = CONFIG) {
   const SITE = 'Flatfox';
   const SITE_BLURB = 'An archive of Tenma Maemi.';
 
+  /** The row an anonymous reader may be told about, or null.
+   *
+   *  The anonymous question, deliberately — see rule 2 above. ANON is the
+   *  archive's own word for nobody, and it is what every request carries
+   *  before a cookie is read; asking with a bare null instead would be a
+   *  different, subtly weaker question, and `atLeast()` dereferences it.
+   */
+  const publicSnippet = (id) => {
+    const r = R.prepare(
+      `SELECT * FROM snippet WHERE id = ? AND retracted_at IS NULL`).get(id);
+    return snipVisible(r, { person: ANON }) ? r : null;
+  };
+
   /** The <head> additions for one moment, or the site's own when there is
    *  nothing an anonymous reader may be told about it.
    */
@@ -6219,13 +7914,8 @@ export function makeApp(config = CONFIG) {
       ['og:description', SITE_BLURB], ['twitter:card', 'summary'],
     ];
 
-    const r = R.prepare(
-      `SELECT * FROM snippet WHERE id = ? AND retracted_at IS NULL`).get(id);
-    /* The anonymous question, deliberately — see rule 2 above. ANON is the
-       archive's own word for nobody, and it is what every request carries
-       before a cookie is read; asking with a bare null instead would be a
-       different, subtly weaker question, and `atLeast()` dereferences it. */
-    if (!snipVisible(r, { person: ANON })) return generic;
+    const r = publicSnippet(id);
+    if (!r) return generic;
 
     const dur = shortDur(r.duration_s);
     const tags = TAGLETS_OF.all(r.id)
@@ -6233,9 +7923,12 @@ export function makeApp(config = CONFIG) {
       .slice(0, 6).map((t) => t.name);
     const desc = [dur, tags.join(', ')].filter(Boolean).join(' · ') || SITE_BLURB;
 
+    const still = isStill(r);
     const out = [
       ['og:site_name', SITE],
-      ['og:type', 'video.other'],
+      // A picture is not a video, and telling an unfurler otherwise is how you
+      // get a play button drawn over a JPEG that will never play.
+      ['og:type', still ? 'website' : 'video.other'],
       ['og:title', r.title || 'A moment'],
       ['og:description', desc],
       ['og:url', `${base}/m/${r.id}`],
@@ -6248,17 +7941,335 @@ export function makeApp(config = CONFIG) {
       if (r.width) out.push(['og:image:width', String(r.width)]);
       if (r.height) out.push(['og:image:height', String(r.height)]);
       out.push(['twitter:card', 'summary_large_image']);
+    } else if (still && r.file_path) {
+      /* A picture is its own thumbnail, and a meme that never got a generated
+         poster is otherwise a card with no picture in it. The trailing name is
+         what makes an unfurler that goes by the URL rather than the
+         Content-Type treat it as an image — see /media/snippet/:id/:name. */
+      out.push(['og:image',
+                `${base}/media/snippet/${r.id}/${r.id}${extname(r.file_path).toLowerCase() || '.jpg'}`]);
+      if (r.width) out.push(['og:image:width', String(r.width)]);
+      if (r.height) out.push(['og:image:height', String(r.height)]);
+      out.push(['twitter:card', 'summary_large_image']);
     } else {
       out.push(['twitter:card', 'summary']);
+    }
+
+    /* og:video is the whole point of the public carve-out: it is what turns a
+       picture card into one that plays in the message, without the reader
+       leaving Discord or holding an account here.
+       The type is what it will be SERVED as, not what was uploaded, and
+       `secure_url` is only claimed when the base really is https — an unfurler
+       handed an https url that answers on http drops the card. */
+    const vt = still ? null : playType(r);
+    if (r.file_path && vt && vt.startsWith('video/')) {
+      const url = `${base}/media/snippet/${r.id}`;
+      out.push(['og:video', url]);
+      if (base.startsWith('https://')) out.push(['og:video:secure_url', url]);
+      out.push(['og:video:type', vt]);
+      if (r.width) out.push(['og:video:width', String(r.width)]);
+      if (r.height) out.push(['og:video:height', String(r.height)]);
     }
     if (dur) out.push(['og:video:duration', String(Math.round(r.duration_s))]);
     return out;
   }
 
-  app.get('/m/:id', (req, res) => {
-    const html = indexHtml();
-    if (html === null) return res.status(500).json({ error: 'the page is missing' });
+  // -------------------------------------------------------------------------
+  // The two pages a stranger can see
+  //
+  // Both are SELF-CONTAINED: no stylesheet, no webfont, no script from
+  // anywhere, nothing fetched, nothing that needs an API to answer. That is
+  // not thrift, it is the requirement — these render in precisely the
+  // situation where the rest of the archive is unreachable, and a page that
+  // needed the archive in order to look right would look broken instead of
+  // looking locked.
+  //
+  // Which is also why the application itself is not what a stranger gets.
+  // Serving index.html to somebody with no session would boot a megabyte of
+  // app, have every one of its dozen opening requests refused, and render as
+  // something that is not working rather than as something they may not have.
+  // -------------------------------------------------------------------------
 
+  /* Shared so there is one palette rather than three. Deliberately a subset of
+     the application's: what these pages need is the background, the ink, the
+     accent and a border. */
+  /* The fox, inlined.
+     Read once at boot and embedded rather than linked, for two reasons: these
+     pages fetch nothing, and pointing at /icon.svg would mean widening the
+     gate's carve-out by a route in order to serve a logo.
+     A mask and not an <img>, the same choice the topbar makes and for the same
+     reason — the artwork's fills are baked dark, CSS cannot reach inside an
+     external image to recolour it, and a mask uses only the alpha so
+     `background` decides the colour.
+     Absent, the mark falls back to the diamond these pages shipped with, which
+     is what happens in the test tree where the artwork does not live. */
+  const FOX = (() => {
+    try {
+      const svg = readFileSync(join(HERE, 'public', 'icon.svg'));
+      if (!svg.length || svg.length > 48 * 1024) return null;
+      return svg;
+    } catch { return null; }
+  })();
+  const FOX_URI = FOX && `data:image/svg+xml;base64,${FOX.toString('base64')}`;
+  /* The same artwork repainted for a browser tab, where there is no mask to
+     hide behind and a shape baked in near-black is invisible against a dark
+     one. #231f20 is what the file actually contains — the topbar's comment
+     says so — and a replace that finds nothing yields no favicon rather than
+     a wrong one. */
+  const FOX_ICON = (() => {
+    if (!FOX) return null;
+    const painted = FOX.toString('utf8').replace(/#231f20/gi, '#ef9fc6');
+    if (!painted.includes('#ef9fc6')) return null;
+    return `data:image/svg+xml;base64,${Buffer.from(painted, 'utf8').toString('base64')}`;
+  })();
+
+  /* Shared so there is one palette rather than three. Deliberately a subset of
+     the application's: what these pages need is the ground, the ink, the
+     accent and a border.
+
+     Her colours, not the app's, and the two will converge from this end. The
+     ground is lighter than the application's near-black, which changes one
+     thing structurally: --surface and --panel are DARKER than --bg here, so a
+     field or a box reads as recessed rather than raised. That is why the input
+     looks like a well and the button like a tile.
+
+     Three tones that are not in the brief and why:
+       --text-2   the warm cream, two steps lighter. #d1c1a8 on this ground is
+                  4.3:1 — fine for the wordmark, which is large, and short of
+                  AA for footer-sized text. So the ramp lightens for small
+                  print and --text-3 is kept for what is big or decorative.
+       --link     the accent as TEXT is 3.8:1 and fails; the accent as a FILL
+                  with dark ink on it is 7.7:1 and passes. Different jobs,
+                  different values. The button keeps her pink exactly.
+       --err      warm salmon rather than red, far enough from the accent to
+                  not read as another link.
+
+     .wm exists because the gap kept landing inside the word. `Flat<i>fox</i>`
+     as bare text beside an element is TWO flex items — a text node in a flex
+     container becomes its own anonymous item — so the 11px meant for
+     mark-to-word split the word and it read as "Flat fox".
+
+     The wordmark is Caveat (SIL Open Font License 1.1, (c) 2014 The Caveat
+     Project Authors), subset to the seven letters of the word and inlined —
+     1.8 KB, so there is no request and no third party. Renaming the site means
+     re-subsetting it; until then a missing glyph falls through the stack to
+     whatever cursive the machine has, rather than to a blank box. */
+  const PAGE_CSS = `
+/* Caveat, (c) 2014 The Caveat Project Authors, SIL Open Font License 1.1
+   <https://scripts.sil.org/OFL>. Subset to the letters of the wordmark.
+   The notice travels with the bytes: a subset embedded in a page is still a
+   redistribution, and the one place it is certain to stay attached is beside
+   the data itself. */
+@font-face{font-family:Caveat;font-style:normal;font-weight:700;font-display:block;
+  src:url(data:font/woff2;base64,d09GMgABAAAAAAcAAA8AAAAADAwAAAapAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGhwbIBwqBmA/U1RBVCoAZBEICo44ilIBNgIkAyALEgAEIAWDJgcgGw0JUZRuUpHgi4NM7rpFMohEthU7cm2e8FRk5fy9mkF02tzeJr0STEEnZVI95OBhp0+RIFmuWTiNIr4KhUSVbnFdKHyrDgUKIXEOjbLlS/8D+Pe/XMup69QCSyTNwtbIGpPIJnYhB0+E+r/dmLNElWxgTJKU6s3NakB8AuE7cU1dFOjsEyc+8YlUfCwqOIoiQSc4oKYs2s12ExpHAQ7Up5kbKn29FNORYSQRDEADxBkETxBFdGYyoMaCFaaZmJ4PDv0vEAPIONiJC9Ka1qymux0mNBWjaWwg+8ADciHFANLMVpgp/HwA/IyNBIPcBCxCon5p5b8rwD6ZcJbLXEmtwwa7Z4wTMQNjsAUyF4q6GQAgo4Ipsg9uB8COINiR+VQ2QIeOfItENRq1EuvW7/+/8MX/91psPgWZGabGwElg5h+0MS4coQNQBbICyB1QT2+fZIzj74N1RyY565YXdM1mVrkM5f8dRhIA0sdjF4xLoCTqDXLocgk6jhIrO07AN+ggC4uoDacArJIiSm6mmMYizKxOarHyIS5qsZmhoNVIGUVAQuMAq0kQrlZX8cvCqOI+SB+7hNpzlseYmeqyKEpbyOd5yx2V7OzLU2DVWKW+aGLFrz7zAn6MMCKIOJWXXjKvANDqSpE0VWz1ig9zyFbtbw+F685qCtlBdlD6Jip3DjohlPva0r9N6cuW631prOboRB4FQXpLEEXJJ1PaWe/wsgnSEBgQYEda2slETq1+cDNpRqtFUE6Fy1dSAGIHXFACGwcAELEWDpI27rLkOMoOsg/iqhnluSRL+Ure9YWWuMMxR95MFITZljAHBBCYbtPMVIDixL/CsOi8E0iS2SATEqveo1KQcwdNtbIxzZGM31rFrGvnwuX62lyQnbZQmOIrC0Xi4cqSa5Gjvd5JkJMhL0EyQplyUC+UGenOojVGi0zcZyK1WMJvgR0u26DoZTu4PndlobDSWHtfUbQ4coKFm6uvaiaQqKhQ83WNcktSHo3n4nHbK/KctFf8tpJ5xSbdCHmLdWYHArPMyKmNcmQFwqTC4WXu0lRqPa/V0aj/K7lN4zYvdVv/Y41yOH43f6KEQSe4sU9fXtb9Sj81eDzyTJ0RbKSrGYkET6Suw22zcbuPUaRBxdIOyeZFPtO+qlrbPqghj+0P5cQ1srEzlDp+xH6ZkW7dF7JIILDL9zeCb19QS+wIp+ezPJkIs18gqYwPcvf7pns5PIl+evQ5e9O+KAzMBm+kdJh/wj9rgV3fn/60kA7VT7rzUprR+8cudrkihjl+enuq+kXJTXUTOp3dPjhQSQPOFSQm1bsZiKovjLTYnpEn+8tp+pw7cPQGbv3y5twX+rqEsZTfIvFg3IlJiWO/Rap61+msoBBTwY3sx/3bXHp2lVYY6itPzjNJEh+Ylb1Dqq2iDo9z0CBhjq2W3QUWy9Y1TedRQ4q6begwfwZj5ISaGH2+rHG4W5FsyK4X6J8wYWkK1UwyHDWhnl9owAVbUIZPVG10PDTiMFnN4d7e7rRCFdMdN5X6tEKFq/PnpVOaRFtFZgnGgnc8bj9nl0vRd97noYam0MS5S49ScXjwvUcKQlX8qRrUPt/MyixMXuLB13y5yr7NxlkL8WV9vpkxfV4iUe4etTo/3/t9k62bp25hv5HflRlfM/vmem4IdDfLGWN084ZfzAIXrhlrsFiW7koS4Jcp8ckKalg9oGYi5SxpjPl0G98+RqkDW1qHL0zcOmbsmDf9dSdLUod9Dbx2RKrj/NOpS4dTch0domD/j1tv6qU32A2LXTTj8rIB0lFmSCqFa0z7eLpEHWPUaa8/DeyaaWLZxOfxUJioqWGt/95VHDfFVQ+Td9ovFz8K38QNBPpWd/J9+JxO79A991B4/YjtGeCgrnEnzMLbL3fWr6CHdUU3thIqreurdwYAgAEQ0H+/vlKlHfGVY9kXAFwrifgEwG3R1fD/E36PvcEqEfgIAGDgE1HmKM6KmyDAr+NSZf974xJ6cQBp4YEUW5ATzSiKNNRHEYIwAC4KoUIOOg9GonGqOrGYRBXAEsCFMjQsQQnOBpTlYQdKGXmE8pj5gfAZhR4PA2iEi3S+fQTEJPrr1ERIpJsNPz58BTTafAK1ISZQo0+I1XDabKNsYs1uep0tVo9pExHL2i4R5jKfrZuksYXxVhxCTWSvHrW81BFrE7Vi0TuFWjVoJNauWxdvdas2uu6hdxyxVvX8ePGJrg0nUCJXgvARpGdeKLJtHIUado01rV9nM3M5s3mKNNyUgQWC/m/PDw==) format("woff2")}
+:root{--bg:#59525a;--panel:#453f47;--surface:#2a212b;--text:#f3f1f7;
+  --text-2:#ddcfb9;--text-3:#d1c1a8;--accent:#ef9fc6;--on-accent:#2a212b;
+  --link:#f8c2d8;--err:#ffc4b8;--line:rgba(209,193,168,.22)}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);
+  font:16px/1.55 "Plus Jakarta Sans",system-ui,-apple-system,Segoe UI,sans-serif;
+  -webkit-font-smoothing:antialiased;display:flex;flex-direction:column;
+  align-items:center;gap:20px;padding:clamp(22px,6vh,72px) 16px}
+a{color:var(--link);text-decoration:none}
+a:hover{text-decoration:underline}
+/* The word is ONE flex item, so the gap cannot land inside it. */
+.brand{display:flex;align-items:center;gap:11px;text-decoration:none;
+  color:var(--text)}
+.brand:hover{text-decoration:none}
+.wm{font-family:Caveat,"Segoe Script","Bradley Hand",cursive;font-weight:700;
+  font-size:2.15rem;line-height:1;letter-spacing:.005em}
+.wm i{font-style:normal;color:var(--text-3)}
+.mark{flex:none;background:var(--accent)}
+${FOX_URI
+  ? `.mark{width:25px;height:28px;
+      -webkit-mask:url("${FOX_URI}") no-repeat center/contain;
+              mask:url("${FOX_URI}") no-repeat center/contain}`
+  : '.mark{width:13px;height:13px;border-radius:3px;transform:rotate(45deg)}'}
+.foot{color:var(--text-2);font-size:.78rem;text-align:center;margin:0;
+  line-height:1.7}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}`;
+
+  /* The tab icon, for both pages. A link somebody bookmarks should not be a
+     blank sheet of paper, and without it every visit also spends a request on
+     a /favicon.ico the gate refuses. */
+  const FAVICON = FOX_ICON
+    ? `<link rel="icon" href="${FOX_ICON}">`
+    : '';
+
+  /* Her channel, in the footer of both public pages. The line already named
+     her; a name in the footer of a fan archive should be the way to the person
+     it is about. rel=noopener because target=_blank without it hands the new
+     tab a window.opener handle back into this origin. */
+  const FOOT = 'An archive of <a href="https://www.youtube.com/@TenmaMaemi"'
+    + ' target="_blank" rel="noopener noreferrer">Tenma Maemi</a>.'
+    + '<br>Not affiliated with Phase Connect.';
+
+  /* The door. Served to anybody without a session who asks for the root, and
+     for anything else page-shaped that the gate refuses. A stranger learns the
+     site's name and that there is a password, which is all there is to learn.
+
+     Nothing in the page it returns explains itself. The inline script's
+     redirect goes to the root and never back to where they came from — the
+     only other page they could arrive from is the 404, which after signing in
+     is still a 404, and the archive is what they were trying to reach. That
+     note used to be a comment inside the <script>, where anybody who opened
+     devtools read my working notes; these two pages are the ones strangers
+     inspect, so the reasoning lives here and the output stays quiet. */
+  function gatePage(req, msg = null) {
+    return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>${attrEsc(SITE)}</title>
+${FAVICON}
+<style>${PAGE_CSS}
+body{justify-content:center;padding-bottom:14vh}
+main{width:100%;max-width:330px;display:flex;flex-direction:column;gap:18px;
+  align-items:center}
+form{display:flex;flex-direction:column;gap:10px;width:100%}
+input{width:100%;padding:12px 14px;border-radius:10px;color:var(--text);
+  background:var(--surface);border:1px solid var(--line);font:inherit}
+input::placeholder{color:var(--text-3)}
+input:focus{border-color:var(--accent);outline:none}
+button{width:100%;padding:12px 16px;border:0;border-radius:10px;cursor:pointer;
+  background:var(--accent);color:var(--on-accent);font:inherit;font-weight:700}
+button:hover:not([disabled]){filter:brightness(1.06)}
+button[disabled]{opacity:.55;cursor:default}
+.note,.err{margin:0;font-size:.85rem;text-align:center}
+.note{color:var(--text-2)}
+.err{color:var(--err);font-weight:600}
+</style></head><body>
+<main>
+  <div class="brand"><span class="mark"></span><span class="wm">Flat<i>fox</i></span></div>
+  ${msg ? `<p class="note">${attrEsc(msg)}</p>` : ''}
+  <form id="f">
+    <input id="p" type="password" name="password" placeholder="Password"
+      autocomplete="current-password" aria-label="Password" autofocus>
+    <button id="b" type="submit">Sign in</button>
+  </form>
+  <p class="err" id="e" role="alert" hidden></p>
+  <p class="foot">${FOOT}</p>
+</main>
+<script>
+(function(){
+  var f=document.getElementById('f'),p=document.getElementById('p'),
+      e=document.getElementById('e'),b=document.getElementById('b');
+  f.addEventListener('submit',function(ev){
+    ev.preventDefault();
+    e.hidden=true;b.disabled=true;b.textContent='Signing in';
+    fetch('/api/auth/login',{method:'POST',
+      headers:{'content-type':'application/json'},
+      body:JSON.stringify({password:p.value})})
+      .then(function(r){
+        if(r.ok){location.replace('/');return null;}
+        return r.json().catch(function(){return{};}).then(function(x){
+          throw new Error(x.error||('refused ('+r.status+')'));});
+      })
+      .catch(function(x){
+        e.textContent=(x&&x.message)||'the server did not answer';
+        e.hidden=false;b.disabled=false;b.textContent='Sign in';p.select();
+      });
+  });
+})();
+</script>
+</body></html>`;
+  }
+
+  /* One moment, for somebody holding the link and nothing else.
+   *
+   * This is the human half of the Discord carve-out. The unfurler reads the
+   * <head> and never renders any of this; the person who clicks the card gets
+   * this page. Same three routes, same visibility check, no session, no API.
+   *
+   * `r` is null both when the id never existed and when it is not published,
+   * and this page is IDENTICAL in the two cases — see rule 1 above. A page
+   * that said "not public" would be an oracle: paste a hundred ids and learn
+   * which hundred clips exist without being allowed to see one.
+   */
+  /* NO robots meta on this page, deliberately, and there was one for a round.
+     This page exists to be read by a robot. Discord's fetcher honours
+     robots.txt, and asking one unfurler not to look while asking another to
+     render the tags is a distinction too fine to bet the feature on — it cost
+     an evening's debugging to learn that. Keeping strangers out is the gate's
+     job; search-engine reach belongs at /robots.txt, where one file governs
+     the site instead of one page quietly disagreeing with the rest. */
+  function cardPage(req, r, head) {
+    const base = publicBase(req);
+    const still = r ? isStill(r) : false;
+    const vt = r && !still ? playType(r) : null;
+    const dur = r ? shortDur(r.duration_s) : null;
+    const tags = r
+      ? TAGLETS_OF.all(r.id).filter((t) => !t.gate).slice(0, 8).map((t) => t.name)
+      : [];
+    const title = r ? (r.title || 'A moment') : SITE;
+    /* Only when both are known, and only as a ratio — the frame then reserves
+       the right shape before a byte of video has arrived, which is the
+       difference between a card that settles and one that jumps. */
+    const ratio = r && r.width > 0 && r.height > 0
+      ? ` style="aspect-ratio:${r.width}/${r.height}"` : '';
+    const poster = r?.poster_path ? `${base}/media/snippet-poster/${r.id}` : null;
+
+    let media = '';
+    if (r && still && r.file_path) {
+      media = `<img${ratio} src="${attrEsc(
+        `${base}/media/snippet/${r.id}/${r.id}${extname(r.file_path).toLowerCase() || '.jpg'}`)}"
+        alt="${attrEsc(title)}">`;
+    } else if (r && r.file_path && vt) {
+      /* preload="metadata" rather than auto: this link gets pasted into a
+         channel and opened by a dozen people at once, and none of them asked
+         for the whole clip before pressing play. */
+      media = `<video${ratio} controls playsinline preload="metadata"${
+        poster ? ` poster="${attrEsc(poster)}"` : ''}>
+        <source src="${attrEsc(`${base}/media/snippet/${r.id}`)}" type="${attrEsc(vt)}">
+      </video>`;
+    } else if (poster) {
+      // The still exists and the bytes do not — better than an empty frame.
+      media = `<img${ratio} src="${attrEsc(poster)}" alt="${attrEsc(title)}">`;
+    }
+
+    const line = [dur, tags.join(' · ')].filter(Boolean).join('  ·  ');
+    return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${attrEsc(r ? `${title} · ${SITE}` : SITE)}</title>
+${FAVICON}
+${head}
+<style>${PAGE_CSS}
+main{width:100%;max-width:760px;display:flex;flex-direction:column;gap:14px}
+/* Black behind the video whatever the page's ground is: letterboxing that
+   matches the page makes a 9:16 clip look like a cropping mistake, and every
+   player anybody has ever seen sits on black. */
+.frame{width:100%;background:#000;border:1px solid var(--line);border-radius:14px;
+  overflow:hidden;display:flex;line-height:0}
+video,img{width:100%;height:auto;max-height:76vh;display:block;object-fit:contain;
+  background:#000}
+h1{margin:0;font-size:1.18rem;line-height:1.35;font-weight:700}
+.line{margin:0;color:var(--text-2);font-size:.85rem}
+.bar{display:flex;gap:16px;align-items:center;flex-wrap:wrap;font-size:.85rem;
+  font-weight:600}
+.empty{padding:34px 18px;text-align:center;color:var(--text-2);
+  background:var(--panel);border:1px solid var(--line);border-radius:14px}
+/* The wordmark is the way back on this page, so it has to look like one. */
+.brand:hover .wm{color:var(--link)}
+.wm{transition:color .15s ease}
+</style></head><body>
+<a class="brand" href="/"><span class="mark"></span><span class="wm">Flat<i>fox</i></span></a>
+<main>
+${media ? `  <div class="frame">${media}</div>` : ''}
+${r ? `  <h1>${attrEsc(title)}</h1>` : ''}
+${r && line ? `  <p class="line">${attrEsc(line)}</p>` : ''}
+${r ? `  <div class="bar">
+    <a href="${attrEsc(`/media/snippet/${r.id}?dl=1`)}">Save the file</a>
+    <a href="/">The rest of the archive</a>
+  </div>` : `  <div class="empty">Nothing to show here.<br><a href="/">Flatfox</a></div>`}
+  <p class="foot">${FOOT}</p>
+</main>
+</body></html>`;
+  }
+
+  app.get('/m/:id', (req, res) => {
     let tags = [];
     /* A malformed id, a database that does not answer, a title with something
        unusual in it — none of these should cost somebody the page. Fall back
@@ -6269,6 +8280,24 @@ export function makeApp(config = CONFIG) {
     const head = tags
       .map(([k, v]) => `<meta property="${attrEsc(k)}" content="${attrEsc(v)}">`)
       .join('\n');
+
+    /* Somebody holding the link and no session gets the card, not the app.
+       Signed in, the same URL opens the archive at that moment, which is what
+       it has always done and what you want when it is you clicking it. */
+    if (gateOn() && !signedIn(req)) {
+      let row = null;
+      try { row = publicSnippet(String(req.params.id ?? '')); }
+      catch (e) { console.error('card for /m:', e?.message ?? e); }
+      /* `private, no-cache` for the same reason as below — a shared proxy
+         holding this under an id outlives the clip being gated later. No ETag
+         though: this page is a few kilobytes, so asking and re-sending cost
+         the same and one of them is simpler. */
+      res.set('Cache-Control', 'private, no-cache');
+      return res.type('html').send(cardPage(req, row, head));
+    }
+
+    const html = indexHtml();
+    if (html === null) return res.status(500).json({ error: 'the page is missing' });
 
     /* `private`, because a shared proxy holding a page under an id is exactly
        the kind of thing that outlives a gate being added to a taglet later —
@@ -6349,6 +8378,16 @@ if (isMain) {
     console.log(`  quarantine  ${quarantineState()}`);
     app.startNormalizeWorker();
     console.log(`  dev auth    ${CONFIG.devAuth ? 'ON — do not expose this' : 'off'}`);
+    /* The one line to read before opening a port. The gate and dev auth are
+       opposites by construction, so there is no state where both are on and no
+       way to expose the archive by forgetting a flag — but "gate on, no
+       password set" is reachable and means nobody can sign in at all, which is
+       worth saying out loud rather than discovering at the login box. */
+    console.log(`  gate        ${CONFIG.devAuth
+      ? 'off — dev auth is on'
+      : CONFIG.adminPass
+        ? `ON — sign in as ${CONFIG.adminHandle}`
+        : 'ON, but NO PASSWORD IS SET — nobody can sign in'}`);
     console.log(`  ingest      ${CONFIG.ingestToken ? 'enabled' : 'disabled (no token set)'}`);
   });
 }

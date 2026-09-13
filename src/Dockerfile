@@ -16,34 +16,34 @@ WORKDIR /w
 RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
       -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF \
  && cmake --build build -j2 --config Release
-
+ 
 FROM node:22-alpine
-
+ 
 RUN apk add --no-cache ffmpeg tini libstdc++ libgomp
 COPY --from=whisper /w/build/bin/whisper-cli /usr/local/bin/whisper-cli
 WORKDIR /app
-
+ 
 # Copied first and separately so `npm ci` is cached against dependency changes
 # rather than every edit to server.js.
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-
+ 
 COPY . .
-
+ 
 # Nothing in here writes to /app. The database lives in /data and the media is
 # mounted read-only, so the image can run unprivileged.
 USER node
-
+ 
 ENV NODE_ENV=production \
     PORT=8000 \
     TENMA_DB=/data/archive.db \
     TENMA_MEDIA_ROOT=/media \
     TENMA_CACHE_ROOT=/cache \
     TENMA_HOST=0.0.0.0
-
-
+ 
+ 
 EXPOSE 8000
-
+ 
 # tini, because node as PID 1 does not reap children or forward SIGTERM
 # properly, and an unclean stop on a WAL-mode SQLite database is the one
 # shutdown you do not want to get wrong.
