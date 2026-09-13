@@ -296,10 +296,15 @@ export const KIND_DIR = { snippet: 'snippets', meme: 'memes', gallery: 'gallery'
  */
 export const MODEL_TASKS = ['transcribe', 'ocr', 'search'];
 
+/* `what` is gone from all three. The panel is a list of slots with a state and
+   a picker each, and a sentence explaining what transcription is belongs in
+   the documentation rather than on a control an administrator uses weekly.
+   `into` stays: it is where the output LANDS, which is the one fact about a
+   model that is not visible from anywhere else — it is simply no longer drawn
+   on the card. */
 export const MODEL_TASK = {
   transcribe: {
     label: 'Transcription',
-    what: 'Speech in a clip, written down.',
     /* The one task that does not go to the sidecar. whisper.cpp is a single
        static binary the archive already spawns, and moving it would be a
        rewrite of something that works to gain a network hop. */
@@ -307,8 +312,7 @@ export const MODEL_TASK = {
     into: 'the transcript, line by line, with timings',
   },
   ocr: {
-    label: 'Text in pictures',
-    what: 'Words ON a meme — the part a search can match.',
+    label: 'Optical Character Recognition',
     runner: 'sidecar',
     /* Deliberately the same column a clip's speech lands in. A caption field
        beside it would be two homes for one fact, searched by two indexes, and
@@ -316,8 +320,7 @@ export const MODEL_TASK = {
     into: 'the transcript, as lines with no timings',
   },
   search: {
-    label: 'Smart search',
-    what: 'What a picture is OF, without anybody typing it.',
+    label: 'Smart Search (CLIP)',
     runner: 'sidecar',
     into: 'an embedding beside the row — not built yet',
   },
@@ -2028,13 +2031,25 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
       }
     }
 
-    // Same idea one level up: two people tagging the same thing with the same
-    // thing is not a conflict, it is agreement. The pair already being there
-    // means the changeset's intent is satisfied, so drop the insert rather than
-    // failing the UNIQUE and rolling back everything else in it.
+    /* Same idea one level up: two people tagging the same thing with the same
+       thing is not a conflict, it is agreement. The pair already being there
+       means the changeset's intent is satisfied, so drop the insert rather than
+       failing the UNIQUE and rolling back everything else in it.
+
+       `music_tag` was missing from this list for as long as the music module
+       has existed, and the consequence was a proposal that could be turned
+       down but never approved. Approving the first of two mints of one name
+       onto one song creates the tag and the junction; the second one's mint
+       then folds correctly onto the row that now exists — and dies on the
+       junction underneath it, rolling back the whole changeset with a raw
+       SQLITE_CONSTRAINT. Nothing about that is recoverable by trying again,
+       because the thing in the way is the first approval having worked. Every
+       junction the archive has belongs here; a new one that is not is the same
+       bug waiting. */
     for (const [jt, [a, b]] of Object.entries({
       stream_tag: ['stream_id', 'tag_id'],
       snippet_taglet: ['snippet_id', 'tag_id'],
+      music_tag: ['music_id', 'tag_id'],
     })) {
       for (const [tid, c] of [...creates]) {
         if (c.type !== jt) continue;

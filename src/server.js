@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url';
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 import {
-  bumpGeneration, create, meta, now, open, resolveDbPath, slugify, tx, ulid,
+  bumpGeneration, create, meta, now, open, resolveDbPath, setMeta, slugify, tx, ulid,
 } from './db.js';
 import {
   ALL_KINDS, ChangeError, KINDS,
@@ -1129,6 +1129,8 @@ export function makeApp(config = CONFIG) {
               COUNT(DISTINCT st.stream_id) n,
               (SELECT COUNT(*) FROM snippet_taglet sl JOIN snippet sn ON sn.id = sl.snippet_id
                 WHERE sl.tag_id = t.id AND sn.retracted_at IS NULL) snippets,
+              (SELECT COUNT(*) FROM music_tag mt JOIN music mu ON mu.id = mt.music_id
+                WHERE mt.tag_id = t.id AND mu.retracted_at IS NULL) songs,
               (SELECT COUNT(*) FROM segment g
                 WHERE g.tag_id = t.id AND g.retracted_at IS NULL) blocks,
               (SELECT COUNT(*) FROM ${insideFrom({ tag: 't.id' })}) inside
@@ -1157,7 +1159,8 @@ export function makeApp(config = CONFIG) {
          to have meant to bring back. */
       retracted_at: t.retracted_at ?? null,
       parent: t.parent_id ? { id: t.parent_id, name: t.parent_name, slug: t.parent_slug } : null,
-      streams: t.n, snippets: t.snippets, blocks: t.blocks, inside: t.inside,
+      streams: t.n, snippets: t.snippets, songs: t.songs, blocks: t.blocks,
+      inside: t.inside,
     })) });
   });
 
@@ -3021,7 +3024,6 @@ export function makeApp(config = CONFIG) {
         return {
           task,
           label: spec.label,
-          what: spec.what,
           into: spec.into,
           runner: spec.runner,
           slug: m?.slug ?? null,
@@ -3137,10 +3139,10 @@ export function makeApp(config = CONFIG) {
     res.json({ job_id: id });
   });
 
-  /** One job: pause it, put it back, or stop it. */
+  /** One job: pause it, put it back, stop it, or give up on it. */
   app.post('/api/jobs/:id/:verb', requireRole('admin'), (req, res) => {
     const verb = String(req.params.verb);
-    if (!['pause', 'resume', 'cancel', 'retry'].includes(verb)) {
+    if (!['pause', 'resume', 'cancel', 'retry', 'dismiss'].includes(verb)) {
       return res.status(404).json({ error: 'no such action' });
     }
     const j = R.prepare('SELECT * FROM job WHERE id = ?').get(req.params.id);
@@ -3193,10 +3195,61 @@ export function makeApp(config = CONFIG) {
                                       updated_at = ?
                     WHERE id = ? AND transcript_status = 'failed'`).run(t, j.snippet_id);
       }
+      /* And the third pair of columns that mirror a job, which this block also
+         predated. A retried music job left the card reading `unread` or `not
+         saved` with the old reason under it while the recorder was already
+         queued to try again — the same disagreement, on the surface where it
+         is least explicable, because a song's card is the only place its state
+         is shown at all. */
+      const mid = (j.kind === 'music_probe' || j.kind === 'music_fetch')
+        ? musicJobTarget(j) : null;
+      if (mid) {
+        const col = j.kind === 'music_probe' ? 'probe' : 'fetch';
+        W.prepare(`UPDATE music SET ${col}_status = 'queued', ${col}_note = NULL,
+                                    updated_at = ?
+                    WHERE id = ? AND ${col}_status = 'failed'`).run(t, mid);
+      }
       logEvent(req, 'sent a job back to the recorder', 'snippet', j.snippet_id ?? j.id,
                { job_id: j.id, kind: j.kind, attempts: j.attempts });
       bumpGeneration(W);
       return res.json({ ok: true, status: 'approved' });
+    }
+
+    if (verb === 'dismiss') {
+      /* Giving up, which until now there was no way to say.
+       *
+       * `retry` assumes the failure was circumstantial and the next attempt
+       * might land. Plenty are not: a post whose host will not serve it to
+       * this recorder cannot ever be fetched, and the job for it sat in the
+       * panel forever with a button whose only honest label would have been
+       * "fail again". A queue that accumulates work nobody will ever do is a
+       * queue people stop reading, and the failure that mattered is in there
+       * with the ones that never will.
+       *
+       * Terminal by construction: `dismissed` is not `failed`, so neither the
+       * retry above nor the sweep — which re-approves everything failed —
+       * picks it back up. The row stays, with its error, and the event log
+       * says who gave up and when.
+       *
+       * Deliberately does NOT touch the snippet or music row it belongs to.
+       * That row IS failed, truthfully, and its note is the reason why — "X
+       * did not hand over the video for that post" is the most useful sentence
+       * anybody has about it. Overwriting that with "dismissed by kyabatsu"
+       * would trade the explanation for the bookkeeping. */
+      if (!['failed', 'cancelled'].includes(j.status)) {
+        return res.status(409).json({
+          error: j.status === 'claimed' || j.status === 'approved'
+            ? `that one is still ${j.status === 'claimed' ? 'running' : 'queued'}` +
+              ' — cancel it first, then dismiss it'
+            : `that job is ${j.status}, and only a failed one can be dismissed` });
+      }
+      W.prepare(`UPDATE job SET status = 'dismissed', updated_at = ?,
+                                finished_at = COALESCE(finished_at, ?) WHERE id = ?`)
+        .run(t, t, j.id);
+      logEvent(req, 'gave up on a job', 'snippet', j.snippet_id ?? j.id,
+               { job_id: j.id, kind: j.kind, attempts: j.attempts, was: j.error ?? null });
+      bumpGeneration(W);
+      return res.json({ ok: true, status: 'dismissed' });
     }
 
     if (verb === 'resume') {
@@ -3858,6 +3911,12 @@ export function makeApp(config = CONFIG) {
     }
     const str = (v, n) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, n) : null);
     const int = (v) => (Number.isFinite(Number(v)) ? Math.trunc(Number(v)) : null);
+    /* Read before the write, because the concert guess is only made ONCE: the
+       first time this archive learns how long the thing is. A re-probe that
+       returns the same number must not re-attach a tag somebody has since
+       taken off, and "duration_s was empty and now is not" is exactly the
+       moment nobody has had a chance to disagree yet. */
+    const knew = musicById(id)?.duration_s ?? null;
     W.prepare(
       `UPDATE music SET title = COALESCE(?, title), channel = COALESCE(?, channel),
                         channel_id = COALESCE(?, channel_id),
@@ -3867,6 +3926,8 @@ export function makeApp(config = CONFIG) {
         WHERE id = ?`)
       .run(str(result.title, 300), str(result.channel, 200), str(result.channel_id, 64),
            int(result.uploaded_at), int(result.duration_s), t, id);
+    const secs = int(result.duration_s);
+    if (!knew && secs !== null && secs >= CONCERT_MIN_S) markConcert(id);
     bumpGeneration(W);
   }
 
@@ -4162,11 +4223,6 @@ export function makeApp(config = CONFIG) {
    *  in the page says so, because "your corrections will be overwritten" is
    *  the thing worth warning about and "it will be empty for a while" is not
    *  a thing that should be true.
-   *
-   *  The worker itself does not exist yet. This is deliberately still a real
-   *  endpoint writing a real row: the queue is the interface, and a job
-   *  sitting in it visible from /api/jobs is honest in a way that a button
-   *  wired to nothing is not.
    */
   app.post('/api/snippets/:id/retranscribe', requireRole('editor'), (req, res) => {
     const s = R.prepare(
@@ -4277,6 +4333,12 @@ export function makeApp(config = CONFIG) {
               j.result_path, s.title, s.retracted_at
          FROM job j LEFT JOIN snippet s ON s.id = j.snippet_id
         WHERE j.kind IN (${marks})
+          -- Dismissed jobs are excluded outright rather than windowed like the
+          -- other terminal states. Dismissing one is somebody saying "stop
+          -- showing me this", so keeping it on the card for another day would
+          -- answer the only thing the verb is for with "no". The row and the
+          -- event log keep it.
+          AND j.status <> 'dismissed'
           AND (j.status IN ('approved', 'claimed', 'paused') OR j.finished_at > ?)
         ORDER BY CASE j.status WHEN 'claimed' THEN 0 WHEN 'approved' THEN 1
                                WHEN 'paused' THEN 2 ELSE 3 END,
@@ -4344,8 +4406,11 @@ export function makeApp(config = CONFIG) {
     /* Everything that failed, however long ago. The panel only shows a day of
        history, and a pile of failures from the week the recorder was off is
        exactly what this is for. */
+    /* `= 'failed'` and not "everything terminal", which is what makes dismiss
+       stick: a job somebody has given up on is not swept back in by the button
+       that means "try the failures again". */
     const failed = R.prepare(
-      `SELECT id, kind, snippet_id FROM job
+      `SELECT id, kind, snippet_id, payload FROM job
         WHERE kind IN (${marks}) AND status = 'failed'`).all(...PI_KINDS);
     for (const j of failed) {
       W.prepare(`UPDATE job SET status = 'approved', claimed_by = NULL, claimed_at = NULL,
@@ -4354,6 +4419,17 @@ export function makeApp(config = CONFIG) {
       if (j.kind === 'fetch' && j.snippet_id) {
         W.prepare(`UPDATE snippet SET fetch_status = 'queued', fetch_note = NULL,
                                       updated_at = ? WHERE id = ?`).run(t, j.snippet_id);
+      }
+      // The same resync the single-job retry does, for the same reason: a row
+      // still reading `failed` while its job is queued again is the panel
+      // disagreeing with itself.
+      const mid = (j.kind === 'music_probe' || j.kind === 'music_fetch')
+        ? musicJobTarget(j) : null;
+      if (mid) {
+        const col = j.kind === 'music_probe' ? 'probe' : 'fetch';
+        W.prepare(`UPDATE music SET ${col}_status = 'queued', ${col}_note = NULL,
+                                    updated_at = ?
+                    WHERE id = ? AND ${col}_status = 'failed'`).run(t, mid);
       }
     }
 
@@ -4368,7 +4444,13 @@ export function makeApp(config = CONFIG) {
     }
 
     if (failed.length || stranded.length) {
-      logEvent(req, 'swept the recorder queue', 'setting', 'recorder', null,
+      /* The detail belongs in the fifth argument. It was in the sixth — where
+         `changesetId` is — with null in its place, so the insert refused to
+         bind an object to that column and logEvent swallowed the error into
+         one line on stderr. Nothing was ever written. Which means the single
+         action that re-approves the ENTIRE failed queue at once was the one
+         action in the archive with no record of having happened. */
+      logEvent(req, 'swept the recorder queue', 'setting', 'recorder',
                { retried: failed.length, queued: stranded.length });
       bumpGeneration(W);
     }
@@ -7318,6 +7400,99 @@ export function makeApp(config = CONFIG) {
       : { sql: `m.status = 'confirmed'`, params: [] };
   };
 
+  /* ---- concerts ----------------------------------------------------------
+   *
+   * A concert is a song that is really a set: a whole karaoke stream, an
+   * anniversary live, a three-hour unarchived. It belongs on the same shelf —
+   * it is still her singing, still found by the same search — but it is not
+   * what somebody scrolling for a song is looking for, and mixed in among
+   * three-minute covers it buries them.
+   *
+   * A TAG and not a column, and not a bare duration test either, which is the
+   * whole design in one sentence: the length is a good guess and only a guess.
+   * A fourteen-minute single with a long instrumental is not a concert and a
+   * tightly-edited half-hour medley is; storing the guess as a tag means the
+   * archive proposes and a person corrects, in the tag popover that already
+   * exists, with no new UI and no new vocabulary. It is also why "concert"
+   * typed into the music search finds them: that box already searches tags.
+   *
+   * `type`, because the kind vocabulary already has a word for this class of
+   * thing — collab, watchalong, karaoke, zatsudan are all `type`, and they are
+   * all "what this broadcast IS" rather than what it is about.
+   */
+  const CONCERT_MIN_S = 600;
+
+  /* Minted on demand and only once. `vault` rather than `user`, because
+     nobody proposed it — it is the archive's own word, the same as every row
+     the importer wrote — and `confirmed` so it appears in the picker the
+     moment it exists rather than waiting in a queue nobody opened. */
+  /* Both reads go through W, and that is the whole of a bug worth writing down.
+   *
+   * They went through R, and R is a different connection. So inside the
+   * backfill's transaction the tag this function had just INSERTED was
+   * invisible to it: the first long song minted `concert`, the second one's
+   * lookup found nothing — an uncommitted write is not there for a reader —
+   * and it tried to mint the same slug again. UNIQUE(slug), rollback, the
+   * whole pass lost, the meta flag never set, and the identical failure on
+   * every boot after. Silent apart from one line in the log, and the visible
+   * symptom was simply an empty Concerts shelf.
+   *
+   * It needed two concert-length songs to happen at all, which is why it
+   * survived a test suite that had one.
+   *
+   * `ON CONFLICT DO NOTHING` plus a re-read is the belt to that brace: a row
+   * minted by something else between the two statements now resolves rather
+   * than throwing. */
+  const concertTagId = () => {
+    const have = W.prepare("SELECT id FROM tag WHERE slug = 'concert'").get();
+    if (have) return have.id;
+    const id = ulid(), t = now();
+    W.prepare(`INSERT INTO tag(id, name, slug, kind, status, origin, created_at, updated_at)
+               VALUES(?, 'Concert', 'concert', 'type', 'confirmed', 'vault', ?, ?)
+               ON CONFLICT(slug) DO NOTHING`).run(id, t, t);
+    return W.prepare("SELECT id FROM tag WHERE slug = 'concert'").get()?.id ?? id;
+  };
+
+  const isConcertTagged = W.prepare(
+    `SELECT 1 FROM music_tag mt JOIN tag t ON t.id = mt.tag_id
+      WHERE mt.music_id = ? AND t.slug = 'concert'`);
+
+  /** Put the tag on, unless it is already there. Returns whether it moved. */
+  const markConcert = (musicId) => {
+    if (isConcertTagged.get(musicId)) return false;
+    const t = now();
+    W.prepare(`INSERT INTO music_tag(id, music_id, tag_id, created_at, updated_at)
+               VALUES(?,?,?,?,?)`).run(ulid(), musicId, concertTagId(), t, t);
+    return true;
+  };
+
+  /* Once, ever, for the rows that were here before this existed.
+   *
+   * Guarded by a meta flag rather than by "has no concert tag", because those
+   * two are the same question only on the first run: after somebody takes the
+   * tag OFF a fourteen-minute single, an unguarded pass would put it back on
+   * every restart and there would be no way to win an argument with a boot
+   * sequence. */
+  if (!meta(R, 'music_concert_backfill')) {
+    const long = R.prepare(
+      `SELECT id FROM music WHERE duration_s >= ? AND retracted_at IS NULL`)
+      .all(CONCERT_MIN_S);
+    let n = 0;
+    try {
+      tx(W, () => { for (const m of long) if (markConcert(m.id)) n++; });
+      setMeta(W, 'music_concert_backfill', String(now()));
+      if (n) {
+        bumpGeneration(W);
+        console.log(`  concerts    tagged ${n} existing entr${n === 1 ? 'y' : 'ies'}`);
+      }
+    } catch (e) {
+      /* Never worth failing a boot over. Unflagged, so the next start tries
+         again — and markConcert is idempotent, so a partial pass costs
+         nothing but the second attempt. */
+      console.error('concert backfill:', e?.message ?? e);
+    }
+  }
+
   app.get('/api/music', (req, res) => {
     const limit = Math.min(Math.max(Number(req.query.limit ?? 200) || 200, 1), 500);
     const vis = musicVisibleSql(req);
@@ -7375,6 +7550,21 @@ export function makeApp(config = CONFIG) {
        control. On this collection they are how you look for anything — the
        question is nearly always "what has she sung" — and one box that
        answers it needs no explaining. */
+    /* ?view=songs|concerts — the shelf's two halves, and they are exclusive by
+       construction: `songs` is everything the concert tag is NOT on, so the
+       two counts add up to the collection and nothing sits in both.
+       Filtered HERE and not in the browser, because the list is capped: a page
+       narrowed client-side would show whatever fraction of 200 rows happened
+       to survive, and running out of songs would look identical to there
+       being none. */
+    const view = String(req.query.view ?? '');
+    if (view === 'concerts' || view === 'songs') {
+      where.push(`${view === 'songs' ? 'NOT ' : ''}EXISTS (
+        SELECT 1 FROM music_tag mt2 JOIN tag t2 ON t2.id = mt2.tag_id
+         WHERE mt2.music_id = m.id AND t2.slug = 'concert'
+           AND t2.retracted_at IS NULL)`);
+    }
+
     const q = String(req.query.q ?? '').trim().toLowerCase();
     if (q) {
       const like = `%${q}%`;
@@ -7600,6 +7790,71 @@ export function makeApp(config = CONFIG) {
                job_id: jobId, changed: 1 });
   });
 
+  /** Ask the recorder for this one again.
+   *
+   *  The gap this closes: a song whose download failed had no way back. Approve
+   *  is the only thing that enqueues a fetch and it short-circuits on
+   *  `fetch_status !== 'none'`, so the only route was a laundering trip —
+   *  unlist, back to the queue, approve — which takes the song off the public
+   *  shelf and back on again to re-run a download. A failed PROBE had no route
+   *  at all short of hand-posting a job.
+   *
+   *  Both concerts that would not pull were the same story: the recorder's
+   *  post-hoc downloads went out without cookies, so the probe could read the
+   *  page and the fetch could not have the file. Fixing the recorder fixed the
+   *  next song; it did nothing for the two already sitting there failed.
+   *
+   *  One verb for both columns, and the row decides which. A card shows one
+   *  "try again" because the person pressing it means "get this song" — which
+   *  of the two halves is stuck is the archive's bookkeeping, not theirs.
+   */
+  app.post('/api/music/:id/retry', requireCap('music.decide'), (req, res) => {
+    const m = R.prepare('SELECT * FROM music WHERE id = ? AND retracted_at IS NULL')
+      .get(req.params.id);
+    if (!m) return res.status(404).json({ error: 'no such song' });
+
+    /* Asking twice queues two of the same job, and the second answer overwrites
+       the first with itself. Same guard, same wording, as the picture re-read
+       and the harvest. */
+    const open = R.prepare(
+      `SELECT id, kind FROM job
+        WHERE kind IN ('music_probe','music_fetch') AND status IN ('approved','claimed')
+          AND payload LIKE ?`).get(`%"${m.id}"%`);
+    if (open) return res.json({ job_id: open.id, kind: open.kind, already: true });
+
+    const t = now();
+    /* The probe first when both are stuck, because the fetch has nothing to go
+       on without it: a row with no duration walks past the length cap, and a
+       row with no title is a card nobody can judge. */
+    const kind = m.probe_status === 'failed' ? 'music_probe'
+      : m.fetch_status === 'failed' ? 'music_fetch' : null;
+    if (!kind) {
+      return res.status(409).json({
+        error: 'nothing about that song failed — there is nothing to try again',
+        probe_status: m.probe_status, fetch_status: m.fetch_status });
+    }
+    /* A download is what approval means, so re-running one needs the approval
+       to still stand. Without this, "try again" on a song waiting for a verdict
+       would fetch it — which is the one thing the review step exists to stop. */
+    if (kind === 'music_fetch' && m.status !== 'confirmed') {
+      return res.status(409).json({
+        error: `that song is ${m.status}, so nothing should be downloading it` });
+    }
+
+    const col = kind === 'music_probe' ? 'probe' : 'fetch';
+    W.prepare(`UPDATE music SET ${col}_status = 'queued', ${col}_note = NULL,
+                                updated_at = ? WHERE id = ?`).run(t, m.id);
+    const jobId = enqueueJob(kind, { url: m.url, by: req.person.id,
+                                     payload: { music_id: m.id, video_id: m.video_id } });
+    logEvent(req, kind === 'music_probe' ? 'asked the recorder to read it again'
+                                         : 'asked the recorder to save it again',
+             'music', m.id, { title: m.title ?? null, job_id: jobId, was: m[`${col}_note`] ?? null });
+    bumpGeneration(W);
+    res.json({ job_id: jobId, kind,
+               music: musicRow(R.prepare('SELECT * FROM music WHERE id = ?').get(m.id),
+                               musicTagsFor([m.id]).get(m.id) ?? []) });
+  });
+
   /** Destroy the row. Two calls, and the reversible step has to have happened
    *  first — the same shape as the tag and snippet purges, for the same
    *  reason: this is the one action nobody can undo. */
@@ -7646,12 +7901,22 @@ export function makeApp(config = CONFIG) {
                job_id: job, job_ids: jobs });
   });
 
+  /* `songs` was missing here, and a purge preview that under-reports is worse
+     than no preview: the whole point of the two-phase confirm is that nobody
+     destroys more than they were shown, and a tag on twelve songs read as
+     "nothing points at it". The attachments went anyway — music_tag.tag_id is
+     ON DELETE CASCADE — so the number was the only thing missing, which is
+     exactly the kind of quiet that this confirm exists to prevent. */
   const tagPurgeCounts = (id) => ({
     streams: R.prepare('SELECT COUNT(*) c FROM stream_tag WHERE tag_id = ?').get(id).c,
     snippets: R.prepare('SELECT COUNT(*) c FROM snippet_taglet WHERE tag_id = ?').get(id).c,
+    songs: R.prepare('SELECT COUNT(*) c FROM music_tag WHERE tag_id = ?').get(id).c,
     blocks: R.prepare('SELECT COUNT(*) c FROM segment WHERE tag_id = ?').get(id).c,
     children: R.prepare('SELECT COUNT(*) c FROM tag WHERE parent_id = ?').get(id).c,
   });
+  // What the caller has to hand back, and therefore what it had to have been
+  // shown. Named once so the preview, the check and the client cannot drift.
+  const PURGE_CONFIRM = ['streams', 'snippets', 'songs', 'blocks'];
 
   app.post('/api/tags/:id/purge', requireCap('tag.purge'), (req, res) => {
     const t = R.prepare('SELECT id, name, slug, retracted_at FROM tag WHERE id = ?')
@@ -7659,7 +7924,7 @@ export function makeApp(config = CONFIG) {
     if (!t) return res.status(404).json({ error: 'no such tag' });
 
     const counts = tagPurgeCounts(t.id);
-    const total = counts.streams + counts.snippets + counts.blocks;
+    const total = PURGE_CONFIRM.reduce((n, k) => n + counts[k], 0);
 
     /* Phase one. No `confirm` in the body means the caller is asking, not
        telling — so answer and write nothing. */
@@ -7671,13 +7936,25 @@ export function makeApp(config = CONFIG) {
            token only proves the round trip happened, while these change if
            somebody tags something in between — which is the case actually
            worth catching. */
-        confirm: { streams: counts.streams, snippets: counts.snippets, blocks: counts.blocks },
+        confirm: Object.fromEntries(PURGE_CONFIRM.map((k) => [k, counts[k]])),
       });
     }
 
     const said = req.body.confirm;
-    if (said.streams !== counts.streams || said.snippets !== counts.snippets
-        || said.blocks !== counts.blocks) {
+    /* A key that is not there at all is a different thing from a key that
+       disagrees, and it has a different answer. `songs` was added to this list
+       after the panel shipped, so a page somebody left open yesterday sends
+       three counts and would otherwise be told the tag "changed since you
+       looked" — which is not true and not actionable. Nothing is destroyed
+       either way; only the sentence differs. */
+    const missing = PURGE_CONFIRM.filter((k) => typeof said?.[k] !== 'number');
+    if (missing.length) {
+      return res.status(409).json({
+        error: 'this page is out of date — reload it and try again',
+        missing, counts,
+      });
+    }
+    if (PURGE_CONFIRM.some((k) => said[k] !== counts[k])) {
       return res.status(409).json({
         error: 'this tag changed since you looked — nothing was destroyed',
         counts, you_saw: said,
@@ -7687,6 +7964,10 @@ export function makeApp(config = CONFIG) {
     tx(W, () => {
       W.prepare('DELETE FROM stream_tag WHERE tag_id = ?').run(t.id);
       W.prepare('DELETE FROM snippet_taglet WHERE tag_id = ?').run(t.id);
+      // Explicit, like the two above and for the same reason, though the
+      // cascade would do it: the count in the log should be a count of what
+      // this did rather than of what SQLite did behind it.
+      W.prepare('DELETE FROM music_tag WHERE tag_id = ?').run(t.id);
       /* Both are ON DELETE SET NULL, and both are done explicitly so the count
          in the log is a count of what this did rather than of what SQLite did
          afterwards. A child tag is orphaned, not destroyed — it is a tag in its

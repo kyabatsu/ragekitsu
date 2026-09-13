@@ -149,15 +149,62 @@
      nothing in this file saying so and nothing in the console to find. The
      whole admin panel rendered as its intro paragraph and a screenful of
      background. Do not name a class after an advertisement. */
-  .ops-intro { max-width: 68ch; margin-bottom: 22px; color: var(--text-2);
-    font-size: 0.86rem; line-height: 1.6; }
-  .ops-intro b { color: var(--text); }
+  /* Two columns that stay two columns: gates on the left, roles on the right,
+     and each column stacks its own pair. auto-fit would reflow them into one
+     row of four the moment the window is wide enough, which puts Role
+     ownership beside Gates and breaks the one thing the layout says. */
   .ops-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
     gap: 16px; align-items: start; }
+  .ops-col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
   .ops-card { padding: 16px 18px 18px; border-radius: 14px;
     border: 1px solid var(--border); background: var(--surface); }
   .ops-card h3 { margin: 0 0 4px; font-size: 0.95rem; }
   .ops-note { margin: 0 0 14px; color: var(--text-3); font-size: 0.76rem; line-height: 1.5; }
+
+  /* ---- a card that opens ---------------------------------------------------
+     The marker is drawn here rather than left to the browser: the default
+     triangle sits outside the flow and is a different size and colour on every
+     platform, and this one has to line up with an h3. */
+  details.ops-card { padding-bottom: 16px; }
+  details.ops-card > summary { display: flex; align-items: baseline; gap: 8px;
+    cursor: pointer; list-style: none; margin: -2px 0 0; }
+  details.ops-card > summary::-webkit-details-marker { display: none; }
+  details.ops-card > summary::before { content: '▸'; color: var(--text-3);
+    font-size: 0.7rem; line-height: 1.5; transition: transform 0.12s ease;
+    transform-origin: 45% 55%; }
+  details.ops-card[open] > summary::before { transform: rotate(90deg); }
+  details.ops-card > summary h3 { margin: 0; }
+  details.ops-card > summary:hover h3 { color: var(--accent); }
+  /* The reason a shut card is still worth having: the number is the answer to
+     most of the questions anybody opens one of these to ask. */
+  .ops-n { margin-left: auto; color: var(--text-3);
+    font-family: var(--font-mono); font-size: 0.7rem; }
+  details.ops-card[open] > summary { margin-bottom: 10px; }
+  details.ops-card:not([open]) > summary { margin-bottom: 0; }
+  /* A room with nothing in it, saying what it is for. Same register as the
+     empty panels — a promise, not an invented table. */
+  .ops-soon { padding: 12px 13px; border-radius: 10px; background: var(--glass-sunk);
+    color: var(--text-3); font-size: 0.78rem; line-height: 1.55; }
+  .ops-soon b { display: block; margin-bottom: 4px; color: var(--text-2); }
+  .ops-soon code { font-family: var(--font-mono); font-size: 0.72rem; color: var(--text-2); }
+
+  /* ---- the two queues, side by side --------------------------------------
+     One grid rather than two floats, so they are the same height and the
+     shorter one does not leave a hole the log climbs into. Each body scrolls
+     at a height that shows about eight rows: enough to read the shape of a
+     queue, bounded so a hundred jobs cannot push the log off the screen. */
+  /* Stretched rather than start-aligned, so the two are the same height
+     whatever is in them. Side by side they read as one instrument with two
+     halves; ragged, they read as one card and an afterthought. */
+  .ops-queues { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+    gap: 16px; margin-top: 16px; }
+  .ops-scroll { min-height: 170px; max-height: 340px; overflow-y: auto;
+    overscroll-behavior: contain; }
+  /* The state line and the pause switch are written INTO the scroller by the
+     loaders, so without this they scroll away and the card loses the one part
+     of itself that is not a row. */
+  .ops-scroll .tq-head { position: sticky; top: 0; z-index: 1; margin: 0 0 10px;
+    padding: 2px 0 8px; background: var(--surface); }
   .ops-rows { display: flex; flex-direction: column; gap: 8px; }
   .ops-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
     padding: 9px 11px; border-radius: 10px; background: var(--glass-sunk); }
@@ -224,7 +271,6 @@
     margin-bottom: 8px; }
   .ml-top { display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap; }
   .ml-label { font-weight: 650; font-size: 0.86rem; }
-  .ml-what { color: var(--text-3); font-size: 0.75rem; }
   .ml-state { font-family: var(--font-mono); font-size: 0.6rem; letter-spacing: 0.04em;
     text-transform: uppercase; padding: 2px 6px; border-radius: 5px;
     background: var(--surface-2); color: var(--text-3); white-space: nowrap; }
@@ -528,6 +574,18 @@
   /* ---- the filter line ----------------------------------------------------
      Count on the left, then the expression as chips. min-height so the list
      below does not jump a line the first time a filter appears. */
+  /* Songs | Concerts. Two buttons and no select, because there are two of
+     them and there will not be a third: a select hides one of two answers
+     behind a click and tells you nothing about what the other one is. */
+  .mu-view { display: inline-flex; gap: 2px; padding: 2px; border-radius: 999px;
+    background: var(--glass-sunk); border: 1px solid var(--border); }
+  .mu-view button { padding: 4px 13px; border: 0; border-radius: 999px;
+    background: transparent; color: var(--text-3); font: inherit;
+    font-size: 0.78rem; font-weight: 600; cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease; }
+  .mu-view button:hover { color: var(--text-2); }
+  .mu-view button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); }
+
   .snip-meta-row { display: flex; align-items: center; flex-wrap: wrap; gap: 10px;
     margin: -10px 0 16px; min-height: 22px; }
   .snip-meta-row .snip-tags { margin-top: 0; }
@@ -967,10 +1025,11 @@
   /* One line, clipped, and NOT scrollable.
      A 20px scroller is a scroller you fight: the wheel lands on it by accident
      while the page is what you meant to move, and reaching a fifth singer means
-     dragging a bar the height of the text it hides. So the row shows what fits
-     and hovering it shows the rest — see .mu-pop below. The fade on the right
-     edge is the only thing that says there is more, which is exactly what a cut
-     chip already implies and this makes deliberate. */
+     dragging a bar the height of the text it hides. So the row shows what fits,
+     hovering it shows the rest, and clicking it holds that open so the rest can
+     be touched — see .mu-pop below. The fade on the right edge is the only thing
+     that says there is more, which is exactly what a cut chip already implies
+     and this makes deliberate. */
   .mu-tags { --mu-tagrow: 20px; display: flex; flex-wrap: nowrap; gap: 4px;
     margin: 1px -4px 0; padding: 0 4px; align-items: center;
     height: var(--mu-tagrow); overflow: hidden; border-radius: 7px;
@@ -990,6 +1049,10 @@
   .mu-minetags { flex-wrap: wrap; height: auto; overflow: visible;
     -webkit-mask-image: none; mask-image: none; }
   .mu-minetags.mu-lit { background: none; box-shadow: none; }
+  /* The shelf's strip answers a click, so it says so — but only when there is
+     something behind the fade to reach. An empty bar whose only control is the
+     `+ tag` button has that button's own cursor and needs none of its own. */
+  .mu-tags.mu-has { cursor: pointer; }
   /* flex: none, so a chip is never squeezed narrower than its own text and the
      row cuts at the container edge instead of at every chip at once. */
   .mu-tag { height: 20px; display: inline-flex; align-items: center; flex: none;
@@ -1014,6 +1077,17 @@
     box-shadow: 0 10px 26px rgba(0,0,0,0.5); pointer-events: none; }
   .mu-pop[hidden] { display: none; }
   .mu-pop .mu-tag { max-width: none; }
+  /* Clicked rather than hovered, and then it is a control surface rather than a
+     readout. The row is 20px of a strip that can hold six tags: the second tag's
+     × is under the fade and the fifth is not inside the box at all, so it cannot
+     be clicked and reads as a broken button rather than an absent one. Pinned,
+     this panel is where those ×s are, which is the one state it takes the
+     pointer in — hovered it must not, or the panel would steal the pointer from
+     the row it is anchored to and flicker itself shut. */
+  .mu-pop.pin { pointer-events: auto;
+    border-color: color-mix(in srgb, var(--accent) 42%, var(--surface-3));
+    box-shadow: 0 10px 26px rgba(0,0,0,0.5),
+      0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent); }
 
   .mu-tagx { margin: 0 -3px 0 4px; padding: 0 2px; border: 0; background: none;
     color: var(--text-3); font: inherit; line-height: 1; cursor: pointer;
@@ -1150,6 +1224,29 @@
   .rv-sgn { margin-left: 6px; padding: 1px 5px; border-radius: 20px;
     background: var(--accent); color: var(--on-accent);
     font-family: var(--font-mono); font-size: 0.6rem; }
+  /* The pile inside a pile. Quieter than .rv-views on purpose — it is a filter
+     within the view you already chose, not a fifth view — and on its own line
+     so it cannot be mistaken for another tab in the row above. */
+  .rv-subs { display: inline-flex; gap: 2px; margin: 10px 0 0; padding: 2px;
+    border-radius: 8px; background: var(--surface-2, rgba(255,255,255,0.05)); }
+  /* The key line carries margin-top: -12px to tuck under the toolbar, and with
+     a switcher between them that pulled it straight over the pills — the keys
+     were drawn across "Clips | Tags". Cancelled for as long as the switcher is
+     on screen, which is exactly when there is something between them. */
+  .rv-subs:not([hidden]) ~ .rv-keys { margin-top: 10px; }
+  .rv-sub { padding: 3px 10px; border: 0; border-radius: 6px; cursor: pointer;
+    background: none; color: var(--text-3); font: inherit; font-size: 0.74rem;
+    transition: background 0.14s ease, color 0.14s ease; }
+  .rv-sub:hover { color: var(--text-2); }
+  .rv-sub.is-on { background: var(--surface); color: var(--text); font-weight: 600; }
+  .rv-sub .rv-sgn { background: var(--surface-3); color: var(--text-2); }
+  /* The row under the cursor in the tombstone list. Same affordance as
+     `.rv-at` on a clip, at the size of a one-line row: the accent edge is what
+     says "D acts on this one", and D cannot be undone, so it has to be
+     unmistakable which row it is about to act on. */
+  #rv-dead .ops-row.rv-at { background: var(--accent-soft);
+    box-shadow: inset 3px 0 0 var(--accent); }
+  #rv-dead .ops-row.is-going { opacity: 0.4; }
 
   /* ---- lazy load ---------------------------------------------------------
      The sentinel is always in the DOM when there is a next page, and the
@@ -4066,84 +4163,92 @@
 
 
     <section class="panel" id="panel-admin" role="tabpanel" aria-labelledby="tab-admin" tabindex="0" hidden>
-      <div class="ops-intro">
-        <b>Gates decide who can see what.</b> A gate is a word. Put it on a taglet
-        and every snippet carrying that taglet disappears for anyone without the
-        matching grant — out of the lists, the search, the tag vocabulary and the
-        media routes alike, answering 404 rather than 403 so the snippet's
-        existence is not the thing that leaks.
-      </div>
+      <!-- Four <details>, two columns, everything shut on arrival.
+           Native disclosure rather than a class and a click handler: it is
+           keyboard-operable, it is in the accessibility tree as a disclosure,
+           and Ctrl-F finds text inside a closed one in Chrome. The count in
+           the summary is what makes a shut card still worth reading — "Gates ·
+           4" answers the question most visits are here to ask. -->
       <div class="ops-grid">
-        <section class="ops-card">
-          <h3>Gated taglets</h3>
-          <p class="ops-note">Any taglet can gate. Naming a gate that nobody holds
-            hides those snippets from everyone but editors.</p>
-          <div id="ops-gates" class="ops-rows"></div>
-          <div class="ops-add">
-            <input type="text" id="ops-gate-q" placeholder="Search a taglet to gate…"
-                   autocomplete="off" spellcheck="false">
-            <div class="ops-ac" id="ops-gate-ac" hidden></div>
-          </div>
-        </section>
+        <div class="ops-col">
+          <details class="ops-card" id="ops-gates-card">
+            <summary><h3>Gates</h3><span class="ops-n" id="ops-gates-n"></span></summary>
+            <p class="ops-note">Restricts elements marked with the gating tag from
+              general viewing.</p>
+            <div id="ops-gates" class="ops-rows"></div>
+            <div class="ops-add">
+              <input type="text" id="ops-gate-q" placeholder="Search a taglet to gate…"
+                     autocomplete="off" spellcheck="false">
+              <div class="ops-ac" id="ops-gate-ac" hidden></div>
+            </div>
+          </details>
 
-        <section class="ops-card">
-          <h3>Who holds what</h3>
-          <p class="ops-note">A grant is the same word as the gate. Nothing else
-            about the person changes — their role decides what they can DO, a
-            grant decides what they can SEE.</p>
-          <div id="ops-people" class="ops-rows"></div>
-        </section>
+          <details class="ops-card" id="ops-people-card">
+            <summary><h3>Gate ownership</h3><span class="ops-n" id="ops-people-n"></span></summary>
+            <p class="ops-note">Assign gating tags to members of the community to
+              grant extended viewing access.</p>
+            <div id="ops-people" class="ops-rows"></div>
+          </details>
+        </div>
 
-        <section class="ops-card">
-          <h3>Retracted tags</h3>
-          <p class="ops-note">Retracting a tag hides it; it does not remove it.
-            The row keeps owning its name for good, so nothing else can ever be
-            minted under that name — and typing the name again brings this one
-            back rather than making a new one. Destroying it here is the only
-            thing that frees the name, and it is the one action on this page
-            that cannot be undone.</p>
-          <div id="ops-dead" class="ops-rows"></div>
-        </section>
+        <div class="ops-col">
+          <!-- The skeleton is real and the screen for it is not. Said plainly,
+               because a panel that looks operable and is not costs more than an
+               empty one that says why. -->
+          <details class="ops-card" id="ops-roles-card">
+            <summary><h3>Roles</h3><span class="ops-n">—</span></summary>
+            <p class="ops-note">Bundles of permissions assigned to members of the
+              community.</p>
+            <div class="ops-soon">
+              <b>No screen for this yet.</b>
+              The ladder is live and enforced on every route — viewer, suggester,
+              editor, admin, each one a set of capabilities rather than a rank
+              with rules written beside it. What is missing is a way to edit
+              those sets from here, and there are enough of them that a table
+              thrown together would be worse than the env var it replaced.
+            </div>
+          </details>
+
+          <details class="ops-card" id="ops-rolepeople-card">
+            <summary><h3>Role ownership</h3><span class="ops-n">—</span></summary>
+            <p class="ops-note">Assign roles to members of the community to grant
+              extended editing access.</p>
+            <div class="ops-soon">
+              <b>No screen for this yet.</b>
+              Roles are set with <code>TENMA_GRANTS</code> at build for now. The
+              people and their current rank are listed under Gate ownership.
+            </div>
+          </details>
+        </div>
       </div>
 
-      <!-- Ahead of the transcription card on purpose: that card is one of the
-           three machines this one lists, and reading about the whole set
-           before reading about one of them is the right order. -->
       <section class="ops-card" style="margin-top:16px">
         <h3>Models</h3>
-        <p class="ops-note">Three machines that read things nobody has typed:
-          speech in a clip, words on a picture, and what a picture is of. Each
-          slot names a model; none of them are downloaded here. Whisper runs in
-          this container because it is one static binary — the other two are
-          Python, so they live in a sidecar that loads a model when a job needs
-          one and lets it go again when it has been idle.</p>
+        <p class="ops-note">Auxiliary tools to enhance database capabilities.</p>
         <div id="ml-body"></div>
       </section>
 
-      <section class="ops-card" style="margin-top:16px">
-        <h3>Transcription</h3>
-        <p class="ops-note">Runs after approval, in the same single slot the
-          converter uses — so a snippet nobody can watch yet always goes first.
-          Nothing here is on anybody's critical path.</p>
-        <div id="tq-body"></div>
-      </section>
+      <!-- Side by side, because they are the same fact about two different
+           machines and the question is almost always "which of them is stuck".
+           Each list scrolls inside its own card rather than growing the page:
+           a hundred queued jobs should not push the log out of reach. -->
+      <div class="ops-queues">
+        <section class="ops-card">
+          <h3>Model queue</h3>
+          <p class="ops-note">Task list being performed by the on device models.</p>
+          <div id="tq-body" class="ops-scroll"></div>
+        </section>
+
+        <section class="ops-card">
+          <h3>Worker queue</h3>
+          <p class="ops-note">Task list being performed by the 'air-gapped' worker.</p>
+          <div id="rq-body" class="ops-scroll"></div>
+        </section>
+      </div>
 
       <section class="ops-card" style="margin-top:16px">
-        <h3>The recorder</h3>
-        <p class="ops-note">The three things this box is not allowed to do
-          itself: download a link, move an approved file into the media tree,
-          delete a master. They are written down here and the Pi comes and
-          takes them — nothing is pushed to it, so a queue that stops going
-          down is the only symptom there is.</p>
-        <div id="rq-body"></div>
-      </section>
-
-      <section class="ops-card" style="margin-top:16px">
-        <h3>The log</h3>
-        <p class="ops-note">Everything anybody has done, newest first. This is the
-          only place a purged snippet's last line can be read — the snippet is in
-          no list to open a panel from, so the entry that matters most is the one
-          whose subject is gone.</p>
+        <h3>Log</h3>
+        <p class="ops-note">Logging all activities performed involving the database.</p>
         <div class="lg-filters">
           <select id="lg-who" aria-label="Filter by person"><option value="">anyone</option></select>
           <select id="lg-verb" aria-label="Filter by what happened"><option value="">anything</option></select>
@@ -4255,6 +4360,13 @@
         </button>
       </div>
       <div class="snip-meta-row">
+        <!-- Beside the count rather than up in the toolbar, because the count
+             is the thing it changes: switching shelf and watching the number
+             move is the whole feedback. -->
+        <div class="mu-view" role="group" aria-label="Which shelf">
+          <button type="button" data-muview="songs" aria-pressed="true">Songs</button>
+          <button type="button" data-muview="concerts" aria-pressed="false">Concerts</button>
+        </div>
         <span class="meta" id="mu-count"></span>
       </div>
       <div class="mu-grid" id="mu-grid"></div>
@@ -4309,13 +4421,28 @@
         <button class="btn-ghost" id="rv-restore-all" hidden>Back to queue</button>
         <button class="btn-primary" id="rv-approve-all">Publish page</button>
       </div>
-      <div class="rv-keys">
+      <!-- Removed holds two kinds of removal now, and they are not the same
+           job: a rejected clip is a verdict somebody can revisit, and a
+           retracted tag is a name being held hostage by a row every list
+           filters out. Fifty of the second would bury three of the first, so
+           they get a pile each rather than a shared scroll. -->
+      <div class="rv-subs" id="rv-subs" role="tablist" aria-label="Which removals" hidden>
+        <button class="rv-sub is-on" data-rvsub="clips" role="tab"
+          aria-selected="true">Clips<span class="rv-sgn" id="rv-subclips" hidden></span></button>
+        <button class="rv-sub" data-rvsub="tags" role="tab"
+          aria-selected="false">Tags<span class="rv-sgn" id="rv-subtags" hidden></span></button>
+      </div>
+      <div class="rv-keys" id="rv-keys-clips">
         <b>J</b>/<b>K</b> move · <b>A</b> publish · <b>X</b> reject · <b>R</b> back to queue ·
         <b>E</b> retitle · <b>T</b> transcript · <b>Space</b> play · <b>U</b> undo
+      </div>
+      <div class="rv-keys" id="rv-keys-tags" hidden>
+        <b>J</b>/<b>K</b> move · <b>D</b> destroy — no prompt, and nothing brings one back
       </div>
       <div class="snips" id="rv-list"></div>
       <div class="sg-list" id="sg-list" hidden></div>
       <div class="cs-list" id="cs-list" hidden></div>
+      <div class="ops-rows" id="rv-dead" hidden></div>
       <div id="rv-more" style="margin-top:14px;text-align:center" hidden>
         <button class="btn-ghost" id="rv-more-btn">Load more</button>
       </div>
@@ -13874,12 +14001,14 @@
           ? `${t.queue.waiting || 0} waiting${t.queue.failed ? ` · ${t.queue.failed} failed` : ''}`
           : t.queue ? 'nothing waiting' : '';
 
+        /* The name, the state, the size. Nothing else on the line — the
+           sentence that used to sit here explaining what transcription IS was
+           read once and then in the way every time after. */
         return `<div class="ml-row${t.enabled ? '' : ' is-off'}" data-mltask="${esc(t.task)}">
           <div class="ml-top">
             <span class="ml-label">${esc(t.label)}</span>
             <span class="ml-state ${esc(state)}">${esc(state)}</span>
             ${t.bytes ? `<span class="ops-sub">${esc(mlBytes(t.bytes))}</span>` : ''}
-            <span class="ml-what">${esc(t.what)}</span>
           </div>
           <div class="ml-pick">
             <select data-mlslug${local ? ' disabled title="Set by TENMA_WHISPER_MODEL"' : ''}>
@@ -13893,8 +14022,14 @@
             <button type="button" data-mlenable${
               t.enabled ? '' : ' class="is-off"'}>${t.enabled ? 'On' : 'Off'}</button>
           </div>
-          ${t.note ? `<div class="ml-note">${esc(t.note)}</div>` : ''}
-          <div class="ml-note">Writes into ${esc(t.into)}.</div>
+          <!-- One line under the buttons, and it answers the only question the
+               picker raises: who decides this. Whisper's is disabled because
+               the model is baked in at build; the other two are set right
+               here. The model blurb and "Writes into the transcript…" are both
+               gone — neither was something anybody came to this row to read. -->
+          <div class="ml-note">${local
+            ? 'Set by TENMA_WHISPER_MODEL on build.'
+            : 'Set by administrator inside this user panel.'}</div>
           ${t.state_note ? `<div class="ml-why">${esc(t.state_note)}</div>`
             : t.ready === false ? `<div class="ml-why">${esc(t.why ?? '')}</div>` : ''}
           ${q ? `<div class="ml-q">${esc(q)}</div>` : ''}
@@ -14109,17 +14244,36 @@
 
       const rows = jobs.map((j) => {
         const live = j.status === 'claimed';
-        const tag = live ? 'running' : j.status === 'approved' ? 'waiting'
-          : j.status === 'paused' ? 'paused' : j.status === 'done' ? 'done' : 'failed';
+        /* Every status by name. It used to fall through to the literal
+           "failed", which meant a CANCELLED job — the music module cancels
+           them when an entry is turned down — was displayed as a failure and
+           then offered no button, because the buttons test the real value.
+           A row that lies about its state and then behaves according to the
+           truth is unreadable. */
+        const tag = live ? 'running' : ({
+          approved: 'waiting', paused: 'paused', done: 'done',
+          cancelled: 'cancelled', dismissed: 'dismissed',
+        })[j.status] ?? 'failed';
         const what = j.kind === 'fetch' && j.url
           ? `<span class="rq-url">${esc(shortUrl(j.url))}</span>`
           : esc(j.title ?? 'a snippet that is gone');
         /* Only failures offer anything. A waiting job needs the recorder, not
            a button, and cancelling one is on the row too — but retry is the
            verb that was missing entirely: `failed` is terminal at this end on
-           purpose, and until now nobody could say "go on, try again". */
-        const acts = j.status === 'failed'
-          ? `<button type="button" data-rqretry="${esc(j.id)}">Try again</button>`
+           purpose, and until now nobody could say "go on, try again".
+           And beside it, the other half of that sentence. Some failures are
+           never going to land — a post whose host will not serve it to this
+           recorder cannot be fetched by trying harder — and a queue that keeps
+           them forever is a queue nobody reads, with the failure that mattered
+           somewhere in it. Dismiss puts one away; the row and the log keep it,
+           and the sweep will not pick it back up. */
+        const dead = ['failed', 'cancelled'].includes(j.status);
+        const acts = dead
+          ? `${j.status === 'failed'
+              ? `<button type="button" data-rqretry="${esc(j.id)}">Try again</button>` : ''}
+             <button type="button" data-rqdrop="${esc(j.id)}"
+               title="Stop showing this. Nothing is deleted and nothing is retried."
+               >Dismiss</button>`
           : ['approved', 'claimed'].includes(j.status)
             ? `<button type="button" class="danger" data-rqcancel="${esc(j.id)}"
                 >Cancel</button>` : '';
@@ -14140,9 +14294,9 @@
          right roots. The cost is that a quiet week says "5d ago", which is
          honest — it IS the last time anything was proved. */
       const who = d.worker
-        ? `<span class="ops-sub">${esc(d.worker.name)} · last took something
-             ${esc(since(d.worker.last_seen, d.now))} ago</span>`
-        : '<span class="ops-sub">no worker has ever taken a job from this archive</span>';
+        ? `<span class="ops-sub">PiWorker · ${esc(d.worker.name)} · last took
+             something ${esc(since(d.worker.last_seen, d.now))} ago</span>`
+        : '<span class="ops-sub">PiWorker · has never taken a job from this archive</span>';
 
       box.innerHTML = warn + fix + `<div class="tq-head">
           <span class="tq-state ${idleFor > 180 ? 'is-off' : d.running ? 'is-on' : ''}"
@@ -14174,20 +14328,32 @@
           loadRecorder();
         })();
       }
-      const act = e.target.closest('[data-rqretry], [data-rqcancel]');
+      const act = e.target.closest('[data-rqretry], [data-rqcancel], [data-rqdrop]');
       if (!act) return;
-      const retry = !!act.dataset.rqretry;
-      const id = act.dataset.rqretry ?? act.dataset.rqcancel;
-      if (!retry && !confirm('Cancel this job?\n\n'
+      const verb = act.dataset.rqretry ? 'retry'
+        : act.dataset.rqdrop ? 'dismiss' : 'cancel';
+      const id = act.dataset.rqretry ?? act.dataset.rqdrop ?? act.dataset.rqcancel;
+      /* Only cancel asks. It interrupts work in progress and can leave a file
+         in quarantine nothing points at, which is a mess somebody has to clean
+         up. Dismiss stops a list from showing a row: nothing is deleted,
+         nothing is interrupted, and the job can be made again from the thing
+         that asked for it — a confirm on that is friction for its own sake,
+         and the whole complaint was friction. */
+      if (verb === 'cancel' && !confirm('Cancel this job?\n\n'
         + 'If the recorder is already working on it, it will finish anyway and '
         + 'its report will be ignored — which for a fetch means a file left in '
         + 'quarantine that no clip points at. The quarantine view lists those.')) return;
       void (async () => {
-        const r = await apiPost(`/api/jobs/${encodeURIComponent(id)}/${retry ? 'retry' : 'cancel'}`);
+        const r = await apiPost(`/api/jobs/${encodeURIComponent(id)}/${verb}`);
         if (r.status >= 400) return void toast('bad', 'Not done', r.body?.error ?? `HTTP ${r.status}`);
-        if (retry) {
+        if (verb === 'retry') {
           toast('queued', 'Back on the queue',
                 'The recorder will take it on its next pass.');
+        }
+        if (verb === 'dismiss') {
+          toast('applied', 'Put away',
+                'It is off this list for good. The row and the reason stay in the '
+                + 'log, and the sweep will not pick it back up.', 7000);
         }
         loadRecorder();
       })();
@@ -14406,7 +14572,7 @@
        same word held by a person. Matching them is the whole mechanism, which
        is why both are drawn as the same chip.
        ===================================================================== */
-    const AD = { gates: [], people: [], roster: [], dead: [], loading: false, booted: false };
+    const AD = { gates: [], people: [], roster: [], loading: false, booted: false };
 
     async function loadAdmin() {
       if (AD.loading || !ME.can?.admin) return;
@@ -14423,13 +14589,6 @@
         AD.gates = g.gates ?? [];
         AD.people = g.people ?? [];
         AD.roster = p.people ?? [];
-        /* Its own call with its own catch, and pointedly NOT folded into the
-           Promise.all above. Everything in that pair is load-bearing for the
-           panel, so one rejection there paints nothing at all — which is a
-           whole admin screen lost to a list of tombstones being unavailable.
-           This one degrades to an empty card. */
-        try { AD.dead = (await api('/api/tags?retracted=1&limit=500')).tags ?? []; }
-        catch { AD.dead = []; }
         adPaint();
         loadLog({ reset: true });
         loadTranscribe();
@@ -14491,66 +14650,16 @@
         }).join('')
         : '<div class="ops-empty">Nobody has signed in yet.</div>';
 
-      /* Newest death first, which is the order in which you are likely to have
-         meant to do something about them. The counts are what the purge is
-         about to take with it, so they are on the row rather than behind the
-         confirm — a tombstone with forty streams still pointing at it is a
-         different decision from an empty one. */
-      const dead = document.getElementById('ops-dead');
-      dead.innerHTML = AD.dead.length
-        ? AD.dead.map((t) => {
-          const bits = [
-            t.streams ? `${t.streams} stream${t.streams === 1 ? '' : 's'}` : null,
-            t.snippets ? `${t.snippets} snippet${t.snippets === 1 ? '' : 's'}` : null,
-            t.blocks ? `${t.blocks} block${t.blocks === 1 ? '' : 's'}` : null,
-          ].filter(Boolean);
-          return `<div class="ops-row" data-dead="${esc(t.id)}">
-            <span class="ops-who">${esc(t.name)}</span>
-            <span class="ops-sub">${esc(bits.length ? bits.join(', ') : 'nothing points at it')}</span>
-            <span class="ops-give"><button type="button" class="btn-ghost"
-              data-purge="${esc(t.id)}">destroy</button></span>
-          </div>`;
-        }).join('')
-        : '<div class="ops-empty">No retracted tags. Every name is in use or free.</div>';
+      /* The numbers on the shut cards. Written after the rows rather than with
+         them so there is one place that decides what a count means, and so a
+         card that fails to paint cannot also lie in its own header. */
+      const n = (id, v) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = v;
+      };
+      n('ops-gates-n', AD.gates.length || '—');
+      n('ops-people-n', held.size ? `${held.size} of ${rows.length}` : rows.length || '—');
     }
-
-    /* Two phases, both here. The route answers a preview to a body with no
-       `confirm` and refuses the real thing if the counts it is handed do not
-       match what it just read — so this asks, shows a person the number, and
-       sends back exactly what it was told. A stale panel cannot destroy more
-       than it displayed. */
-    document.getElementById('ops-dead').addEventListener('click', async (e) => {
-      const b = e.target.closest('[data-purge]');
-      if (!b) return;
-      const id = b.dataset.purge;
-      b.disabled = true;
-      try {
-        const prev = await apiPost(`/api/tags/${encodeURIComponent(id)}/purge`, {});
-        if (prev.status !== 200) {
-          return void toast('bad', 'Could not read that tag',
-                            prev.body?.error ?? `The archive answered ${prev.status}.`);
-        }
-        const c = prev.body.counts, name = prev.body.tag?.name ?? 'that tag';
-        const owns = [
-          `${c.streams} stream${c.streams === 1 ? '' : 's'}`,
-          `${c.snippets} snippet${c.snippets === 1 ? '' : 's'}`,
-          `${c.blocks} block${c.blocks === 1 ? '' : 's'}`,
-          `${c.children} child tag${c.children === 1 ? '' : 's'}`,
-        ].join(', ');
-        if (!confirm(`Destroy "${name}" for good?\n\n${owns} point at it and will `
-                   + `lose it.\n\nThis cannot be undone. It is also the only thing `
-                   + `that frees the name "${name}" to be minted again.`)) return;
-        const done = await apiPost(`/api/tags/${encodeURIComponent(id)}/purge`,
-          { confirm: { streams: c.streams, snippets: c.snippets, blocks: c.blocks } });
-        if (done.status !== 200) {
-          return void toast('bad', 'The purge was refused',
-            done.body?.error ?? `The archive answered ${done.status}.`, 9000);
-        }
-        toast('applied', `Destroyed ${name}`, 'That name is free to mint again.', 6000);
-        AD.dead = AD.dead.filter((t) => t.id !== id);
-        adPaint();
-      } finally { b.disabled = false; }
-    });
 
     document.getElementById('ops-people').addEventListener('click', (e) => {
       const rm = e.target.closest('[data-ungrant]');
@@ -16598,9 +16707,6 @@
       upFile.value = '';   // so the same file can be picked twice running
     });
 
-    /* Links are accepted into the queue and then refused, deliberately: the
-       fetch side is a Pi job that does not exist yet, and a field that swallows
-       a URL and says nothing is worse than one that says "not yet". */
     document.getElementById('up-add-url').addEventListener('click', upTakeUrl);
     document.getElementById('up-url').addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { e.preventDefault(); upTakeUrl(); }
@@ -18301,7 +18407,11 @@
                  held: [], songs: 0,
                  // Which pile you are looking at. The queue is the default and
                  // the other two exist so a decision can be revisited.
-                 view: 'proposed' };
+                 view: 'proposed',
+                 /* And which half of Removed. Clips, because a clip is what
+                    somebody arrives in Removed looking for; the tombstones are
+                    a chore you go to deliberately. */
+                 sub: 'clips' };
 
     bindSnipList(rvList);
     bindSnipEditing(rvList);
@@ -18445,6 +18555,122 @@
       } catch (e) { offline(e); } finally { RV.loading = false; }
     }
 
+    /* =====================================================================
+       Retracted tags, which live in Removed
+       =====================================================================
+       They were an admin-panel card, and that was the wrong room. Retracting a
+       tag is a removal — the same act as rejecting a clip, on a different kind
+       of row — and the place the archive keeps its removals is here. What the
+       admin panel had that this does not is a confirm on every destroy, which
+       with fifty tombstones in the list was fifty dialogs to clear a backlog
+       nobody disagreed about.
+
+       So: no prompt, and J/K/D instead. That is a deliberate trade and the key
+       line says so out loud, because a tag purge is the one action in the
+       archive that cannot be undone by anything. D is not X and not Delete for
+       the same reason — the keys next to it should not be the irreversible one,
+       and a held-down key should not walk a list destroying things.
+    */
+    const rvDead = document.getElementById('rv-dead');
+    const DEAD = { rows: [], at: 0, loading: false };
+
+    const deadRows = () => [...rvDead.querySelectorAll('.ops-row')];
+
+    function deadPaint() {
+      /* Newest death first, which is the order somebody is likeliest to have
+         meant to act on. The counts are on the row rather than behind a
+         confirm — there is no confirm any more, so this IS the warning: a
+         tombstone with forty streams still pointing at it is a different
+         decision from an empty one, and it has to be readable before the key
+         is pressed. */
+      rvDead.innerHTML = DEAD.rows.length
+        ? DEAD.rows.map((t, i) => {
+          const bits = [
+            t.streams ? `${t.streams} stream${t.streams === 1 ? '' : 's'}` : null,
+            t.snippets ? `${t.snippets} snippet${t.snippets === 1 ? '' : 's'}` : null,
+            t.songs ? `${t.songs} song${t.songs === 1 ? '' : 's'}` : null,
+            t.blocks ? `${t.blocks} block${t.blocks === 1 ? '' : 's'}` : null,
+          ].filter(Boolean);
+          return `<div class="ops-row${i === DEAD.at ? ' rv-at' : ''}"
+                       data-dead="${esc(t.id)}">
+            <span class="ops-who">${esc(t.name)}</span>
+            <span class="ops-sub">${esc(t.kind ?? '')}</span>
+            <span class="ops-sub">${esc(bits.length ? bits.join(', ')
+              : 'nothing points at it')}</span>
+            <span class="ops-give"><button type="button" class="btn-ghost"
+              data-purge="${esc(t.id)}">Destroy</button></span>
+          </div>`;
+        }).join('')
+        : '<div class="ops-empty">No retracted tags. Every name is in use or free.</div>';
+      const n = document.getElementById('rv-subtags');
+      if (n) { n.textContent = DEAD.rows.length; n.hidden = !DEAD.rows.length; }
+    }
+
+    function deadFocus(i) {
+      const rows = deadRows();
+      if (!rows.length) return;
+      DEAD.at = Math.max(0, Math.min(i, rows.length - 1));
+      rows.forEach((r, k) => r.classList.toggle('rv-at', k === DEAD.at));
+      rows[DEAD.at]?.scrollIntoView({ block: 'nearest' });
+    }
+
+    async function loadDead() {
+      if (DEAD.loading) return;
+      DEAD.loading = true;
+      try {
+        DEAD.rows = (await api('/api/tags?retracted=1&limit=500')).tags ?? [];
+        DEAD.at = Math.min(DEAD.at, Math.max(0, DEAD.rows.length - 1));
+        deadPaint();
+      } catch (e) {
+        offline(e);
+        rvDead.innerHTML = '<div class="ops-empty">Could not read the tombstones.</div>';
+      } finally { DEAD.loading = false; }
+    }
+
+    /** Destroy one, with no dialog in the way.
+     *
+     *  Still two calls, because the route is still two-phase: it answers a
+     *  preview to a body with no `confirm` and refuses a confirm whose counts
+     *  disagree with what it just read. With the dialog gone that guard is no
+     *  longer a person checking a number — but it is still the difference
+     *  between destroying what this page listed and destroying whatever the
+     *  row happens to point at now, which is the case worth catching.
+     */
+    async function deadPurge(id) {
+      const row = rvDead.querySelector(`[data-dead="${CSS.escape(id)}"]`);
+      row?.classList.add('is-going');
+      const prev = await apiPost(`/api/tags/${encodeURIComponent(id)}/purge`, {});
+      if (prev.status !== 200) {
+        row?.classList.remove('is-going');
+        return void toast('bad', 'Could not read that tag',
+          prev.body?.error ?? `The archive answered ${prev.status}.`);
+      }
+      const name = prev.body.tag?.name ?? 'that tag';
+      const done = await apiPost(`/api/tags/${encodeURIComponent(id)}/purge`,
+        { confirm: prev.body.confirm });
+      if (done.status !== 200) {
+        row?.classList.remove('is-going');
+        return void toast('bad', 'The purge was refused',
+          done.body?.error ?? `The archive answered ${done.status}.`, 9000);
+      }
+      /* Spliced out and the cursor left where it is, so the next row falls
+         under it — which is what makes J D J D work, and what makes holding D
+         dangerous enough to be worth naming in the key line. */
+      const was = DEAD.rows.findIndex((t) => t.id === id);
+      DEAD.rows = DEAD.rows.filter((t) => t.id !== id);
+      if (was >= 0 && was < DEAD.at) DEAD.at--;
+      DEAD.at = Math.max(0, Math.min(DEAD.at, DEAD.rows.length - 1));
+      deadPaint();
+      toast('applied', `Destroyed ${name}`, 'That name is free to mint again.', 4000);
+    }
+
+    rvDead.addEventListener('click', (e) => {
+      const b = e.target.closest('[data-purge]');
+      if (b) { b.disabled = true; return void deadPurge(b.dataset.purge); }
+      const row = e.target.closest('.ops-row');
+      if (row) deadFocus(deadRows().indexOf(row));
+    });
+
     /* Switching pile. The bulk buttons change meaning with it: in the queue
        they publish or reject, and among rejected clips the only sensible bulk
        action is putting them back. A button whose label lies about what it
@@ -18461,36 +18687,69 @@
       /* Bulk actions only where they are the obvious thing. Among published
          clips every bulk verb is destructive at fifty-at-a-time scale — the
          occasional un-publish is a per-row X, not a page button. */
+      rvShow();
+      if (view === 'suggestions') return void loadSuggestions();
+      if (view === 'changes') return void loadChangesets();
+      if (RV.sub === 'tags') return void loadDead();
+      loadReview({ reset: true });
+    }
+
+    /** Who is on screen, for every combination of pile and sub-pile.
+     *
+     *  One function rather than a line per control in each switcher: there are
+     *  now five lists and two switchers over them, and the failure mode of
+     *  scattering the visibility rules is two of them on screen at once. This
+     *  is derived from (view, sub) every time either changes.
+     */
+    function rvShow() {
+      const view = RV.view;
       const sg = view === 'suggestions';
       const cs = view === 'changes';
-      /* Both non-clip views want the same thing from the clip apparatus:
-         nothing. Kept as one flag rather than two so a third such view cannot
-         half-hide it. */
-      const clips = !sg && !cs;
+      const dead = view === 'rejected' && RV.sub === 'tags';
+      /* Every non-clip view wants the same thing from the clip apparatus:
+         nothing. Kept as one flag rather than one per view so a third such
+         view cannot half-hide it. */
+      const clips = !sg && !cs && !dead;
       document.getElementById('rv-approve-all').hidden = view !== 'proposed';
       document.getElementById('rv-reject-all').hidden = view !== 'proposed';
-      document.getElementById('rv-restore-all').hidden = view !== 'rejected';
+      document.getElementById('rv-restore-all').hidden = !clips || view !== 'rejected';
       /* The whole clip-review apparatus goes away here: the bulk verbs mean
          nothing, the J/K/A/X keys have no rows to act on, and Undo undoes a
          verdict rather than a canonization. */
       document.getElementById('rv-undo').hidden = !clips;
-      document.querySelector('.rv-keys').hidden = !clips;
+      document.getElementById('rv-keys-clips').hidden = !clips;
+      document.getElementById('rv-keys-tags').hidden = !dead;
       document.getElementById('rv-progress').hidden = !clips;
       document.getElementById('rv-pace').hidden = !clips;
+      // The sub-switcher belongs to Removed and nowhere else.
+      document.getElementById('rv-subs').hidden = view !== 'rejected';
       rvList.hidden = !clips;
       rvMore.hidden = true;
       sgList.hidden = !sg;
       csList.hidden = !cs;
+      rvDead.hidden = !dead;
+      for (const b of document.querySelectorAll('[data-rvsub]')) {
+        const on = b.dataset.rvsub === RV.sub;
+        b.classList.toggle('is-on', on);
+        b.setAttribute('aria-selected', String(on));
+      }
       /* Silence whatever was playing in the list we just hid. `hidden` stops a
          video being drawn and stops nothing else — the same bug the tab
          switcher had, one level down. */
       if (!clips) for (const v of rvList.querySelectorAll('video')) v.pause();
-      if (sg) return void loadSuggestions();
-      if (cs) return void loadChangesets();
-      loadReview({ reset: true });
     }
+
     for (const b of document.querySelectorAll('[data-rvview]')) {
       b.addEventListener('click', () => rvSetView(b.dataset.rvview));
+    }
+    for (const b of document.querySelectorAll('[data-rvsub]')) {
+      b.addEventListener('click', () => {
+        if (RV.sub === b.dataset.rvsub) return;
+        RV.sub = b.dataset.rvsub;
+        rvShow();
+        if (RV.sub === 'tags') loadDead();
+        else loadReview({ reset: true });
+      });
     }
 
     /* =====================================================================
@@ -18538,7 +18797,10 @@
     const muGrid = document.getElementById('mu-grid');
     const muCount = document.getElementById('mu-count');
     const muQ = document.getElementById('mu-q');
-    const MU = { rows: [], q: '', loading: false, booted: false };
+    /* Said in one place so the sentence under an empty shelf cannot drift
+       from CONCERT_MIN_S in server.js. If that number moves, this moves. */
+    const MU_CONCERT_MIN_S = 600;
+    const MU = { rows: [], q: '', view: 'songs', loading: false, booted: false };
     /* Every song the page has seen, by id — the music twin of `snipCache`, and
        here for the same reason it is: the review queue renders songs too, and
        its rows are not in `MU.rows`. A handler that resolved a card by looking
@@ -18569,6 +18831,11 @@
       retract: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 21H8a2 2 0 0 1-1.42-.587l-3.994-3.999a2 2 0 0 1 0-2.828l10-10a2 2 0 0 1 2.829 0l5.999 6a2 2 0 0 1 0 2.828L12.834 21"/><path d="m5.082 11.09 8.828 8.828"/></svg>',
       link:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>',
       restore: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/></svg>',
+      /* Its own glyph rather than `restore` again. Both are circular arrows and
+         they mean different things — restore undoes a decision a person made,
+         this asks the recorder to have another go — so the one place they could
+         appear side by side is the one place they must not look alike. */
+      again:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-3.36-7"/><path d="M21 3v6h-6"/></svg>',
       delete:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 11v6"/><path d="M14 11v6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
     };
 
@@ -18626,9 +18893,14 @@
              title="Take ${esc(t.name)} off this song"
              aria-label="Remove ${esc(t.name)}">×</button>` : ''}</span>`;
 
+    /* One answer to "may this come off", because the strip and the pinned
+       panel both draw the same chip and a panel that offered a × the row did
+       not would be offering a write the server refuses. */
+    const muMayDetach = (m) => !m.retracted && !!ME.can?.['tag.detach'];
+
     function muTagStrip(m) {
       const live = !m.retracted;
-      const mayDetach = live && !!ME.can?.['tag.detach'];
+      const mayDetach = muMayDetach(m);
       const mayAttach = live && !!ME.can?.['tag.attach'];
       /* `+ tag` FIRST, which is the opposite of where the snippet strip puts
          it, and for a reason particular to this card: the strip is clamped to
@@ -18666,6 +18938,15 @@
         /* Matches the server's own guard: a published song has to be turned
            down or retracted first, so a slip costs a click and not a master. */
         purge: !!ME.can?.['music.purge'] && (m.status !== 'confirmed' || m.retracted),
+        /* Only when something actually failed, which is what makes it readable:
+           a button that is there whenever it COULD be pressed says nothing, and
+           this one appearing is the whole message. The fetch half also needs
+           the approval to still stand, because a download is what an approval
+           means — the server refuses it otherwise and this matches, so the
+           button is never offered where it would 409. */
+        again: !!ME.can?.['music.decide'] && !m.retracted
+          && (m.probe_status === 'failed'
+              || (m.fetch_status === 'failed' && m.status === 'confirmed')),
       };
       const btn = (act, icon, label, cls = '') =>
         `<button class="mu-btn ${cls}" type="button" data-muact="${act}"
@@ -18684,6 +18965,13 @@
         may.undo ? btn('reject', 'unlist', 'Unlist — take it off the shelf', 'bad') : '',
         may.unretract ? btn('unretract', 'restore', 'Restore — undo the retraction', 'yes') : '',
         may.requeue ? btn('reset', 'restore', 'Back to the queue', 'yes') : '',
+        /* The reason it failed, on the button that does something about it. The
+           note is otherwise only a tooltip on a chip, so "it did not download"
+           and "it did not download because the recorder was not signed in" were
+           the same card — and the second one is the one you can act on. */
+        may.again ? btn('retry', 'again', m.probe_status === 'failed'
+          ? `Try reading it again${m.probe_note ? ` — last time: ${m.probe_note}` : ''}`
+          : `Try saving it again${m.fetch_note ? ` — last time: ${m.fetch_note}` : ''}`) : '',
         may.retract ? btn('retract', 'retract', 'Retract', 'bad') : '',
         may.purge ? btn('purge', 'delete', 'Delete', 'bad') : '',
       ].filter(Boolean).join('');
@@ -18720,7 +19008,7 @@
           <div class="mu-ch" title="${esc(m.channel ?? '')}">${esc(m.channel ?? '')}</div>
           <div class="mu-date">${m.uploaded_at ? muDate(m.uploaded_at) : ''}${
             mine && m.status === 'proposed' ? '<span class="mu-mine">yours</span>' : ''}</div>
-          <div class="mu-tags">${muTagStrip(m)}</div>
+          <div class="mu-tags${m.tags.length ? ' mu-has' : ''}">${muTagStrip(m)}</div>
           ${acts ? `<div class="mu-acts">${acts}</div>` : ''}
         </div>
       </article>`;
@@ -18807,15 +19095,33 @@
     }
 
     function muPaint() {
+      /* Every card is about to be replaced, so a panel held open over one of
+         them is about to be a panel held open over nothing — or worse, over a
+         different song's card at the same coordinates. muRepaint re-anchors
+         because it replaces ONE card and knows which; this replaces the lot. */
+      muPopHide();
+      const shelf = MU.view === 'concerts';
       muGrid.innerHTML = MU.rows.length
         ? MU.rows.map(muCard).join('')
         : `<div class="mu-empty">${MU.q
             ? `Nothing matches “${esc(MU.q)}” here.`
-            : 'Nothing here yet. Paste a link and it starts as a suggestion.'}</div>`;
+            /* An empty SHELF is not an empty collection, and the old line said
+               the second thing whichever was true — "paste a link and it
+               starts as a suggestion" under a Concerts tab reads as the
+               archive having no music at all. */
+            : shelf
+              ? `Nothing over ${Math.round(MU_CONCERT_MIN_S / 60)} minutes yet. `
+                + 'Anything longer is filed here, and the tag can be taken off '
+                + 'a long single that is not really a set.'
+              : 'Nothing here yet. Paste a link and it starts as a suggestion.'}</div>`;
       /* "3 of them" is a different fact from "3 songs", and on a filtered
-         list the second one reads as the collection being smaller than it is. */
+         list the second one reads as the collection being smaller than it is.
+         The shelf changes the noun for the same reason: "12 songs" under
+         Concerts names the wrong thing twice over. */
       const n = MU.rows.length;
-      const noun = MU.q ? (n === 1 ? 'match' : 'matches') : (n === 1 ? 'song' : 'songs');
+      const noun = MU.q ? (n === 1 ? 'match' : 'matches')
+        : shelf ? (n === 1 ? 'concert' : 'concerts')
+        : (n === 1 ? 'song' : 'songs');
       muCount.textContent = n ? `${n} ${noun}` : '';
     }
 
@@ -18827,7 +19133,7 @@
       if (MU.loading) return;
       MU.loading = true;
       try {
-        const d = await api('/api/music?limit=200'
+        const d = await api(`/api/music?limit=200&view=${MU.view}`
           + (MU.q ? `&q=${encodeURIComponent(MU.q)}` : ''));
         MU.rows = d.music ?? [];
         for (const m of MU.rows) muCache.set(m.id, m);
@@ -18854,6 +19160,8 @@
         }
         // The add window draws the same song in a different shape.
         if (MU_MINE.includes(id)) muMinePaint();
+        // And the panel held open over the card that was just replaced.
+        if (muPopPin && muPop.dataset.mu === id) muPopResync(id);
       } catch { /* the write landed; the next load will show it */ }
     }
 
@@ -19054,6 +19362,10 @@
       const tagAdd = e.target.closest('[data-mutagadd]');
       if (tagAdd) {
         e.stopPropagation();
+        // The picker opens at the `+ tag` button, which is where the held-open
+        // panel is sitting. Two popovers over each other is one too many, and
+        // the one being asked for wins.
+        muPopHide();
         openTagletPicker(tagAdd, m.id, m.tags, { on: 'music' });
         return true;
       }
@@ -19086,20 +19398,35 @@
     const muPop = Object.assign(document.createElement('div'),
       { className: 'mu-pop', hidden: true });
     document.body.appendChild(muPop);
-    let muPopFor = null;
+    let muPopFor = null, muPopPin = false;
 
-    function muPopShow(strip) {
+    /** Show every tag on the song this strip belongs to. Returns whether it
+     *  managed to — a song with no tags has nothing to put in a panel.
+     *
+     *  `pin` is the difference between reading and editing. Hovered, the panel
+     *  carries no × at all: it is pointer-events: none so that the pointer
+     *  stays on the row underneath and the hover does not flicker itself shut,
+     *  and a button inside something that cannot be clicked is worse than no
+     *  button. Clicked, the pointer-events come back and the ×s with them, and
+     *  that is the only way to reach the second tag's × on a card — the row is
+     *  one 20px line and everything past the first chip is under the fade or
+     *  outside the box.
+     */
+    function muPopShow(strip, pin = false) {
       const card = strip.closest('[data-mu]');
       const m = card && muCache.get(card.dataset.mu);
-      if (!m?.tags?.length) return;
+      if (!m?.tags?.length) return false;
       muPopFor?.classList.remove('mu-lit');
       muPopFor = strip;
+      muPopPin = pin;
       strip.classList.add('mu-lit');
-      // Never with the × buttons: this panel does not take clicks (it is
-      // pointer-events: none, so the pointer stays on the row it belongs to and
-      // the hover does not flicker), and a control you cannot press is worse
-      // than no control.
-      muPop.innerHTML = m.tags.map((t) => muTagChip(t, false)).join('');
+      muPop.classList.toggle('pin', pin);
+      /* Which song the ×s belong to. The panel lives on the body, outside the
+         card, so the delegated handler cannot walk up to a `[data-mu]` the way
+         it does from a chip in the row — stamping the id here makes the panel
+         its own host and muTagClick works on it unchanged. */
+      muPop.dataset.mu = m.id;
+      muPop.innerHTML = m.tags.map((t) => muTagChip(t, pin && muMayDetach(m))).join('');
       muPop.hidden = false;
       const r = strip.getBoundingClientRect();
       const w = muPop.offsetWidth, h = muPop.offsetHeight;
@@ -19108,11 +19435,26 @@
       const top = r.bottom + 6 + h > window.innerHeight ? r.top - h - 6 : r.bottom + 6;
       muPop.style.left = `${Math.round(Math.max(8, Math.min(r.left, window.innerWidth - w - 8)))}px`;
       muPop.style.top = `${Math.round(Math.max(8, top))}px`;
+      return true;
     }
     function muPopHide() {
       muPop.hidden = true;
+      muPop.classList.remove('pin');
       muPopFor?.classList.remove('mu-lit');
       muPopFor = null;
+      muPopPin = false;
+    }
+
+    /** The pinned panel, after the card underneath it was redrawn.
+     *
+     *  muRepaint replaces the whole card, so the strip the panel was anchored
+     *  to is a detached node the moment a tag comes off — and taking one tag
+     *  off is exactly when somebody is about to take the next one off too.
+     *  Re-anchoring rather than closing is what makes removing three tags three
+     *  clicks instead of six. */
+    function muPopResync(id) {
+      const strip = document.querySelector(`.mu[data-mu="${CSS.escape(id)}"] .mu-tags`);
+      if (!strip || !muPopShow(strip, true)) muPopHide();
     }
 
     /* pointerover/out and NOT pointerenter/leave.
@@ -19127,12 +19469,19 @@
      * pointer came from, or went to. That is the whole fix: a move that stays
      * inside the same strip is a move this ignores, whichever children it was
      * between. */
+    /* Both stand down while the panel is pinned. A pinned panel that another
+       card's hover could take over would be a panel that closes itself the
+       moment you move the pointer toward its ×s — the row below is often
+       exactly what is in the way — so once it is held open, only an explicit
+       dismissal closes it. */
     muGrid.addEventListener('pointerover', (e) => {
+      if (muPopPin) return;
       const strip = e.target?.closest?.('.mu-tags');
       if (!strip || strip === muPopFor) return;
       muPopShow(strip);
     });
     muGrid.addEventListener('pointerout', (e) => {
+      if (muPopPin) return;
       const strip = e.target?.closest?.('.mu-tags');
       if (!strip || strip !== muPopFor) return;
       // Still inside the row — a chip handing over to its neighbour, or to the
@@ -19140,9 +19489,30 @@
       if (strip.contains(e.relatedTarget)) return;
       muPopHide();
     });
-    // A repaint or a scroll leaves the panel pointing at nothing.
+    // A repaint or a scroll leaves the panel pointing at nothing. Pinned too:
+    // it is position: fixed, so a scrolled page leaves it floating over a card
+    // that is no longer the one it is about.
     muGrid.addEventListener('scroll', muPopHide, true);
     addEventListener('scroll', muPopHide, true);
+
+    /* The ×s inside the pinned panel, through the same handler the row uses —
+       the panel is stamped with the song's id, so it is a `[data-mu]` host in
+       its own right and muTagClick needs to know nothing about it. It stops
+       propagation on a hit, which is also what keeps the dismissal below from
+       reading a removal as a click somewhere else. */
+    muPop.addEventListener('click', muTagClick);
+
+    /* Dismissal. Anywhere outside the panel and outside a tag row: a click on a
+       row is either the pin gesture itself or a re-pin onto another song, and
+       both are handled where the gesture is, not here. */
+    document.addEventListener('click', (e) => {
+      if (!muPopPin) return;
+      if (e.target.closest('.mu-pop, .mu-tags')) return;
+      muPopHide();
+    });
+    addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && muPopPin) { e.stopImmediatePropagation(); muPopHide(); }
+    }, true);
 
     muGrid.addEventListener('click', async (e) => {
       const card = e.target.closest('.mu');
@@ -19155,6 +19525,19 @@
       if (!m) return;
       if (e.target.closest('[data-muplay]')) return void muPlay(m);
       if (muTagClick(e)) return;
+
+      /* Whatever is left of a click on the tag row is a click on the ROW —
+         muTagClick has already taken `+ tag` and any × that happened to be
+         reachable — and that is the gesture that holds the panel open. Which is
+         the only way to reach the second tag's ×: the row is one line, and the
+         chips past the first are under the fade or outside the box entirely.
+         Clicking the held-open row again puts it away. */
+      const bar = e.target.closest('.mu-tags');
+      if (bar) {
+        if (muPopPin && bar === muPopFor) muPopHide();
+        else if (!muPopShow(bar, true)) muPopHide();
+        return;
+      }
 
       const act = e.target.closest('[data-muact]')?.dataset.muact;
       if (!act) return;
@@ -19222,6 +19605,25 @@
         return;
       }
 
+      if (act === 'retry') {
+        /* Not a verdict, so not the review route. Which of the two halves is
+           being re-run is the row's business and the server works it out —
+           there is one button here because there is one intention. */
+        card.classList.add('busy');
+        const r = await apiPost(`/api/music/${m.id}/retry`);
+        card.classList.remove('busy');
+        if (r.status !== 200) {
+          return void toast('bad', 'Not queued', r.body?.error ?? `HTTP ${r.status}`, 7000);
+        }
+        muRepaint(m.id);
+        toast('queued', r.body?.already ? 'Already on the queue'
+                                        : 'Asked the recorder again',
+          r.body?.kind === 'music_probe'
+            ? 'It will read the page and fill the card in.'
+            : 'It will try to save a copy. The card says when it lands.', 6000);
+        return;
+      }
+
       card.classList.add('busy');
       const r = await apiPost(`/api/music/${m.id}/review`, { decision: act });
       card.classList.remove('busy');
@@ -19267,6 +19669,20 @@
       e.preventDefault(); e.stopPropagation();
       muQ.value = ''; MU.q = ''; loadMusic();
     });
+    /* The shelf switch. It reloads rather than filtering what is already here,
+       because the list is capped at 200 and the two shelves are two different
+       200s — hiding rows client-side would make a full shelf look short and an
+       empty one look identical to a failed request. */
+    document.querySelector('.mu-view').addEventListener('click', (e) => {
+      const b = e.target.closest('[data-muview]');
+      if (!b || b.dataset.muview === MU.view) return;
+      MU.view = b.dataset.muview;
+      for (const x of document.querySelectorAll('[data-muview]')) {
+        x.setAttribute('aria-pressed', String(x === b));
+      }
+      loadMusic();
+    });
+
     document.getElementById('tab-music').addEventListener('click', () => {
       if (MU.booted) return void loadMusic();
       MU.booted = true;
@@ -19788,6 +20204,28 @@
          beside it, and X went straight back to rejecting a clip nobody could
          see. An allowlist cannot be forgotten by the next pile. */
       if (RV.view !== 'proposed' && RV.view !== 'rejected') return;
+      /* The tombstone list has its own cursor and its own one verb, and it
+         takes the keys before the clip map sees them — otherwise X in here
+         would reject whichever clip the hidden list was scrolled to, which is
+         the exact bug the paragraph above is about, arriving from a new
+         direction. Only J, K and D are claimed; everything else falls through
+         to nothing, because nothing else in that map means anything to a tag. */
+      if (RV.view === 'rejected' && RV.sub === 'tags') {
+        const k2 = e.key.toLowerCase();
+        const acts = {
+          j: () => deadFocus(DEAD.at + 1),
+          arrowdown: () => deadFocus(DEAD.at + 1),
+          k: () => deadFocus(DEAD.at - 1),
+          arrowup: () => deadFocus(DEAD.at - 1),
+          d: () => {
+            const id = deadRows()[DEAD.at]?.dataset.dead;
+            if (id) deadPurge(id);
+          },
+        };
+        if (!acts[k2]) return;
+        e.preventDefault();
+        return void acts[k2]();
+      }
       const k = e.key.toLowerCase();
       const map = {
         j: () => rvFocus(RV.at + 1),
