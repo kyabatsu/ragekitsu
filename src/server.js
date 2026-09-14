@@ -870,6 +870,12 @@ export function makeApp(config = CONFIG) {
             label: String(b.note_text ?? '').trim().slice(0, 60) || null }
         : { path: cap.video_path, start_s: Math.round(startIn) }),
       duration_s: total,
+      /* Both, and for different readers. `stream_idx` is what a person calls
+         this broadcast and is what the queue row shows; `stream_id` is the
+         key, carried so anything reading this job back can find the row —
+         `idx` is a mutable label and nullable, and a queue that resolves one
+         by it would be looking up a name. */
+      stream_id: row.id,
       stream_idx: row.idx ?? null,
       platform: wantLive ? rec.platform : cap.platform,
       at_wall: at,
@@ -3849,26 +3855,66 @@ export function makeApp(config = CONFIG) {
    * machine wrote it and no human has been over it, and the first hand edit
    * clears the flag in the applier.
    */
+  /** A harvest has two answers now, and only one of them touches the tag.
+   *
+   *  A SEARCH answers with candidates. Those are parked on the job's own
+   *  payload and written nowhere else: nobody has decided anything yet, and a
+   *  search that quietly rewrote the row would be the auto-apply this whole
+   *  design exists to avoid — three different games are called Summer Camp.
+   *  The page reads them back through GET /api/jobs/:id, which already exists
+   *  for exactly this question: is THIS one finished yet.
+   *
+   *  An ART fetch answers with a file. The worker wrote it where the payload
+   *  told it to, inside the media tree, so all that is left is to point the
+   *  row at it.
+   */
   function harvestLanded(job, status, result, resultPath) {
-    if (status !== 'done' || !result || typeof result !== 'object') return;
-    const id = String(job.payload ? (JSON.parse(job.payload)?.tag_id ?? '') : '');
+    let pay = null;
+    try { pay = job.payload ? JSON.parse(job.payload) : null; } catch { /* not ours to fix */ }
+    const id = String(pay?.tag_id ?? '');
     if (!id) return;
+    const t = now();
+
+    /* Candidates first, and recorded even on a FAILED search: "IGDB refused
+       us" is an answer the page has to be able to draw, and the error is
+       already on the job row beside them. */
+    if (Array.isArray(result?.candidates)) {
+      const https = (v) => (/^https:\/\//i.test(String(v ?? '')) ? String(v).slice(0, 600) : null);
+      const trim = result.candidates.slice(0, 8).map((c) => ({
+        name: String(c?.name ?? '').slice(0, 200),
+        summary: String(c?.summary ?? '').slice(0, 4000),
+        art: https(c?.art), url: https(c?.url),
+        meta: String(c?.meta ?? '').slice(0, 200),
+        exact: !!c?.exact, twins: Number(c?.twins) || 0,
+      })).filter((c) => c.name);
+      W.prepare('UPDATE job SET payload = ?, updated_at = ? WHERE id = ?')
+        .run(JSON.stringify({ ...pay, candidates: trim }), t, job.id);
+      bumpGeneration(W);
+      return;
+    }
+
+    if (status !== 'done') return;
     const tag = W.prepare('SELECT id, thumb_path FROM tag WHERE id = ?').get(id);
     if (!tag) return;
-    const t = now();
+
+    /* The art, at the name THIS JOB asked for and no other. Checked against
+       the payload rather than against a shape, because the archive minted that
+       name — a worker answering with some other path inside `posters/` is a
+       worker writing where it was not asked to, and the row must not follow it
+       there. */
+    const want = String(pay?.art_to ?? '');
+    if (want && resultPath === want
+        && /^posters\/[0-9A-HJKMNP-TV-Z]{26}\.(jpg|png)$/.test(want)) {
+      W.prepare('UPDATE tag SET thumb_path = ?, seeded = 1, updated_at = ? WHERE id = ?')
+        .run(want, t, id);
+      bumpGeneration(W);
+    }
+    if (!result || typeof result !== 'object') return;
 
     const set = [], vals = [];
     const put = (col, v) => { set.push(`${col} = ?`); vals.push(v); };
     if (typeof result.summary === 'string' && result.summary.trim()) {
       put('summary', result.summary.trim().slice(0, 4000));
-    }
-    /* A re-seed replaces the art as well as the words — that is what the
-       button says it does, and half a re-seed would leave a row that is
-       neither what the wiki says nor what you wrote. `posters/` is where a
-       promoted poster lands, and the Pi has already put the file in
-       quarantine under that name. */
-    if (typeof resultPath === 'string' && /^posters\/[0-9A-HJKMNP-TV-Z]{26}\.png$/.test(resultPath)) {
-      put('thumb_path', resultPath);
     }
     if (!set.length) return;
     // Set LAST so the writes above do not have to care about ordering, and so
@@ -3974,6 +4020,56 @@ export function makeApp(config = CONFIG) {
     bumpGeneration(W);
   }
 
+  /** What a queue row is ABOUT, in words, for whichever kind it is.
+   *
+   *  The panel had one answer to this and it was `snippet.title`, reached
+   *  through the only join the query made. So every kind that is not about a
+   *  snippet — `clip`, `harvest`, `rescan`, and both music kinds — rendered as
+   *  **"a snippet that is gone"**, which is the interface inventing a missing
+   *  row: a clip cut out of a capture never had a snippet to lose. A queue
+   *  whose rows say a thing has been destroyed when it has not is worse than
+   *  one with no labels at all, because it sends you looking.
+   *
+   *  Built HERE and not in the page, because this is where the payload and the
+   *  rows it names both are. `null` is reserved for the one case that sentence
+   *  is actually true of: a job that names a snippet which is no longer there.
+   */
+  function jobLabel(r) {
+    let p = null;
+    try { p = r.payload ? JSON.parse(r.payload) : null; } catch { /* not ours to fix here */ }
+
+    if (r.kind === 'clip') {
+      /* `stream_idx` is a label and nullable, so it is offered and not relied
+         on; the duration is the one thing every clip job has. */
+      const head = p?.stream_idx ? `#${p.stream_idx}` : 'a clip';
+      const len = Number(p?.duration_s) > 0 ? ` · ${hms(p.duration_s)}` : '';
+      const from = p?.live ? ' out of the live recording' : ' out of the master';
+      return `${head}${len}${from}${p?.label ? ` — ${p.label}` : ''}`;
+    }
+    if (r.kind === 'harvest') {
+      return p?.name ? `a description for ${p.name}` : 'a description for a tag';
+    }
+    if (r.kind === 'rescan') {
+      const n = Array.isArray(p?.captures) ? p.captures.length : 0;
+      return n ? `re-read ${n} capture${n === 1 ? '' : 's'}` : 're-read a stream';
+    }
+    if (r.kind === 'music_probe' || r.kind === 'music_fetch') {
+      const verb = r.kind === 'music_probe' ? 'read' : 'download';
+      /* `channel`, not an artist column — there is not one. A song that has
+         only just been linked has neither yet, because the title IS what the
+         probe is on its way to find out; hence the plain fallback. */
+      const m = p?.music_id
+        ? R.prepare('SELECT title, channel FROM music WHERE id = ?').get(p.music_id) : null;
+      const name = [m?.channel, m?.title].filter(Boolean).join(' — ');
+      return name ? `${verb} ${name}` : `${verb} a song`;
+    }
+    /* The snippet kinds, where the old answer was the right one. A `fetch`
+       carries a url and no snippet until the bytes land, which is why the
+       panel draws that one from `url` and this leaves it alone. */
+    if (r.kind === 'fetch' && r.url) return null;
+    return r.title ?? null;
+  }
+
   const jobRow = (r) => ({
     id: r.id, kind: r.kind, status: r.status,
     snippet_id: r.snippet_id, url: r.url,
@@ -4029,7 +4125,20 @@ export function makeApp(config = CONFIG) {
 
   /* POST and not GET, though it reads like a fetch: claiming TAKES A LEASE,
      which is a write, and a GET that writes is both wrong and cacheable. */
-  app.post('/api/ingest/jobs/claim', requireIngest, (req, res) => {
+  /* How long a claim may be held open, and why there is a ceiling at all.
+     Long enough that a person pressing a button is not waiting on a poll
+     interval; short enough to answer before anything in front of this decides
+     an idle socket is dead. The worker reaches this over the tailnet, where
+     there is nothing in front of it, but the number should be safe if that
+     ever stops being true. */
+  const CLAIM_WAIT_MAX_S = 30;
+  /* How often the held-open claim looks. 250ms is imperceptible next to a
+     network round trip and it is ONE indexed SELECT — `ix_job_claim` is
+     (status, kind, created_at) and the queue is nearly all `done`. */
+  const CLAIM_POLL_MS = 250;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  app.post('/api/ingest/jobs/claim', requireIngest, async (req, res) => {
     const worker = String(req.body?.worker ?? 'unknown').slice(0, 64);
     const want = Math.min(Math.max(Number(req.body?.limit ?? 1) || 1, 1), 10);
     const kinds = [].concat(req.body?.kinds ?? PI_KINDS)
@@ -4037,13 +4146,70 @@ export function makeApp(config = CONFIG) {
     if (!kinds.length) {
       return res.status(400).json({ error: `kinds must be some of ${PI_KINDS}` });
     }
-    const t = now();
+    /* `wait` — hold this open until there is something, rather than answering
+       "nothing" and making the worker sleep twenty seconds. Absent or 0 is the
+       old behaviour exactly, so a worker that has not been updated is
+       unaffected.
+
+       THE WAIT HAPPENS OUTSIDE THE TRANSACTION, and that is not a detail. The
+       claim below opens `BEGIN IMMEDIATE`, which takes the write lock; holding
+       that for twenty-five seconds would block every write in the archive for
+       twenty-five seconds — every changeset, every note, every upload. So the
+       loop does a cheap unlocked read and only opens the transaction once that
+       read says there is a row to take. Backwards, this is not a latency
+       improvement, it is a global write lock with a timer on it. */
+    const wait = Math.min(Math.max(Number(req.body?.wait ?? 0) || 0, 0), CLAIM_WAIT_MAX_S);
+    /* Whether the caller is still there, from `close` on the RESPONSE.
+       Not `req.destroyed`, which was the first version of this and is a trap:
+       `destroyed` on an IncomingMessage is set when the request stream has
+       been fully READ, not when the socket dies — and express.json() reads the
+       body to completion before the handler runs. So the guard was true on
+       every single request, the loop returned without answering, and every
+       long poll hung until the client gave up. It looked exactly like a
+       network fault. */
+    let gone = false;
+    res.on('close', () => { gone = true; });
+    const marks = kinds.map(() => '?').join(',');
+    const peek = R.prepare(
+      `SELECT 1 FROM job
+        WHERE kind IN (${marks})
+          AND (status = 'approved'
+               OR (status = 'claimed' AND (claimed_at IS NULL OR claimed_at < ?)))
+        LIMIT 1`);
+
+    /* `let`, and re-read after the wait. A claim held open for twenty-five
+       seconds would otherwise stamp `claimed_at` with the time it ARRIVED and
+       measure the lease from there — a lease a third short, on the one path
+       where the delay is deliberate. */
+    let t = now();
+    if (wait) {
+      const until = Date.now() + wait * 1000;
+      /* Recorded on the FIRST look, before any waiting: this is what proves
+         the worker is alive and proves which kinds it will never ask for, and
+         a poll that ends up waiting the full twenty-five seconds must not be
+         invisible for those twenty-five seconds. */
+      try { tx(W, () => setMeta(W, 'worker_poll', JSON.stringify({ at: t, worker, kinds }))); }
+      catch { /* a note about a poll is not worth failing the poll over */ }
+      while (!peek.get(...kinds, now() - JOB_LEASE_S)) {
+        if (Date.now() >= until) return res.json({ jobs: [], lease_s: JOB_LEASE_S, waited: wait });
+        // The caller hanging up mid-wait is the normal end of a long poll.
+        if (gone) return;
+        await sleep(CLAIM_POLL_MS);
+      }
+      t = now();
+    }
     try {
       /* One transaction, so two polls arriving together cannot both claim the
          same row. A lapsed lease is re-claimable — a worker that died holding
          one must not park its job forever — and `attempts` is what makes that
          visible rather than silent. */
       const rows = tx(W, () => {
+        /* What was asked for, before finding out whether there was any of it.
+           A poll that comes up empty is exactly the poll worth recording: it
+           is the one that proves the worker is alive and proves which kinds it
+           will never take. No bumpGeneration — see the note where the panel
+           reads this back. */
+        setMeta(W, 'worker_poll', JSON.stringify({ at: t, worker, kinds }));
         const found = W.prepare(
           `SELECT * FROM job
             WHERE kind IN (${kinds.map(() => '?').join(',')})
@@ -4328,7 +4494,9 @@ export function makeApp(config = CONFIG) {
     const t = now();
     const marks = PI_KINDS.map(() => '?').join(',');
     const rows = R.prepare(
-      `SELECT j.id, j.kind, j.status, j.snippet_id, j.url, j.attempts, j.error,
+      /* `j.payload` is here for jobLabel(), which is the only reason a row
+         that is not about a snippet can say what it is about. */
+      `SELECT j.id, j.kind, j.status, j.snippet_id, j.url, j.payload, j.attempts, j.error,
               j.claimed_by, j.claimed_at, j.created_at, j.updated_at, j.finished_at,
               j.result_path, s.title, s.retracted_at
          FROM job j LEFT JOIN snippet s ON s.id = j.snippet_id
@@ -4357,6 +4525,27 @@ export function makeApp(config = CONFIG) {
         ORDER BY claimed_at DESC LIMIT 1`).get(...PI_KINDS);
 
     const waiting = rows.filter((r) => r.status === 'approved');
+
+    /* WHAT THE WORKER ASKED FOR, last time it asked.
+     *
+     * The gap this closes: a job can sit `approved` for ever while the worker
+     * is plainly alive and taking other things, and until now the panel had no
+     * way to say why. `kinds` below is the ARCHIVE's list — what it is willing
+     * to hand out — and the worker sends its own on every poll, filtered
+     * against `ls_archive.PI_KINDS` and then against `archive_job_kinds` in
+     * its config or a `--kinds` flag. So a Pi whose config predates a kind
+     * asks for everything except that kind, gets handed nothing, reports
+     * nothing wrong, and the queue waits for ever.
+     *
+     * Recorded on the claim rather than pinged: same argument as `worker`
+     * below. It is one INSERT inside a transaction the claim already opens,
+     * and it deliberately does NOT bump the generation — a counter that moved
+     * every twenty seconds would invalidate every client's cache for ever. */
+    let poll = null;
+    try {
+      const raw = meta(R, 'worker_poll', null);
+      if (raw) poll = JSON.parse(raw);
+    } catch { /* a malformed note about a poll is not worth a 500 */ }
     /* Published clips whose bytes never moved. Counted rather than listed:
        what the panel needs is a number and a button, and the rows themselves
        are the job queue's business once the button has been pressed. */
@@ -4366,6 +4555,9 @@ export function makeApp(config = CONFIG) {
       failed: rows.filter((r) => r.status === 'failed').length,
       lease_s: JOB_LEASE_S,
       kinds: PI_KINDS,
+      /* What it asks for, beside what is on offer. The difference between the
+         two is the answer to "why has nothing taken this". */
+      poll,
       worker: last?.claimed_by
         ? { name: last.claimed_by, last_seen: last.claimed_at } : null,
       waiting: waiting.length,
@@ -4383,7 +4575,7 @@ export function makeApp(config = CONFIG) {
       waiting_since: waiting.length
         ? Math.min(...waiting.map((r) => r.updated_at ?? r.created_at)) : null,
       now: t,
-      jobs: rows,
+      jobs: rows.map((r) => ({ ...r, payload: undefined, label: jobLabel(r) })),
     });
   });
 
@@ -6651,6 +6843,12 @@ export function makeApp(config = CONFIG) {
     const out = {
       now: now(), checked_at: live.at || null, age_s: age, stale,
       interval_s: live.interval_s, YT: { live: false }, TW: { live: false },
+      /* Carried here so a page notices a change it did not make itself. Every
+         list response already reports the generation, but a reader sitting on
+         one panel makes no list requests — and this poll is the one thing the
+         page does on a timer. It is how another tab's mint, or somebody else's
+         approval, reaches a tab that is just sitting there. */
+      generation: Number(generation()),
     };
     if (stale) return out;
     for (const r of live.recording) {
@@ -7987,33 +8185,113 @@ export function makeApp(config = CONFIG) {
     res.json({ ok: true, destroyed: { id: t.id, name: t.name }, counts, total });
   });
 
+  /** Ask what the catalogue has under a name.
+   *
+   *  This used to take a URL you had gone and found, and hand it to a worker
+   *  that read the lead paragraph off a wiki. Two things were wrong with that
+   *  and only one of them was the source: it also never fetched the art, not
+   *  once — `do_harvest` returned `result_path = None` every time, while the
+   *  button said "replaces the description and the art" and the branch in
+   *  harvestLanded sat waiting for a file that was never coming.
+   *
+   *  So: no URL. The tag HAS a name and the name is the query. One deliberate
+   *  press, one job, and what comes back is CANDIDATES rather than an answer —
+   *  a search returns 0, 1 or many, and three different games are called
+   *  Summer Camp. Picking is /api/tags/:id/seed below, and it needs no worker.
+   */
   app.post('/api/tags/:id/harvest', requireRole('editor'), (req, res) => {
-    const t = R.prepare('SELECT id, name, seed_url FROM tag WHERE id = ? AND retracted_at IS NULL')
+    const t = R.prepare('SELECT id, name FROM tag WHERE id = ? AND retracted_at IS NULL')
       .get(req.params.id);
     if (!t) return res.status(404).json({ error: 'no such tag' });
-    const url = String(req.body?.url ?? t.seed_url ?? '').trim();
-    if (!url) return res.status(400).json({ error: 'no link to read — paste one first' });
-    if (!/^https:\/\//i.test(url)) {
-      return res.status(400).json({ error: 'https only' });
-    }
-    /* Asking twice queues two fetches of the same page and the second answer
-       overwrites the first with itself. */
+    /* The tag's own name unless a person retyped it. That is the whole of the
+       retype path: a franchise word like `Pokemon` is a bad query and no
+       amount of ranking fixes it, so the answer is to let it be asked again
+       differently rather than to guess harder. */
+    const q = String(req.body?.q ?? t.name ?? '').trim().slice(0, 120);
+    if (!q) return res.status(400).json({ error: 'nothing to look up' });
+
+    /* Asking twice runs the same search twice and the second answer replaces
+       the first with itself. `art_url` is excluded because those are a
+       different errand on the same kind — see the note in seedArt. */
     const open = R.prepare(
       `SELECT id FROM job WHERE kind = 'harvest' AND status IN ('approved','claimed')
-         AND payload LIKE ?`).get(`%"${t.id}"%`);
+         AND payload LIKE ? AND payload NOT LIKE '%"art_url"%'`).get(`%"${t.id}"%`);
     if (open) return res.json({ job_id: open.id, already: true });
 
-    // Stored on the row as well as in the job: it is where a re-seed reads
-    // from next time, and the attribution for whatever comes back.
-    if (url !== t.seed_url) {
-      W.prepare('UPDATE tag SET seed_url = ?, updated_at = ? WHERE id = ?').run(url, now(), t.id);
-    }
     const id = enqueueJob('harvest', {
-      url, payload: { tag_id: t.id, name: t.name, url }, by: req.person.id });
+      payload: { tag_id: t.id, name: t.name, q }, by: req.person.id });
     bumpGeneration(W);
-    logEvent(req, 'asked for a description', 'tag', t.id, { url }, null);
-    res.json({ job_id: id });
+    logEvent(req, 'looked a tag up in the catalogue', 'tag', t.id, { q }, null);
+    res.json({ job_id: id, q });
   });
+
+  /** What a person picked out of the candidates.
+   *
+   *  Writes DIRECTLY, like harvest always has, and for the same reason: this
+   *  is an observation of somebody else's catalogue, not a decision the
+   *  archive is taking. Nobody has to answer for what IGDB says a game is
+   *  about. The editorial half — whether this tag should exist, what it is
+   *  called, what kind it is — all still goes through changesets.
+   *
+   *  And it needs NO WORKER, which is the whole reason the latency of this
+   *  feature is one wait and not two. The candidate already carries the words
+   *  and the link; only the cover is bytes, and bytes have to go through the
+   *  recorder because the recorder is the only thing that writes the media
+   *  tree. Nobody watches a cover arrive.
+   */
+  app.post('/api/tags/:id/seed', requireRole('editor'), (req, res) => {
+    const t = R.prepare('SELECT id, name FROM tag WHERE id = ? AND retracted_at IS NULL')
+      .get(req.params.id);
+    if (!t) return res.status(404).json({ error: 'no such tag' });
+
+    const b = req.body ?? {};
+    const url = String(b.url ?? '').trim();
+    const summary = String(b.summary ?? '').trim().slice(0, 4000);
+    const art = String(b.art ?? '').trim();
+    const picked = String(b.name ?? '').trim().slice(0, 200);
+    if (!url && !summary) {
+      return res.status(400).json({ error: 'a pick needs at least a link or a description' });
+    }
+    for (const [what, v] of [['link', url], ['art', art]]) {
+      if (v && !/^https:\/\//i.test(v)) {
+        return res.status(400).json({ error: `${what} must be https` });
+      }
+    }
+
+    const at = now();
+    /* `seeded = 1` says out loud that a machine wrote this and no human has
+       been over it; the first hand edit clears it in the applier. */
+    W.prepare(`UPDATE tag SET summary = COALESCE(?, summary), seed_url = COALESCE(?, seed_url),
+                              seeded = 1, updated_at = ? WHERE id = ?`)
+      .run(summary || null, url || null, at, t.id);
+
+    const job = art ? seedArt(t.id, art, req.person?.id ?? null) : null;
+    bumpGeneration(W);
+    logEvent(req, 'seeded a tag from the catalogue', 'tag', t.id,
+             { picked: picked || null, url: url || null, art: !!art }, null);
+    res.json({ ok: true, art_job: job });
+  });
+
+  /** The one thing in a pick that has to go through the recorder.
+   *
+   *  A `harvest` carrying `art_url` rather than a kind of its own, and that is
+   *  deliberate: a new kind would have to be added to JOB_KINDS here, to
+   *  PI_KINDS here, to PI_KINDS in ls_archive.py, AND to `archive_job_kinds`
+   *  in the Pi's config — which is the trap that had a clip sitting WAITING
+   *  for ever while the worker took everything else. A kind that already
+   *  travels cannot fall into it.
+   *
+   *  The destination is named HERE, as a ULID, because names in the media tree
+   *  are the archive's to mint — the same rule the quarantine names follow.
+   *  `.jpg` and not `.png`: IGDB serves JPEG, `.jpg` is in the media MIME
+   *  allowlist, and converting it on a Pi to satisfy a regex would be a
+   *  transcode for nothing.
+   */
+  function seedArt(tagId, artUrl, by) {
+    const to = `posters/${ulid()}.jpg`;
+    return enqueueJob('harvest', {
+      payload: { tag_id: tagId, art_url: artUrl, art_to: to }, by });
+  }
 
   const POSTER_MAX_BYTES = Number(process.env.TENMA_POSTER_MAX_BYTES) || 8 * 1024 * 1024;
   const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);

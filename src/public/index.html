@@ -331,6 +331,10 @@
     background: color-mix(in srgb, var(--tl-not) 13%, transparent);
     border: 1px solid color-mix(in srgb, var(--tl-not) 28%, transparent); }
   .rq-warn b { color: #fff; }
+  /* On the header line, where "asks for x" has to be readable as stale. A
+     poll older than the claim hold means the worker is not asking at all, and
+     that is not a detail to print in the same grey as the rest. */
+  .rq-cold { color: var(--tl-not); font-weight: 600; }
   /* Not an alarm — nothing is broken, something was never asked for. Same
      shape as the warning so it reads as the same kind of thing to act on,
      in the colour of a note rather than of a problem. */
@@ -395,7 +399,12 @@
        title is not reading material. The glass stays in the border and the
        shadow, where it costs nothing. */
     background: color-mix(in srgb, var(--panel) 97%, transparent);
-    backdrop-filter: blur(var(--glass-blur));
+    /* No backdrop-filter, deliberately, and there never effectively was one:
+       it read `blur(var(--glass-blur))`, and --glass-blur already carries its
+       own function list, so that expanded to `blur(blur(26px) saturate(165%))`
+       — invalid, and therefore dropped. Which is what the paragraph above asks
+       for anyway. Blurring 97% opacity would cost a compositor pass to change
+       nothing visible. */
     box-shadow: var(--glass-shadow); }
   .hist-head { display: flex; align-items: center; gap: 10px; padding: 13px 15px 11px;
     border-bottom: 1px solid var(--glass-line); }
@@ -426,7 +435,12 @@
   .ops-ac { position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 5;
     max-height: 260px; overflow-y: auto; border-radius: 10px;
     border: 1px solid var(--glass-line); background: var(--bg-blur);
-    backdrop-filter: blur(var(--glass-blur)); box-shadow: var(--glass-shadow); }
+    /* var(--glass-blur), not blur(var(--glass-blur)) — the var is already a
+       function list, so wrapping it made `blur(blur(26px) saturate(165%))`,
+       which is invalid and was being dropped. This dropdown's background is
+       translucent, so the blur is what makes the names on it readable. */
+    -webkit-backdrop-filter: var(--glass-blur);
+    backdrop-filter: var(--glass-blur); box-shadow: var(--glass-shadow); }
   .ops-ac button { display: flex; width: 100%; gap: 8px; align-items: center; border: 0;
     background: none; color: var(--text); font: inherit; font-size: 0.8rem;
     padding: 8px 11px; text-align: left; cursor: pointer; }
@@ -896,7 +910,11 @@
   .moment-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
     margin: -6px 0 16px; padding: 9px 14px; border-radius: 12px;
     border: 1px solid var(--glass-line); background: var(--glass-2);
-    backdrop-filter: blur(var(--glass-blur)); color: var(--text-2);
+    /* Same correction as .ops-ac: the blur() wrapper made this invalid, and
+       --glass-2 is a 4.5% white wash — without the blur there is no glass
+       here at all, just a very faint box. */
+    -webkit-backdrop-filter: var(--glass-blur);
+    backdrop-filter: var(--glass-blur); color: var(--text-2);
     font-size: 0.82rem; }
   .moment-bar b { color: var(--text); font-weight: 600; }
   .moment-bar button { margin-left: auto; padding: 5px 11px; border-radius: 8px;
@@ -1322,7 +1340,16 @@
      dismiss it. That last one is the difference between a window and a menu —
      a menu closes when you look elsewhere, and looking elsewhere is exactly
      what you do while a file uploads and you type its title. */
-  .glass {
+  /* `.pop2` is on this selector and not on a copy of it further down, which is
+     the whole of "unify the minting surfaces". The first attempt WAS a copy —
+     assembled out of the same tokens by hand — and it came out looking like
+     the dark panel it replaced, because a hand copy gets to be subtly wrong:
+     it used --bg-blur (0.78 alpha) instead of --glass (0.62), and it left off
+     `inset 0 1px 0 0 var(--glass-hi)`, which is the lit top edge and is most
+     of what actually reads as glass. Two selectors on one recipe cannot drift
+     like that. Anything below that re-declares background, border or
+     box-shadow on .pop2 would win on later-wins, so it declares none of them. */
+  .glass, .pop2 {
     background: var(--glass);
     -webkit-backdrop-filter: var(--glass-blur);
     backdrop-filter: var(--glass-blur);
@@ -1332,7 +1359,7 @@
   /* Without this, Firefox with the pref off is a transparent rectangle with
      text floating on the posters — unreadable, not merely plainer. */
   @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
-    .glass { background: color-mix(in srgb, var(--panel) 96%, #000); }
+    .glass, .pop2 { background: color-mix(in srgb, var(--panel) 96%, #000); }
   }
 
   /* How many of yours are still in flight or still waiting, on the button that
@@ -1474,14 +1501,22 @@
   .up-tagbox input { flex: 1; min-width: 74px; background: none !important;
     border: 0 !important; outline: none; color: var(--text); font: inherit;
     font-size: 0.75rem; padding: 2px; }
+  /* All six kinds, and a neutral default above them.
+     This mapped four, and an unresolvable var() invalidates the whole
+     declaration — so a `type` or `elements` chip got neither its background
+     nor its colour and came out as bare text on the box. Same trap as the
+     blur() one; --seg- is the ramp that has all six. */
   .up-chip { display: inline-flex; align-items: center; gap: 3px;
     font-family: var(--font-mono); font-size: 0.63rem; padding: 2px 3px 2px 7px;
-    border-radius: 6px; background: color-mix(in srgb, var(--tl) 20%, transparent);
+    border-radius: 6px; --tl: var(--text-3);
+    background: color-mix(in srgb, var(--tl) 20%, transparent);
     color: var(--tl); }
-  .up-chip[data-kind="character"] { --tl: var(--tl-character); }
-  .up-chip[data-kind="media"]    { --tl: var(--seg-media); }
-  .up-chip[data-kind="meta"]      { --tl: var(--tl-meta); }
-  .up-chip[data-kind="general"]   { --tl: var(--tl-general); }
+  .up-chip[data-kind="media"]     { --tl: var(--seg-media); }
+  .up-chip[data-kind="character"] { --tl: var(--seg-character); }
+  .up-chip[data-kind="type"]      { --tl: var(--seg-type); }
+  .up-chip[data-kind="elements"]  { --tl: var(--seg-elements); }
+  .up-chip[data-kind="meta"]      { --tl: var(--seg-meta); }
+  .up-chip[data-kind="general"]   { --tl: var(--seg-general); }
   /* Not in the vocabulary. Red, struck through, and it blocks the submit —
      submitters attach tags that exist, they do not mint new ones, and the
      cheapest place to say so is the moment it is typed. */
@@ -1499,15 +1534,26 @@
     background: rgba(0,0,0,0.2); overflow: hidden; }
   .up-ac-row { display: flex; align-items: center; gap: 8px; width: 100%; border: 0;
     background: none; color: var(--text); font: inherit; font-size: 0.74rem;
-    padding: 6px 9px; text-align: left; cursor: pointer;
+    padding: 6px 9px; text-align: left; cursor: pointer; --tl: var(--text-3);
     box-shadow: inset 3px 0 0 var(--tl); }
-  .up-ac-row[data-kind="character"] { --tl: var(--tl-character); }
-  .up-ac-row[data-kind="media"]  { --tl: var(--seg-media); }
-  .up-ac-row[data-kind="meta"]      { --tl: var(--tl-meta); }
-  .up-ac-row[data-kind="general"]   { --tl: var(--tl-general); }
+  .up-ac-row[data-kind="media"]     { --tl: var(--seg-media); }
+  .up-ac-row[data-kind="character"] { --tl: var(--seg-character); }
+  .up-ac-row[data-kind="type"]      { --tl: var(--seg-type); }
+  .up-ac-row[data-kind="elements"]  { --tl: var(--seg-elements); }
+  .up-ac-row[data-kind="meta"]      { --tl: var(--seg-meta); }
+  .up-ac-row[data-kind="general"]   { --tl: var(--seg-general); }
+  /* Last in the list and never the consequence of not picking something —
+     the same rule the pickers follow, for the same reason: typing "sca" where
+     `scared` already exists should not quietly make a second one. */
+  .up-ac-row.mint { --tl: var(--accent); color: var(--accent); }
   .up-ac-row.at, .up-ac-row:hover { background: color-mix(in srgb, var(--tl) 26%, transparent); }
   .up-ac-row b { color: var(--tl); font-weight: 700; }
   .up-ac-row .k { margin-left: auto; font-size: 0.62rem; color: var(--text-3); }
+  /* `pop2-kinds` with the picker's art-column indent taken off. One chip row
+     in the page for one decision, rather than a third look for it.
+     Two classes deep on purpose: `.pop2-kinds` is declared further down the
+     sheet, so at equal specificity it would win the padding back. */
+  .up-ac .up-ac-kinds { padding: 1px 9px 8px; }
   /* Grey, not red, and it says what to do. Finding no match used to mean the
      name would be refused; it now means the archive has not got it yet, which
      is an invitation rather than a failure. */
@@ -1737,8 +1783,15 @@
   .snip.mu-rv .snip-frame img { pointer-events: none; }
   /* One row of tags is right on a 232px card where most songs have one singer.
      Here there is a whole column, and a reviewer deciding on a submission
-     wants to see every tag it arrived with, not scroll for them. */
-  .snip.mu-rv .mu-tags { max-height: none; overflow: visible; }
+     wants to see every tag it arrived with, not scroll for them.
+
+     This said `max-height: none` and did nothing for as long as it existed,
+     because `.mu-tags` is sized with `height` and clamped by a mask. Undoing a
+     clamp means undoing the same three properties that set it, which is what
+     `.mu-minetags` already does for the add window — the two are the same
+     override for the same reason. */
+  .snip.mu-rv .mu-tags { height: auto; overflow: visible; flex-wrap: wrap;
+    -webkit-mask-image: none; mask-image: none; }
   .snip.mu-rv .mu-ch { font-size: 0.78rem; }
   /* The third column. For a clip it is the transcript, which is what you read
      to judge it; for a song it is where it came from and what the recorder
@@ -2087,12 +2140,24 @@
     text-transform: uppercase; color: var(--text-3); padding: 7px 2px 0; }
   .tv-more { padding: 10px 2px; text-align: center; color: var(--text-3);
     font-size: 0.72rem; }
+  /* A container, not a button.
+     The name and the kind are each their own control now — clicking the name
+     renames and clicking the kind re-files — and a <button> can hold neither:
+     nested interactive elements are invalid and the inner ones stop working,
+     and an <input> inside a button cannot be typed in, which is what a rename
+     swaps into the name. So the row is a div, the grip and the row's own
+     background toggle it, and everything else in it acts for itself. */
   .tv-row { display: flex; align-items: center; gap: 12px; width: 100%;
-    padding: 7px 12px; margin-bottom: 5px; border: 0; border-radius: var(--radius-sm);
-    background: var(--surface); color: var(--text-2); font: inherit; font-size: 0.8rem;
+    padding: 7px 12px; margin-bottom: 5px; border-radius: var(--radius-sm);
+    background: var(--surface); color: var(--text-2); font-size: 0.8rem;
     text-align: left; cursor: pointer; transition: background 0.15s ease; }
   .tv-row:hover { background: var(--surface-2); }
-  .tv-row[aria-pressed="true"] { box-shadow: inset 0 0 0 1px var(--accent); }
+  /* The chevron and the art, together, as one focusable thing — so the row
+     can still be opened from the keyboard now that the head is not a button. */
+  .tv-grip { display: flex; align-items: center; gap: 12px; flex: none; border: 0;
+    padding: 0; background: none; color: inherit; font: inherit; cursor: pointer; }
+  .tv-grip:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px;
+    border-radius: 5px; }
   .tv-art { flex: none; width: 30px; height: 40px; border-radius: 5px; overflow: hidden;
     position: relative; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.06);
     background: linear-gradient(150deg, hsl(var(--hue) 34% 24%), hsl(calc(var(--hue) + 40) 28% 15%)); }
@@ -2100,14 +2165,38 @@
   .tv-art b { position: absolute; inset: 0; display: grid; place-items: center;
     font-family: var(--font-display); font-size: 0.8rem; color: rgba(255,255,255,0.3); }
   .tv-name { font-weight: 600; color: var(--text); flex: 1 1 auto; min-width: 0;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    padding: 2px 5px; margin: -2px -5px; border-radius: 5px; }
+  /* Only when there is somebody to act. A dotted underline on hover rather
+     than a permanent box: the name is the loudest thing in the row, and a
+     frame around it all the time reads as an empty field. */
+  .tv-name.live { cursor: text; text-decoration: underline dotted transparent;
+    text-underline-offset: 3px; transition: background 0.12s ease; }
+  .tv-name.live:hover, .tv-name.live:focus-visible { background: var(--glass-sunk);
+    text-decoration-color: var(--text-3); outline: 0; }
   .tv-kind { flex: none; display: inline-flex; align-items: center; gap: 5px;
+    border: 0; background: none; padding: 2px 5px; border-radius: 5px;
     font-family: var(--font-mono); font-size: 0.6rem; letter-spacing: 0.05em;
     text-transform: uppercase; color: var(--text-3); }
+  .tv-kind.live { cursor: pointer; transition: background 0.12s ease, color 0.12s ease; }
+  .tv-kind.live:hover, .tv-kind.live:focus-visible { background: var(--glass-sunk);
+    color: var(--text-2); outline: 0; }
   .tv-kind i { width: 7px; height: 7px; border-radius: 2px; transform: rotate(45deg); }
+  /* `unlabelled` has no colour to show — --seg-unknown is transparent on
+     purpose — so it gets an outline instead of an invisible swatch. Legacy
+     now: nothing new is minted without a kind. */
+  .tv-kind.unfiled i { box-shadow: inset 0 0 0 1px var(--text-3); }
   .tv-parent { flex: none; font-size: 0.68rem; color: var(--text-3); }
+  /* Stacked, and only the lines that say something.
+     Side by side this wrapped on a wide screen the moment a tag had two kinds
+     of use: it is one 84px column and "1 stream · 1 block" does not fit in it.
+     Three short lines fit inside the art's own 40px, so the row does not grow
+     to pay for it. */
   .tv-n { flex: none; width: 84px; text-align: right; font-family: var(--font-mono);
-    font-size: 0.64rem; font-variant-numeric: tabular-nums; color: var(--text-3); }
+    font-size: 0.64rem; line-height: 1.32; font-variant-numeric: tabular-nums;
+    color: var(--text-3); }
+  .tv-n i { display: block; font-style: normal; }
+  .tv-n i.none { opacity: 0.55; }
 
   /* ── an open tag row ────────────────────────────────────────────────────
      Same shape as .nv-stream on this surface: the head keeps its own radius
@@ -2172,20 +2261,71 @@
   .tv-btn.sprout:hover:not([disabled]) { color: #8fd694; border-color: rgba(143,214,148,0.4); }
   .tv-btn.bin:hover { color: var(--accent);
     border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
-  /* An icon until you want it. A url is 60 characters of noise next to a
-     paragraph, and it is only ever read when it is about to be used. */
-  .tv-lnk { display: flex; align-items: center; height: 28px; border-radius: 7px;
-    border: 1px solid var(--surface-2); background: var(--surface); overflow: hidden;
-    max-width: 28px; transition: max-width 0.18s ease; }
-  .tv-lnk:hover, .tv-lnk:focus-within { max-width: 330px; }
-  .tv-lnk > .ic { display: grid; place-items: center; width: 26px; height: 26px; flex: none;
-    color: var(--text-3); }
-  .tv-lnk.has > .ic { color: var(--seg-character); }
-  .tv-lnk input { flex: 1; min-width: 0; background: transparent; border: 0; outline: 0;
-    color: var(--text); font-family: var(--font-mono); font-size: 0.65rem; padding: 0 8px 0 0;
-    text-overflow: ellipsis; }
-  .tv-lnk input::placeholder { color: var(--text-3); font-family: var(--font-ui);
-    font-style: italic; }
+  /* The link out to whatever this was seeded from. An icon and nothing more:
+     a url is 60 characters of noise next to a paragraph, and it is only ever
+     read when somebody is about to go and look. */
+  .tv-btn.lnk { color: var(--seg-character); text-decoration: none; }
+  .tv-btn.lnk:hover { border-color: color-mix(in srgb, var(--seg-character) 45%, transparent); }
+  /* The one press. Wide rather than an icon, because it is the thing you came
+     to this row to do and an unlabelled sprout never said what it would ask. */
+  .tv-look { display: inline-flex; align-items: center; gap: 6px; height: 28px; flex: none;
+    padding: 0 10px; border-radius: 7px; border: 1px solid var(--surface-2);
+    background: var(--surface); color: var(--text-2); cursor: pointer;
+    font: inherit; font-size: 0.72rem; transition: 0.13s; }
+  .tv-look:hover { background: var(--surface-2); color: var(--text); }
+  .tv-look[disabled] { opacity: 0.5; cursor: progress; }
+
+  /* ── the candidates ─────────────────────────────────────────────────────
+     Under the description rather than in a popover: it is a list you read and
+     compare, sometimes four rows of it, and a popover over the row you are
+     deciding about would cover the name you are deciding for. */
+  .tv-seed { margin-top: 10px; border-top: 1px dashed var(--surface-2); padding-top: 9px; }
+  .tv-seed-note { font-family: var(--font-mono); font-size: 0.62rem; color: var(--text-3);
+    display: flex; align-items: center; gap: 7px; margin-bottom: 7px; }
+  .tv-seed-note b { color: var(--text-2); font-weight: 600; }
+  .tv-cand { display: flex; gap: 10px; width: 100%; text-align: left; padding: 7px 9px;
+    border: 1px solid transparent; border-radius: 8px; background: var(--glass-sunk);
+    color: var(--text-2); font: inherit; font-size: 0.78rem; cursor: pointer;
+    margin-bottom: 5px; transition: 0.12s; }
+  .tv-cand:hover, .tv-cand:focus-visible { border-color: var(--accent); outline: 0;
+    background: var(--surface-2); color: var(--text); }
+  .tv-cand img { width: 34px; height: 46px; flex: none; border-radius: 4px;
+    object-fit: cover; background: var(--surface-3); }
+  .tv-cand .noart { width: 34px; height: 46px; flex: none; border-radius: 4px;
+    background: var(--surface-3); display: grid; place-items: center;
+    font-family: var(--font-mono); font-size: 0.48rem; color: var(--text-3);
+    text-align: center; line-height: 1.1; }
+  .tv-cand-b { flex: 1; min-width: 0; }
+  .tv-cand-h { display: flex; align-items: baseline; gap: 7px; }
+  .tv-cand-n { font-weight: 600; color: var(--text); overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .tv-cand-m { font-family: var(--font-mono); font-size: 0.58rem; color: var(--text-3);
+    flex: none; }
+  /* EXACT and FUZZY are different CLAIMS and are drawn as different things.
+     `where name =` is the archive asserting its tag IS the catalogue name;
+     a search is a guess with a ranking, and a ranking is what hands you
+     Pokemon GO when the tag said Pokemon. */
+  .tv-cand-k { font-family: var(--font-mono); font-size: 0.5rem; letter-spacing: 0.07em;
+    text-transform: uppercase; flex: none; padding: 1px 5px; border-radius: 4px;
+    background: var(--glass-2); color: var(--text-3); }
+  .tv-cand-k.exact { color: var(--seg-character);
+    background: color-mix(in srgb, var(--seg-character) 16%, transparent); }
+  .tv-cand-s { color: var(--text-3); font-size: 0.72rem; line-height: 1.45;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    overflow: hidden; }
+  /* "None of these" is an ANSWER and not a cancel. Summer Camp is a Phase
+     Connect event, and the catalogue answers it with a real game, a cover and
+     a summary about finding Bigfoot — no amount of matching fixes that and
+     only a person saying no does. */
+  .tv-seed-foot { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
+  .tv-seed-foot button { border: 1px solid var(--surface-2); background: var(--surface);
+    color: var(--text-2); border-radius: 7px; padding: 5px 10px; cursor: pointer;
+    font: inherit; font-size: 0.72rem; }
+  .tv-seed-foot button:hover { background: var(--surface-2); color: var(--text); }
+  .tv-seed-foot input { flex: 1; min-width: 0; background: var(--glass-sunk);
+    border: 1px solid var(--glass-line); border-radius: 7px; padding: 5px 9px;
+    color: var(--text); font: inherit; font-size: 0.74rem; outline: 0; }
+  .tv-seed-foot input:focus { border-color: var(--accent); }
 
   .tv-tabs { display: flex; gap: 2px; padding: 0 14px; border-bottom: 1px solid var(--surface-2); }
   .tv-tab { background: none; border: 0; border-bottom: 2px solid transparent;
@@ -3050,6 +3190,56 @@
 
   .th-tl-body { position: relative; flex: 1 1 auto; min-height: 0; cursor: pointer;
     display: flex; flex-direction: column; justify-content: flex-end; }
+
+  /* ── how much was being said ────────────────────────────────────────────
+     Above the pins rather than across the track. "Overlaid on the timeline"
+     is what it was, and what that cost was legibility: the blocks are the
+     thing being read, and a curve drawn over them is drawn on top of the
+     answer. Same axis, its own 26px.
+
+     `pointer-events: none`, and not optionally: .th-tl-body owns the
+     hairline, the bubble and click-to-seek, and a child that swallowed a
+     pointer would put a dead stripe across all three. What is worth reading
+     off the curve — the rate under the cursor — goes into the bubble
+     instead, which is already following the pointer. */
+  .th-rate { height: 26px; position: relative; flex: none; margin-bottom: 3px;
+    pointer-events: none; }
+  .th-rate svg { display: block; width: 100%; height: 100%; }
+  /* The viewBox is one unit per bucket and preserveAspectRatio is off, so the
+     buckets stretch to the row and bucket i lands exactly where thPct() would
+     put it — no pixel arithmetic, and it stays right through a resize. That
+     is the whole reason this is an SVG and not a row of divs.
+     non-scaling-stroke because that same stretch would otherwise take the
+     stroke with it: 260 × 100 drawn into 900 × 26 makes a line four times
+     wider than it is tall. */
+  .th-rate path { vector-effect: non-scaling-stroke; }
+  .th-rate .all { fill: rgba(255,255,255,0.075); stroke: rgba(255,255,255,0.26);
+    stroke-width: 1; }
+  .th-rate .hit { fill: color-mix(in srgb, var(--accent) 24%, transparent);
+    stroke: var(--accent); stroke-width: 1.4; }
+  /* Searching drops the total to a ghost. Two ridges at two different scales
+     drawn with the same weight is a chart with two unlabelled y-axes: the
+     foreground is whichever one the key is naming, and only one at a time. */
+  /* Faint, but still readable — a ghost nobody can see is the same as not
+     drawing it, and the point of keeping it is that you can tell whether the
+     thing you searched for happened where the chat was busy or somewhere it
+     was not. */
+  .th-rate.q .all { fill: rgba(255,255,255,0.045); stroke: rgba(255,255,255,0.17); }
+  .th-rate-key { display: flex; align-items: center; gap: 7px; flex: none;
+    margin-left: 14px; font-family: var(--font-mono); font-size: 0.52rem;
+    letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-3);
+    min-width: 0; }
+  .th-rate-key i { width: 7px; height: 7px; border-radius: 2px; flex: none;
+    background: rgba(255,255,255,0.26); }
+  .th-rate-key i.hit { background: var(--accent); }
+  /* `text-transform: none`, against the uppercase the row sets: this is the
+     query as it was typed, and an emote's name is not case-insensitive
+     decoration — `theoKEK` uppercased to THEOKEK is the wrong word. */
+  .th-rate-key b { font-weight: 600; color: var(--text-2); overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; max-width: 16ch;
+    text-transform: none; letter-spacing: 0.02em; }
+  .th-rate-key s { text-decoration: none; color: var(--text-3); opacity: 0.7; }
+
   .th-pins { height: 12px; position: relative; flex: none; }
   .th-track { height: 18px; position: relative; border-radius: 5px; overflow: hidden;
     flex: none; background: rgba(255,255,255,0.05); }
@@ -3622,13 +3812,20 @@
      could see the top edge of and nothing else. 96 clears the windows (92),
      the embed (90) and the tag panel (94), and it is the topmost thing in the
      page because a picker is always the most recent thing you asked for. */
-  .pop2 { position: fixed; z-index: 96; width: 290px; background: var(--panel);
-    border-radius: 12px; padding: 8px; box-shadow: 0 0 0 1px rgba(255,255,255,0.1),
-    0 20px 50px rgba(0,0,0,0.62); font-size: 0.82rem; }
+  /* Everything that makes it glass is on `.glass, .pop2` up in the upload
+     window's section — the one recipe, shared rather than restated. What is
+     left here is geometry, and the four popover elements (pop2, pop3, pop4,
+     pop5) all carry the `pop2` class, so they all get it.
+     ONE backdrop-filter, on the shell, and none on the rows: roadmap.md names
+     a per-card backdrop-filter as the leading suspect for the CPU a long-open
+     tab burns, and a popover that exists only while it is open is the cheapest
+     possible place to spend one. */
+  .pop2 { position: fixed; z-index: 96; width: 290px; box-sizing: border-box;
+    border-radius: 12px; padding: 8px; font-size: 0.82rem; }
   .pop2[hidden] { display: none; }
   .pop2 input, .pop2 select, .pop2 textarea { width: 100%; box-sizing: border-box;
-    background: var(--surface-2);
-    border: 1px solid rgba(255,255,255,0.08); color: var(--text); border-radius: 8px;
+    background: var(--glass-sunk);
+    border: 1px solid var(--glass-line); color: var(--text); border-radius: 9px;
     padding: 7px 9px; font-family: inherit; font-size: 0.82rem; }
   .pop2 input:focus, .pop2 select:focus, .pop2 textarea:focus {
     outline: none; border-color: var(--accent); }
@@ -3637,10 +3834,28 @@
      what made a typo hard to find in the first place. */
   .pop2 textarea { resize: none; overflow: hidden; line-height: 1.45;
     font-family: inherit; }
-  .pop2-list { margin-top: 6px; max-height: 250px; overflow-y: auto; }
+  /* .up-ac's box, to the pixel: a well under the field rather than more of the
+     same surface. The list is the one part of a picker that is the archive's
+     own rows and not chrome, and the inset is what says so. */
+  .pop2-list { margin-top: 6px; max-height: 250px; overflow-y: auto;
+    background: rgba(0,0,0,0.2); border: 1px solid var(--glass-line);
+    border-radius: 9px; padding: 3px; }
+  /* The kind, as a lit left edge — the same three pixels .up-ac-row uses, so
+     a row means the same thing in the popover as it does in the upload window.
+     --seg-kind defaults to a neutral rather than to transparent: an unfiled
+     row wants a grey edge, not a missing one, and color-mix() on transparent
+     would leave the selected state invisible. */
   .pop2-row { display: flex; align-items: center; gap: 8px; padding: 6px 7px;
-    border-radius: 8px; cursor: pointer; }
-  .pop2-row[aria-selected="true"] { background: var(--surface-2); }
+    border-radius: 8px; cursor: pointer; --seg-kind: var(--text-3);
+    box-shadow: inset 3px 0 0 var(--seg-kind); }
+  .pop2-row[data-kind="media"]     { --seg-kind: var(--seg-media); }
+  .pop2-row[data-kind="character"] { --seg-kind: var(--seg-character); }
+  .pop2-row[data-kind="type"]      { --seg-kind: var(--seg-type); }
+  .pop2-row[data-kind="elements"]  { --seg-kind: var(--seg-elements); }
+  .pop2-row[data-kind="meta"]      { --seg-kind: var(--seg-meta); }
+  .pop2-row[data-kind="general"]   { --seg-kind: var(--seg-general); }
+  .pop2-row[aria-selected="true"] {
+    background: color-mix(in srgb, var(--seg-kind) 24%, transparent); }
   .pop2-row .art { width: 22px; height: 22px; border-radius: 5px; flex: none;
     background: var(--surface-3); object-fit: cover; }
   .pop2-row .nm { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
@@ -3651,25 +3866,31 @@
   /* Creating is always a deliberate click, never the consequence of not
      picking something. Typing "mario kart" where "Mario Kart 8 Deluxe" already
      exists should not quietly mint a second one. */
-  .pop2-row.mint { color: var(--accent); }
+  .pop2-row.mint { color: var(--accent); --seg-kind: var(--accent); }
   /* The colour of removal, and last in the list. Not a warning — dismissing a
      suggestion destroys nothing, it answers a question — but it is the one row
      here that is a no, and it should not be reachable by accident on the way
      to the mint row above it. */
-  .pop2-row.drop { color: var(--tl-not); }
+  .pop2-row.drop { color: var(--tl-not); --seg-kind: var(--tl-not); }
   .pop2-row.drop .art { display: grid; place-items: center; color: var(--tl-not); }
   /* Filing the new tag is one click, on the row below it, instead of a guess.
      The old code minted everything as 'game' because most tags are games —
      which is the same move as reading a category off a title, just quieter. */
   .pop2-kinds { display: flex; flex-wrap: wrap; gap: 4px; padding: 2px 7px 7px 37px; }
   .pop2-kinds button { display: inline-flex; align-items: center; gap: 4px; border: 0;
-    background: var(--surface-2); color: var(--text-2); border-radius: 6px;
+    background: var(--glass-2); color: var(--text-2); border-radius: 6px;
     padding: 4px 7px; cursor: pointer; font-family: var(--font-mono);
     font-size: 0.56rem; letter-spacing: 0.05em; text-transform: uppercase; }
-  .pop2-kinds button:hover { background: var(--surface-3); color: var(--text); }
+  .pop2-kinds button:hover { background: var(--glass-hi); color: var(--text); }
   .pop2-kinds button i { width: 6px; height: 6px; border-radius: 2px; }
-  .pop2-kinds .pop2-hint { flex: 1 0 100%; color: var(--text-3); font-size: 0.62rem;
-    padding-top: 2px; }
+  /* Which one Enter files it as, shown instead of said.
+     There was a sentence here — "…or just Enter, and file it later" — and it
+     was explaining a default that no longer exists: nothing mints unfiled any
+     more. So the row shows the answer on the chip, and the prose goes.
+     Not aria-pressed: these buttons COMMIT on click rather than select, and a
+     pressed state on a button that fires is a lie to whatever reads it out. */
+  .pop2-kinds button.dflt { background: var(--glass-hi); color: var(--text);
+    box-shadow: inset 0 0 0 1px var(--glass-line); }
   .pop2-row.mint .art { display: grid; place-items: center; color: var(--accent);
     background: var(--accent-soft); font-size: 0.9rem; line-height: 1; }
   .pop2-empty { padding: 14px 8px; text-align: center; color: var(--text-3); font-size: 0.76rem; }
@@ -3679,13 +3900,13 @@
   .pop2-btns { display: flex; gap: 6px; margin-top: 8px; }
   .pop2-btns button { flex: 1 1 auto; border: 0; border-radius: 8px; padding: 7px;
     font-family: inherit; font-size: 0.78rem; font-weight: 600; cursor: pointer;
-    background: var(--surface-2); color: var(--text-2); }
-  .pop2-btns button:hover { background: var(--surface-3); color: var(--text); }
+    background: var(--glass-2); color: var(--text-2); }
+  .pop2-btns button:hover { background: var(--glass-hi); color: var(--text); }
   .pop2-btns button.primary { background: var(--accent); color: var(--on-accent); }
   /* A refusing button that looks ready to be pressed is the interface telling
      one story and the code telling another. The error line above it says why. */
   .pop2-btns button:disabled { opacity: 0.4; cursor: not-allowed; }
-  .pop2-btns button:disabled:hover { background: var(--surface-2); color: var(--text-2); }
+  .pop2-btns button:disabled:hover { background: var(--glass-2); color: var(--text-2); }
   .pop2-btns button.primary:disabled:hover { background: var(--accent); color: var(--on-accent); }
   /* Two scopes, kept visually apart on purpose: one removes a row, the other
      retracts a thing that other streams are using. */
@@ -4613,6 +4834,7 @@
         <div class="th-tl" id="th-tl">
           <div class="th-tl-head">
             <span class="th-now" id="th-now"><i></i><b>—</b><span></span></span>
+            <span class="th-rate-key" id="th-rate-key" hidden></span>
             <span class="th-legend" id="th-legend"></span>
             <!-- Deliberately not the duration pill in the header. That pill is
                  double-click editable and writes what it holds; elapsed is a
@@ -4627,6 +4849,11 @@
             <button class="th-draw-btn" id="th-draw-sub" hidden>+ inside</button>
           </div>
           <div class="th-tl-body" id="th-tlbody">
+            <!-- How much was being said, over the axis it was said on. Its own
+                 key rather than a line inside #th-legend: that one is rebuilt
+                 from the block kinds on every repaint, and anything appended
+                 to it would be wiped by the next one. -->
+            <div class="th-rate" id="th-rate" hidden aria-hidden="true"></div>
             <div class="th-pins" id="th-pins"></div>
             <div class="th-track" id="th-track"></div>
             <!-- Hidden until this stream has something in it. An empty second
@@ -4761,6 +4988,68 @@
     }
     const online = () => { banner.hidden = true; };
 
+    /* ---- staleness, and the one rule that answers all of it ----------------
+     *
+     * Every list response carries the server's `generation`, which every write
+     * bumps, and the page ignored it completely. Two symptoms, one cause:
+     *
+     *  - A tag minted in this tab never reached the search autocomplete or the
+     *    upload window's tag field, because `acLoad()` caches the whole
+     *    vocabulary in `AC.all` and nothing ever cleared it. Caching it is
+     *    right — see the note there — but a cache with no invalidation is a
+     *    cache that is wrong for as long as the tab is open.
+     *  - A verdict given in Review was invisible in Snippets, because a panel
+     *    loads once behind a `booted` flag and never again.
+     *
+     * So: notice when the generation MOVES, and drop what could be stale.
+     *
+     * Invalidators register themselves as their own module initialises rather
+     * than being named from here, and that is not style. This runs during
+     * boot — the first `/api/auth/me` goes through api() — so naming `AC` from
+     * here would read a `const` still in its temporal dead zone, and in this
+     * file a TDZ ReferenceError kills the whole inline script and leaves `ME`
+     * stuck as viewer. It has happened once already.
+     */
+    const GEN_DROP = [];
+    /* `null` and not 0, because **0 is a real generation** — a freshly created
+       archive has exactly that, and the first version of this used 0 to mean
+       "never seen one". The consequence was the whole mechanism doing nothing
+       on a new archive: the baseline was never recorded, so the first real
+       change was read as the baseline and swallowed. Same shape as the trap in
+       findings.md about a player that is not ready answering 0. */
+    let GEN = null;
+
+    function genDrop() {
+      for (const f of GEN_DROP) {
+        try { f(); } catch (e) { console.error('invalidate:', e); }
+      }
+    }
+    /** A response arrived. Only a generation that MOVED counts — the first one
+     *  the page ever sees is the baseline, not a change. */
+    function genSaw(d) {
+      const g = Number(d?.generation);
+      if (!Number.isFinite(g)) return;
+      if (GEN === null) { GEN = g; return; }
+      if (g <= GEN) return;
+      GEN = g;
+      genDrop();
+    }
+    /** A write succeeded, so something changed whether or not the response
+     *  says so — most write routes answer with the row rather than a
+     *  generation. Cheap: a dropped cache costs one list request when it is
+     *  next wanted. */
+    function genWrote(d) {
+      const g = Number(d?.generation);
+      if (Number.isFinite(g) && (GEN === null || g > GEN)) GEN = g;
+      genDrop();
+    }
+    /** A panel that is off screen forgets it has loaded, so it reloads next
+     *  time it is shown. A panel that IS on screen is left alone: the write
+     *  that moved the generation came from it, and it repaints itself. */
+    const genPanel = (panelId, state) => GEN_DROP.push(() => {
+      if (document.getElementById(panelId)?.hidden) state.booted = false;
+    });
+
     async function api(path) {
       // `cache: 'no-cache'` means revalidate, not "don't cache". The server
       // sends Cache-Control: max-age=15, so without this the browser answers
@@ -4773,7 +5062,9 @@
                                     cache: 'no-cache' });
       if (!r.ok) throw new Error(`${r.status} on ${path}`);
       online();
-      return r.json();
+      const d = await r.json();
+      genSaw(d);
+      return d;
     }
 
     /* The archive's vocabulary is about evidence, the calendar's is about
@@ -5640,28 +5931,57 @@
     /* A `<button>` cannot hold the buttons the open row needs — nested
        interactive elements are invalid and the inner ones stop working. So the
        row becomes what nvHead already is on this same surface: a container, a
-       head button, and a body beside it. */
+       head button, and a body beside it.
+       And the head is a container too, now, for a second reason: the name is
+       edited in place, and an <input> inside a <button> cannot be typed in. */
     function tvRow(t) {
-      const can = !!ME.can?.edit;
+      /* Renaming and re-filing are open to a SUGGESTER, not only an editor.
+         Both go through submit(), which applies for anybody holding
+         `change.apply` and queues for everybody else — so the same click is a
+         decision for an editor and a request for a suggester, and nothing here
+         has to know which. The verbs that DESTROY something — retract, the
+         art, the seed link — stay editor-only, in tvBody. */
+      const can = !!ME.can?.suggest;
       const kind = TAG_KIND_COLOR[t.kind];
       const art = t.thumb ? `<img src="${esc(t.thumb)}" alt="" loading="lazy" onerror="this.hidden=true">` : '';
       const open = openTags.has(t.id);
+      const swatch = `${kind ? `<i style="background:${kind}"></i>`
+        : '<i style="background:var(--seg-unknown)"></i>'}${esc(KIND_LABEL[t.kind] || t.kind)}`;
+      const kcls = `tv-kind${can ? ' live' : ''}${t.kind === 'unknown' ? ' unfiled' : ''}`;
+      /* Stacked, and only the lines that have something in them. `unused` is
+         a real answer and a common one for a tag filed ahead of the streams
+         that will carry it. */
+      const uses = [[t.streams, 'stream'], [t.snippets, 'snippet'], [t.blocks, 'block']]
+        .filter(([n]) => n > 0)
+        .map(([n, w]) => `<i>${n} ${w}${n === 1 ? '' : 's'}</i>`).join('');
       return `<div class="tv-tag${open ? ' open' : ''}" data-tvtag="${esc(t.id)}"
           data-slug="${esc(t.slug)}">
-        <button class="tv-row" type="button" data-tvhead
-            aria-expanded="${open}" title="${esc(t.name)}">
-          <svg class="tv-chev" width="12" height="12" viewBox="0 0 24 24" fill="none"
-            stroke="currentColor" stroke-width="2.4" stroke-linecap="round"
-            aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
-          <span class="tv-art" style="--hue:${hueOf(t.slug)}">${art}
-            <b aria-hidden="true">${esc((t.name[0] || '?').toUpperCase())}</b></span>
-          <span class="tv-name" data-tvname>${esc(t.name)}</span>
+        <div class="tv-row">
+          <button class="tv-grip" type="button" aria-expanded="${open}"
+              aria-label="${esc(t.name)} — show what carries it">
+            <svg class="tv-chev" width="12" height="12" viewBox="0 0 24 24" fill="none"
+              stroke="currentColor" stroke-width="2.4" stroke-linecap="round"
+              aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+            <span class="tv-art" style="--hue:${hueOf(t.slug)}">${art}
+              <b aria-hidden="true">${esc((t.name[0] || '?').toUpperCase())}</b></span>
+          </button>
+          ${can
+            ? `<span class="tv-name live" data-tvname data-tvrename role="button" tabindex="0"
+                 title="Rename it — the url follows">${esc(t.name)}</span>`
+            : `<span class="tv-name" data-tvname title="${esc(t.name)}">${esc(t.name)}</span>`}
           ${t.parent ? `<span class="tv-parent">under ${esc(t.parent.name)}</span>` : ''}
           ${t.gate ? `<span class="tv-gate" title="Gated — needs the ${esc(t.gate)} grant">${esc(t.gate)}</span>` : ''}
-          <span class="tv-kind">${kind ? `<i style="background:${kind}"></i>` : ''}${esc(t.kind)}</span>
-          <span class="tv-n">${t.streams} stream${t.streams === 1 ? '' : 's'}${
-            t.blocks ? ` · ${t.blocks} block${t.blocks === 1 ? '' : 's'}` : ''}</span>
-        </button>
+          ${can
+            /* data-popopen, and not optionally: the click that opens the
+               popover is still propagating when the document-level dismisser
+               runs, so an opener without the marker opens it and closes it in
+               one gesture — which looks exactly like a dead button. */
+            ? `<button class="${kcls}" type="button" data-tvkindedit data-popopen
+                 title="Re-file it — every stream, clip and chapter carrying it moves too"
+                 >${swatch}</button>`
+            : `<span class="${kcls}">${swatch}</span>`}
+          <span class="tv-n">${uses || '<i class="none">unused</i>'}</span>
+        </div>
         <div class="tv-body">${open ? tvBody(t) : ''}</div>
       </div>`;
     }
@@ -5725,24 +6045,27 @@
         : `<p class="tv-summ empty${can ? ' editable' : ''}" ${can ? 'data-tvsumm' : ''}>${can
             ? 'No description yet — double-click to write one.' : 'No description.'}</p>`;
 
+      /* The url field and the sprout are gone.
+         There is nothing to paste any more: the tag HAS a name and the name is
+         the query, so this is one deliberate press. What it produces is
+         candidates rather than an answer, because a search returns 0, 1 or
+         many and three different games are called Summer Camp.
+         `seed_url` is still shown, as a LINK — it has changed from the
+         question to the answer, the entry somebody locked this tag to, which
+         is what makes a re-seed read that row again instead of searching the
+         name and possibly landing somewhere else. */
       const ctl = can ? `<div class="tv-ctl">
-          <label class="tv-lnk${t.seed_url ? ' has' : ''}" title="Where a re-seed reads from">
-            <span class="ic" aria-hidden="true"><svg width="13" height="13" viewBox="0 0 24 24"
-              fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path
-              d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.8 1.7"/><path
-              d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg></span>
-            <input type="url" data-tvurl value="${esc(t.seed_url ?? '')}"
-              placeholder="paste a link…" spellcheck="false"></label>
-          <button class="tv-btn" type="button" data-tvrename title="Rename — the url follows"
+          ${t.seed_url ? `<a class="tv-btn lnk" href="${esc(t.seed_url)}" target="_blank"
+            rel="noopener noreferrer" title="${esc(hostOf(t.seed_url))} — the entry this is
+            seeded from"><svg width="13" height="13" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path
+            d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.8 1.7"/><path
+            d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg></a>` : ''}
+          <button class="tv-look" type="button" data-tvseed
+            title="Look “${esc(t.name)}” up in the games catalogue"
             ><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-            stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path
-            d="M21.2 6.8a1 1 0 0 0-4-4L3.8 16.2a2 2 0 0 0-.5.8l-1.3 4.4a.5.5 0 0 0 .6.6l4.4-1.3a2 2 0 0 0 .8-.5z"/><path
-            d="M15 5l4 4"/></svg></button>
-          <button class="tv-btn sprout" type="button" data-tvseed ${t.seed_url ? '' : 'disabled'}
-            title="${t.seed_url ? 'Re-seed — replaces the description and the art'
-              : 'Nothing to read from yet'}"><svg width="14" height="14" viewBox="0 0 24 24"
-            fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
-            stroke-linejoin="round"><path d="M14 9.536V7a4 4 0 0 1 4-4h1.5a.5.5 0 0 1 .5.5V5a4 4 0 0 1-4 4 4 4 0 0 0-4 4c0 2 1 3 1 5a5 5 0 0 1-1 3"/><path d="M4 9a5 5 0 0 1 8 4 5 5 0 0 1-8-4"/><path d="M5 21h14"/></svg></button>
+            stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path
+            d="m20 20-3.5-3.5"/></svg>${t.seed_url ? 'Look it up again' : 'Look it up'}</button>
           <span class="tv-sep"></span>
           <button class="tv-btn bin" type="button" data-tvretract title="Retract everywhere"
             ><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -5754,7 +6077,8 @@
           <div class="tv-art-big" ${can ? 'data-tvart data-drop' : ''}>${art}
             ${can ? `<span class="drop"><b>${t.thumb ? 'Replace art' : 'Add art'}</b>
               drop a PNG or click</span>` : ''}</div>
-          <div class="tv-idb"><div class="tv-descrow">${summ}${ctl}</div></div>
+          <div class="tv-idb"><div class="tv-descrow">${summ}${ctl}</div>
+            <div class="tv-seed" data-tvseedbox hidden></div></div>
         </div>${tvUses(t)}`;
     }
 
@@ -5913,7 +6237,16 @@
         kb.setAttribute('aria-pressed', String(tvKinds.has(k)));
         return void tvPaint();
       }
-      const th = e.target.closest('[data-tvhead]');
+      /* The name and the kind first, because both sit INSIDE the row and the
+         row is what toggles. Order is the whole mechanism here: anything in
+         the head that is not one of these two opens or shuts it, which is what
+         the chevron was always advertising and what the 84px of counts on the
+         right had no other job than to be. */
+      const nm = e.target.closest('[data-tvrename]');
+      if (nm) return void tvRename(nm.closest('[data-tvtag]'));
+      const kd = e.target.closest('[data-tvkindedit]');
+      if (kd) return void tvKind(kd, kd.closest('[data-tvtag]'));
+      const th = e.target.closest('.tv-row');
       if (th) return void tvToggle(th.closest('[data-tvtag]'));
       const inside = e.target.closest('[data-tvtag]');
       if (inside) return void tvAct(e, inside);
@@ -5933,6 +6266,18 @@
        swallows Escape while empty would eat the key the rest of the page uses
        to back out, so it only claims it when there is something to clear. */
     calAlt.addEventListener('keydown', (e) => {
+      /* The name is a span carrying role="button", and it has to be a span:
+         a rename swaps an <input> into it, and an input inside a <button>
+         cannot be typed in. A span does not get Enter and Space for free, so
+         this is the keyboard half of the click above — without it, dropping
+         the pencil would have made renaming mouse-only.
+         The rename field itself stops propagation, so this never sees the
+         keystrokes going into it. */
+      const nm = e.target.closest('[data-tvrename]');
+      if (nm && (e.key === 'Enter' || e.key === ' ')) {
+        e.preventDefault();
+        return void tvRename(nm.closest('[data-tvtag]'));
+      }
       const box = e.target.closest('[data-tvq]');
       if (!box || e.key !== 'Escape' || !box.value) return;
       e.stopPropagation();
@@ -5952,8 +6297,12 @@
       const t = tagById(id);
       if (!el || !t) return;
       el.classList.toggle('open', openTags.has(id));
-      el.querySelector('[data-tvhead]')?.setAttribute('aria-expanded', String(openTags.has(id)));
+      el.querySelector('.tv-grip')?.setAttribute('aria-expanded', String(openTags.has(id)));
       el.querySelector('.tv-body').innerHTML = openTags.has(id) ? tvBody(t) : '';
+      /* Candidates live in SEED and not in the DOM, so a repaint — which
+         happens on every rename, every re-file and every art upload — puts
+         them back rather than throwing away a list somebody is reading. */
+      if (openTags.has(id)) tvSeedPaint(el, t);
     }
 
     async function tvToggle(el) {
@@ -5991,31 +6340,26 @@
       const sn = e.target.closest('[data-tvsnip]');
       if (sn) { location.hash = `#/m/${sn.dataset.tvsnip}`; return; }
 
-      const url = el.querySelector('[data-tvurl]');
-      if (e.target.closest('[data-tvurl]')) return;      // typing, not acting
+      if (e.target.closest('[data-tvq]')) return;        // typing, not acting
 
       if (e.target.closest('[data-tvseed]')) {
-        const link = String(url?.value ?? '').trim();
-        if (!link) return;
-        /* It replaces the description AND the art, and on an edited row that
-           is somebody's writing. Said once, plainly, rather than a toast after
-           the fact — the bin gets the same treatment for the same reason. */
-        if (!t.seeded && t.summary && !confirm(
-          `Re-seed "${t.name}" from ${hostOf(link)}?\n\n`
-          + 'This replaces the description and the art with whatever that page '
-          + 'says. What is there now was written by hand.')) return;
-        try {
-          const r = await apiPost(`/api/tags/${encodeURIComponent(id)}/harvest`, { url: link });
-          if (r.status !== 200) {
-            toast('bad', 'Could not ask', r.body?.error ?? `The archive answered ${r.status}.`, 6000);
-            return;
-          }
-          toast('queued', r.body?.already ? 'Already asked' : 'Asked the recorder to read it',
-            r.body?.already
-              ? 'A read of this page is already waiting to be picked up.'
-              : `${hostOf(link)} · reopen this row afterwards to see what came back.`, 7000);
-        } catch (err) { toast('bad', 'Could not ask', err.message, 6000); }
-        return;
+        return void tvLookUp(el, t, e.target.closest('[data-tvseed]'));
+      }
+      const pick = e.target.closest('[data-tvpick]');
+      if (pick) return void tvTakePick(el, t, Number(pick.dataset.tvpick));
+      if (e.target.closest('[data-tvnone]')) {
+        /* An ANSWER, not a cancel. The list goes away and nothing is written,
+           which for `Summer Camp` — an agency event the catalogue answers with
+           a real game about finding Bigfoot — is the correct outcome and the
+           one no amount of matching could have reached. */
+        SEED.delete(id);
+        return void tvSeedPaint(el, t);
+      }
+      if (e.target.closest('[data-tvagain]')) {
+        const box = el.querySelector('[data-tvseedbox]');
+        const q = String(box?.querySelector('[data-tvq]')?.value ?? '').trim();
+        if (!q) return;
+        return void tvLookUp(el, t, null, q);
       }
 
       if (e.target.closest('[data-tvretract]')) {
@@ -6034,25 +6378,164 @@
           `retracted ${t.name}`, { after: () => { openTags.delete(id); reloadTags(); } });
       }
 
-      if (e.target.closest('[data-tvrename]')) return void tvRename(el);
+      /* The pencil was here. Renaming is a click on the name itself now, and
+         that is claimed further up — before the row's own toggle — so nothing
+         in the body has to know about it. */
       if (e.target.closest('[data-tvart]')) return void tvPickArt(t);
     }
 
-    /* The url field writes on blur, not on every keystroke: it is one field
-       and a changeset per character would be 40 rows in the log for one paste. */
-    calAlt.addEventListener('focusout', async (e) => {
-      const inp = e.target.closest('[data-tvurl]');
-      if (!inp) return;
-      const el = inp.closest('[data-tvtag]');
-      const t = tagById(el?.dataset.tvtag);
-      if (!t) return;
-      const next = inp.value.trim() || null;
-      if (next === (t.seed_url ?? null)) return;
-      await submit([{ target_type: 'tag', target_id: t.id, op: 'update',
-                      field: 'seed_url', value: next }],
-        next ? `set where ${t.name} reads from` : `cleared ${t.name}'s link`,
-        { after: reloadTags });
-    });
+    /* ---- looking a tag up in the catalogue --------------------------------
+     *
+     * One press, and the wait is ONE wait. The job goes to the recorder — the
+     * archive holds no outbound credentials and is the machine exposed to the
+     * internet, so it does not call IGDB itself — and the claim is held open
+     * at that end, so this comes back as fast as the catalogue answers rather
+     * than on the next poll tick.
+     *
+     * The PICK needs no round trip at all, which is the other half of that.
+     * A candidate arrives carrying the words and the link, so choosing one is
+     * a local write that lands instantly; only the cover is bytes, and bytes
+     * have to go through the recorder because the recorder is the only thing
+     * that writes the media tree. Nobody watches a cover arrive.
+     *
+     * There is deliberately no search-as-you-type. The tag already HAS a name
+     * and that is the query; a box that fires per keystroke would be a job per
+     * keystroke, which is the shape this design was chosen to avoid.
+     */
+    const SEED = new Map();     // tag id -> { q, rows, note, busy }
+    const SEED_TRIES = 40;      // × 700ms ≈ 28s, one second past the claim ceiling
+
+    async function tvLookUp(el, t, btn, q = null) {
+      const id = t.id;
+      if (SEED.get(id)?.busy) return;
+      SEED.set(id, { q: q || t.name, rows: null, busy: true, note: null });
+      tvSeedPaint(el, t);
+      if (btn) btn.disabled = true;
+
+      let jobId = null;
+      try {
+        const r = await apiPost(`/api/tags/${encodeURIComponent(id)}/harvest`,
+                                q ? { q } : {});
+        if (r.status !== 200) throw new Error(r.body?.error ?? `HTTP ${r.status}`);
+        jobId = r.body?.job_id;
+      } catch (err) {
+        SEED.set(id, { q: q || t.name, rows: [], busy: false,
+                       note: `Could not ask — ${err.message}` });
+        if (btn) btn.disabled = false;
+        return void tvSeedPaint(el, t);
+      }
+
+      /* Polled on the JOB and not on the tag, because the answer is not on the
+         tag — nothing has been decided yet. GET /api/jobs/:id exists for
+         exactly this question and its own comment says so: polling a 50-row
+         list to find one row is a lot of rows to move to learn one word. */
+      for (let i = 0; i < SEED_TRIES; i++) {
+        await new Promise((r) => setTimeout(r, 700));
+        // The row was closed, or another look-up started. Stop polling.
+        if (!document.body.contains(el) || SEED.get(id)?.q !== (q || t.name)) return;
+        let j;
+        try { j = (await api(`/api/jobs/${encodeURIComponent(jobId)}`)).job; }
+        catch { continue; }
+        const rows = j?.payload?.candidates;
+        if (Array.isArray(rows)) {
+          SEED.set(id, { q: q || t.name, rows, busy: false, note: null });
+          break;
+        }
+        if (j?.status === 'failed') {
+          SEED.set(id, { q: q || t.name, rows: [], busy: false,
+                         note: j.error || 'the recorder could not ask' });
+          break;
+        }
+      }
+      if (SEED.get(id)?.busy) {
+        SEED.set(id, { q: q || t.name, rows: [], busy: false,
+                       note: 'Nothing came back in half a minute. The recorder may be '
+                           + 'down — the Worker queue in the admin panel says.' });
+      }
+      if (btn) btn.disabled = false;
+      tvSeedPaint(el, t);
+    }
+
+    function tvSeedPaint(el, t) {
+      const box = el.querySelector('[data-tvseedbox]');
+      if (!box) return;
+      const s = SEED.get(t.id);
+      box.hidden = !s;
+      if (!s) { box.innerHTML = ''; return; }
+
+      if (s.busy) {
+        box.innerHTML = `<div class="tv-seed-note">asking the catalogue about
+          <b>${esc(s.q)}</b>…</div>`;
+        return;
+      }
+      const rows = s.rows ?? [];
+      const retype = `<div class="tv-seed-foot">
+          <input type="text" data-tvq value="${esc(s.q)}" spellcheck="false"
+            aria-label="Look up a different name">
+          <button type="button" data-tvagain>Ask again</button>
+          <button type="button" data-tvnone>None of these</button>
+        </div>`;
+      if (!rows.length) {
+        /* Not an error, and not drawn as one. A person's name returning
+           nothing from a games catalogue is the correct answer and the row
+           stays hand-written, which is most of this archive's `character`
+           tags. */
+        box.innerHTML = `<div class="tv-seed-note">${s.note
+          ? esc(s.note)
+          : `nothing in the games catalogue is called <b>${esc(s.q)}</b> — `
+            + 'which is the right answer for a person or an event'}</div>${retype}`;
+        return;
+      }
+      box.innerHTML = `<div class="tv-seed-note">${rows.length} match${
+          rows.length === 1 ? '' : 'es'} for <b>${esc(s.q)}</b>${
+          rows[0].twins > 1 ? ` · ${rows[0].twins} carry that name exactly`
+                            : ''} — pick one</div>`
+        + rows.map((c, i) => `<button class="tv-cand" type="button" data-tvpick="${i}">
+            ${c.art ? `<img src="${esc(c.art)}" alt="" loading="lazy"
+                 onerror="this.replaceWith(Object.assign(document.createElement('span'),
+                   {className:'noart',textContent:'no art'}))">`
+                : '<span class="noart">no art</span>'}
+            <span class="tv-cand-b">
+              <span class="tv-cand-h">
+                <span class="tv-cand-n">${esc(c.name)}</span>
+                <span class="tv-cand-k${c.exact ? ' exact' : ''}">${
+                  c.exact ? 'exact' : 'guess'}</span>
+                <span class="tv-cand-m">${esc(c.meta)}</span>
+              </span>
+              <span class="tv-cand-s">${esc(c.summary || 'no description on that entry')}</span>
+            </span>
+          </button>`).join('')
+        + retype;
+    }
+
+    async function tvTakePick(el, t, i) {
+      const c = SEED.get(t.id)?.rows?.[i];
+      if (!c) return;
+      /* Said once, plainly, before the write rather than as a toast after it.
+         The summary may be somebody's writing — `seeded` is 0 the moment a
+         human has edited it — and replacing that is the one thing here worth
+         asking about. */
+      if (!t.seeded && t.summary && !confirm(
+        `Seed "${t.name}" from ${c.name}?\n\n`
+        + 'This replaces the description, and the art if that entry has any. '
+        + 'What is there now was written by hand.')) return;
+      let r;
+      try {
+        r = await apiPost(`/api/tags/${encodeURIComponent(t.id)}/seed`,
+                          { name: c.name, summary: c.summary, url: c.url, art: c.art });
+      } catch (err) { r = { status: 0, body: { error: err.message } }; }
+      if (r.status !== 200) {
+        return void toast('bad', 'Not seeded', r.body?.error ?? `HTTP ${r.status}`, 6000);
+      }
+      SEED.delete(t.id);
+      /* The words are already on the row — that write was local and has
+         landed. Only the cover is still coming, so that is the only thing
+         this sentence promises. */
+      toast('applied', `Seeded from ${c.name}`,
+        c.art ? 'The description is in. The cover is with the recorder.'
+              : 'The description is in. That entry has no cover.', 6000);
+      await reloadTags();
+    }
 
     /* Double-click the description to write one. The archive's other inline
        editors are single-purpose and live beside their forms; this is one
@@ -6060,22 +6543,31 @@
     /* Renaming a tag from the row it is on. The display name is what a human
        reads; the slug follows it in the applier, so "SLAY THE SPIRE" becoming
        "Slay the Spire" keeps every url it already answered to. */
-    /* Renaming a tag from the row it is on. A BUTTON rather than a
-       double-click on the name: the name is `flex: 1` and fills most of the
-       head, and the first click of a double-click has already toggled the row
-       shut before the second arrives — so making it double-clickable turns the
-       whole row into a dead spot for the gesture that opens it.
+    /* Renaming a tag from the row it is on.
+       A SINGLE click on the name, and that is why the head above is a div
+       rather than a button: the old shape made this a pencil, because the name
+       is `flex: 1` and fills most of the head, and a double-click on it had
+       already toggled the row shut before the second click arrived. One click
+       has no such problem — it just has to be claimed before the row's own
+       toggle sees it, which is what the handler order does.
        The display name is what a human reads; the slug follows it in the
        applier, so "SLAY THE SPIRE" becoming "Slay the Spire" keeps every url
        the tag already answered to. */
     function tvRename(el) {
-        const nm = el.querySelector('[data-tvname]');
+        const nm = el?.querySelector('[data-tvname]');
         if (!nm || nm.querySelector('input')) return;
+        // Absent for anybody who cannot even suggest, and then this is text.
+        if (!nm.hasAttribute('data-tvrename')) return;
         const t = tagById(el.dataset.tvtag);
         if (!t) return;
         const inp = Object.assign(document.createElement('input'),
           { type: 'text', className: 'tv-rename', value: t.name, spellcheck: false });
         nm.textContent = '';
+        /* Off while the field is in there. A role of "button" over an <input>
+           is a lie to whatever is reading the row out, and a tab stop on the
+           wrapper is a second one beside the field's own. */
+        nm.removeAttribute('role');
+        nm.removeAttribute('tabindex');
         nm.append(inp);
         inp.focus();
         inp.select();
@@ -6085,6 +6577,8 @@
           const next = inp.value.trim();
           if (!save || !next || next === t.name) {
             nm.textContent = t.name;
+            nm.setAttribute('role', 'button');
+            nm.tabIndex = 0;
             return;
           }
           await submit([{ target_type: 'tag', target_id: t.id, op: 'update',
@@ -6098,6 +6592,34 @@
           if (ev.key === 'Escape') { ev.preventDefault(); finish(false); }
           if (ev.key === 'Enter') { ev.preventDefault(); inp.blur(); }
         });
+    }
+
+    /* Re-filing a tag, from the row that lists the whole vocabulary.
+     *
+     * There was no control for this anywhere in the page. `kind` has been in
+     * WRITABLE.tag and enumerated over ALL_KINDS the whole time, so the
+     * changeset applied — there was simply nothing to click, which is why
+     * filing a meme tag under `general` used to mean minting it on a stream
+     * instead. Two clicks now, on the surface that shows what it would move.
+     *
+     * The chip row is kindField(), the same one the tag editor and the New tag
+     * card use. It renders a hidden [data-f="kind"] and writes the choice into
+     * it, so this handler reads a value and knows nothing about buttons. */
+    function tvKind(anchor, el) {
+      const t = tagById(el?.dataset.tvtag);
+      if (!t) return;
+      const bits = [`${t.streams} stream${t.streams === 1 ? '' : 's'}`];
+      if (t.snippets) bits.push(`${t.snippets} clip${t.snippets === 1 ? '' : 's'}`);
+      if (t.blocks) bits.push(`${t.blocks} chapter${t.blocks === 1 ? '' : 's'}`);
+      openPop(anchor, `
+        <span class="pop2-lab">file “${esc(t.name)}” under</span>
+        ${kindField(t.kind)}
+        <div class="pop2-btns">
+          <button data-act="kind" class="primary">Save</button>
+        </div>
+        <div class="pop2-scope">It is one tag, so this is one change — but the
+          colour it draws with moves on ${bits.join(', ')}.</div>`,
+        { kind: 'tvkind', tag: t });
     }
 
     calAlt.addEventListener('dblclick', (e) => {
@@ -6230,8 +6752,14 @@
     let tagShown = TAG_FIRST;
     let activeTag = null;      // slug, or null
 
+    /* All six, not the four this had. `general` is the minted default now, so
+       the commonest kind in the archive was the one drawing no swatch at all —
+       and `meta` has had a colour for as long as clips have. There is no
+       --seg-unknown worth showing (it is transparent on purpose); an unfiled
+       tag gets an outlined swatch from CSS instead. */
     const TAG_KIND_COLOR = { media: 'var(--seg-media)', character: 'var(--seg-character)',
-      type: 'var(--seg-type)', elements: 'var(--seg-elements)' };
+      type: 'var(--seg-type)', elements: 'var(--seg-elements)',
+      meta: 'var(--seg-meta)', general: 'var(--seg-general)' };
 
     const TAG_NEW_CARD =
       `<button class="tag-card tag-new" id="tag-new" type="button"
@@ -6339,7 +6867,7 @@
       openPop(anchor, `
         <span class="pop2-lab">a new tag, attached to nothing yet</span>
         <input type="text" data-f="name" placeholder="Name it…" autocomplete="off" spellcheck="false">
-        ${kindField('unknown')}
+        ${kindField(MINT_KIND)}
         <div class="pop2-btns">
           <button data-act="mint" class="primary">Create</button>
         </div>
@@ -6982,6 +7510,8 @@
       chatQ: document.getElementById('th-chat-q'),
       count: document.getElementById('th-count'),
       foot: document.getElementById('th-foot'),
+      rate: document.getElementById('th-rate'),
+      rateKey: document.getElementById('th-rate-key'),
     };
 
     let thS = null;        // the raw detail payload — the theater speaks it directly
@@ -7005,6 +7535,23 @@
        server's in `vocabtest`, because it is the last hand-written copy —
        nothing here can import from db.js. */
     const KINDS = ['media', 'character', 'type', 'elements', 'meta', 'general'];
+    /* What the server's ENUMS['tag.kind'] accepts, which is the six plus the
+       legacy one. `unknown` is not mintable from anywhere any more — every
+       mint path defaults to `general` and none of them will submit without a
+       kind — but rows filed before that rule still carry it, so it stays a
+       valid value to hold, to filter for, and to move a tag OUT of. */
+    const ALL_KINDS = [...KINDS, 'unknown'];
+    /* What a mint files a tag as when nobody picks. One constant, read by all
+       four minting surfaces, because the thing that made them diverge in the
+       first place was each one answering this question locally.
+       It used to be `unknown`, on the argument that a default kind is "a guess
+       dressed up as a default" — which was right about the guess and wrong
+       about the cost. Nothing ever went back to file them, so the unlabelled
+       pile only ever grew, and `general` is the honest name for *we have not
+       said anything more than that*. It is also the one kind that carries no
+       claim: nothing downstream reads it, where `media` and `character` both
+       mean something. */
+    const MINT_KIND = 'general';
     /* The strip has two rows. Lane 0 is what she played; lane 1 is what was
        happening inside that. Everything that reads `segments` has to say which
        it means, because the payload carries both in one array — deliberately,
@@ -7654,6 +8201,10 @@
           major ? thHms(t).replace(/:\d\d$/, '') : ''}</span>`;
       }
       TH.axis.innerHTML = ticks;
+      /* Last, and after the domain is drawn: the ridge is buckets across D,
+         so it has to be rebuilt whenever the strip it sits over is. On a live
+         stream that is every time the axis grows. */
+      thRatePaint();
       thDomainDrawn = D;
       thLive();
       thHead();
@@ -7995,19 +8546,39 @@
     let chQuery = '';
     let chFindTimer = null;
 
-    function chMatches(q) {
-      const s = q.trim().toLowerCase();
-      if (!s || !thChat) return [];
+    /** The ONE definition of what a query matches, as a predicate.
+     *
+     *  Factored out because there are two readers of it now — the result list
+     *  and the curve over the timeline — and the difference between them is
+     *  the trap: the list stops at CH_FOUND_MAX, because thirty thousand rows
+     *  is not a list, and the curve must NOT, because a count that stopped at
+     *  three hundred would draw a cliff in the middle of the stream and
+     *  present it as the data. Two copies of the grammar would have diverged
+     *  on exactly that.
+     *
+     *  `null` for a query that asks nothing, so both callers can test one
+     *  thing rather than re-deriving "is this empty".
+     */
+    function chTest(q) {
+      const s = String(q ?? '').trim().toLowerCase();
+      if (!s) return null;
       const byName = s.startsWith('@');
       const needle = byName ? s.slice(1).trim() : s;
-      if (!needle) return [];
-      const out = [];
-      for (let i = 0; i < thChat.msgs.length; i++) {
-        const m = thChat.msgs[i];
+      if (!needle) return null;
+      return (m) => {
         const hay = byName
           ? ((m.author && m.author.name) || (m.user && m.user.name) || '')
           : (m.text || m.system_message || '');
-        if (hay.toLowerCase().includes(needle)) out.push(i);
+        return hay.toLowerCase().includes(needle);
+      };
+    }
+
+    function chMatches(q) {
+      const test = chTest(q);
+      if (!test || !thChat) return [];
+      const out = [];
+      for (let i = 0; i < thChat.msgs.length; i++) {
+        if (test(thChat.msgs[i])) out.push(i);
         if (out.length >= CH_FOUND_MAX) break;
       }
       return out;
@@ -8044,6 +8615,119 @@
       TH.chatQ.value = q;
       document.getElementById('th-chat-qx').hidden = !q;
       chFindRender();
+      // The curve is about the same question the box is asking.
+      thRatePaint();
+    }
+
+    /* ---- how much was being said -----------------------------------------
+     *
+     * A ridge over the timeline: messages per minute, on the axis they were
+     * sent on. This existed once and was lost in a refactor, and the vestige
+     * it left behind is a palette comment mentioning "the density ridge".
+     *
+     * It costs the server nothing and wants no schema. `thChat.msgs` is
+     * already in memory with `_s` — seconds on the axis — on every row,
+     * because the panel had to compute that anyway; the whole feature is one
+     * pass over an array the page is holding.
+     *
+     * BUCKETED, NOT SMOOTHED. A rolling mean or a spline through the midpoints
+     * would look better and would move the peak, and the only reason anybody
+     * reads this is to find the minute something happened. A spline is also
+     * free to draw a value higher than anything that occurred, which for a
+     * count is not a rendering choice but a wrong number. So: a step outline,
+     * of measured counts over a known window. At 260 buckets across the strip
+     * each step is a few pixels wide and it reads as a curve anyway.
+     */
+    const RATE_BUCKETS = 260;
+    let thRate = null;    // { id, D, n, w, all, hits, q, peak, hitPeak, hitTotal }
+
+    function rateCounts(D, test) {
+      const n = RATE_BUCKETS;
+      const w = D / n;                      // seconds per bucket
+      const counts = new Float64Array(n);
+      for (const m of thChat.msgs) {
+        /* Outside the strip is dropped rather than clamped. A message whose
+           timestamp puts it before zero or past the end is a clock problem —
+           the panel says so where it can be read and corrected — and piling
+           those onto the first or last bucket would invent a spike at one end
+           of every stream with a bad offset. */
+        if (m._s < 0 || m._s > D) continue;
+        if (test && !test(m)) continue;
+        counts[Math.min(n - 1, Math.floor(m._s / w))]++;
+      }
+      return { n, w, counts };
+    }
+
+    function ratePath(counts, n, peak, h = 100) {
+      if (!peak) return '';
+      let d = `M0,${h}`;
+      for (let i = 0; i < n; i++) {
+        const y = h - (counts[i] / peak) * h;
+        d += `L${i},${y}L${i + 1},${y}`;
+      }
+      return `${d}L${n},${h}Z`;
+    }
+
+    function thRatePaint() {
+      const D = domainOf(thS);
+      /* Only once the log is in memory, which means only after the chat panel
+         has been opened at least once on this stream. Fetching a megabyte of
+         messages to draw 26 pixels would be the wrong trade by a wide margin,
+         and this is a stream you are already watching — the panel is a click
+         away and the ridge appears with it. */
+      const have = !!(thChat && thChat.id === thS?.id && thChat.msgs.length && D);
+      TH.rate.hidden = !have;
+      TH.rateKey.hidden = !have;
+      if (!have) { thRate = null; TH.rate.innerHTML = ''; return; }
+
+      const q = chQuery.trim();
+      /* Recomputed only when something that moves the buckets moves. An
+         imported log is a FILE — `msgs` never grows — so the stream, the
+         domain and the query are the whole of it. The domain does grow while a
+         stream is live, which is why it is in the key rather than assumed. */
+      if (!thRate || thRate.id !== thChat.id || thRate.D !== D || thRate.q !== q) {
+        const all = rateCounts(D, null);
+        const test = chTest(q);
+        const hits = test ? rateCounts(D, test) : null;
+        thRate = {
+          id: thChat.id, D, q, n: all.n, w: all.w,
+          all: all.counts, hits: hits ? hits.counts : null,
+          peak: Math.max(...all.counts),
+          hitPeak: hits ? Math.max(...hits.counts) : 0,
+          hitTotal: hits ? hits.counts.reduce((a, b) => a + b, 0) : 0,
+        };
+      }
+
+      const R = thRate;
+      const searching = !!R.hits;
+      TH.rate.classList.toggle('q', searching);
+      TH.rate.innerHTML = `<svg viewBox="0 0 ${R.n} 100" preserveAspectRatio="none">
+          <path class="all" d="${ratePath(R.all, R.n, R.peak)}"/>${searching
+            ? `<path class="hit" d="${ratePath(R.hits, R.n, R.hitPeak)}"/>` : ''}
+        </svg>`;
+
+      /* The key carries the peak because the height is normalised and a
+         normalised height means nothing on its own — and when a search is on
+         it carries BOTH peaks, because the two ridges are drawn at two
+         different scales and the only honest way to do that is to say so. */
+      const per = (c) => Math.round(c / (R.w / 60));
+      TH.rateKey.innerHTML = searching
+        ? `<i class="hit"></i><b>${esc(R.q)}</b>${R.hitTotal
+              ? `${R.hitTotal} · peak ${per(R.hitPeak)}/min` : 'none in this chat'}
+           <s>· all chat, peak ${per(R.peak)}/min</s>`
+        : `<i></i>chat · peak ${per(R.peak)}/min`;
+    }
+
+    /* What the ridge is worth reading, in the bubble that is already following
+       the pointer. Not a tooltip of its own: that needs a hit area, and a hit
+       area over the strip is a dead stripe across click-to-seek. */
+    function rateAt(sec) {
+      const R = thRate;
+      if (!R || !R.w || TH.rate.hidden) return '';
+      const i = Math.min(R.n - 1, Math.max(0, Math.floor(sec / R.w)));
+      const per = (c) => Math.round(c / (R.w / 60));
+      const head = ` · ${per(R.all[i])}/min`;
+      return R.hits ? `${head}, ${per(R.hits[i])} ${R.q.slice(0, 14)}` : head;
     }
 
     function chBadgeSet(key) {
@@ -8402,6 +9086,8 @@
                    badges: md.badges || {} };
         thChatFollow = true;
         thChatResync();
+        // The strip can say how much was being said now that the log is here.
+        thRatePaint();
       } catch (e) {
         if (thS?.id !== want) return;
         thChat = null;
@@ -9427,7 +10113,8 @@
       TH.hair.style.left = x + 'px';
       if (TH.pop.classList.contains('on')) { TH.bubble.classList.remove('on'); return; }
       TH.bubble.style.left = Math.min(Math.max(x, 34), r.width - 34) + 'px';
-      TH.bubble.textContent = thHms((x / r.width) * domainOf(thS));
+      const at = (x / r.width) * domainOf(thS);
+      TH.bubble.textContent = thHms(at) + rateAt(at);
       TH.bubble.classList.add('on');
     });
     TH.tlbody.addEventListener('pointerleave', () => TH.bubble.classList.remove('on'));
@@ -9526,6 +10213,11 @@
       });
       let json = null;
       try { json = await r.json(); } catch { /* 204 and friends */ }
+      /* A write that landed is the other half of the staleness rule. The
+         generation check on reads covers another tab and another person; this
+         covers the common case, where the thing that changed was done here and
+         the response carries the row rather than a generation. */
+      if (r.status < 400) genWrote(json);
       return { status: r.status, body: json };
     }
 
@@ -9581,6 +10273,11 @@
       });
       let json = null;
       try { json = await r.json(); } catch { /* 204 and friends */ }
+      /* A write that landed is the other half of the staleness rule. The
+         generation check on reads covers another tab and another person; this
+         covers the common case, where the thing that changed was done here and
+         the response carries the row rather than a generation. */
+      if (r.status < 400) genWrote(json);
       return { status: r.status, body: json };
     }
 
@@ -9912,10 +10609,11 @@
           ? `<div class="pop2-row mint" role="option" data-i="${i}" aria-selected="${i === at}">
                <span class="art">+</span><span class="nm">Create “${esc(r.name)}”</span></div>
              <div class="pop2-kinds">${mintKinds.map((k) =>
-               `<button data-mintkind="${k}" title="${esc(KIND_GLOSS[k])}"
-                 ><i style="background:var(--seg-${k})"></i>${k}</button>`).join('')}
-               <span class="pop2-hint">…or just Enter, and file it later.</span></div>`
-          : `<div class="pop2-row" role="option" data-i="${i}" aria-selected="${i === at}">
+               `<button data-mintkind="${k}"${k === MINT_KIND ? ' class="dflt"' : ''}
+                 title="${esc(KIND_GLOSS[k])}${k === MINT_KIND ? ' — and what Enter files it as' : ''}"
+                 ><i style="background:var(--seg-${k})"></i>${k}</button>`).join('')}</div>`
+          : `<div class="pop2-row" data-kind="${esc(r.tag.kind || 'unknown')}"
+                 role="option" data-i="${i}" aria-selected="${i === at}">
                ${tagArt(r.tag)}
                <span class="nm">${esc(r.tag.name)}
                  ${r.tag.parent ? `<span class="sub">· ${esc(r.tag.parent.name)}</span>` : ''}</span>
@@ -10007,10 +10705,12 @@
         const tid = ulid26();
         await submit([
           { target_type: 'tag', target_id: tid, op: 'create', field: 'name', value: pick.name },
-          // 'unknown' unless the person clicked one of the four. Minting
-          // everything as 'game' was a guess dressed up as a default.
+          /* Whichever of the six was clicked, and MINT_KIND when the answer
+             was Enter. Never absent and never 'unknown': a tag minted with no
+             kind is a row nobody comes back for, and that is what the
+             unlabelled pile is. */
           { target_type: 'tag', target_id: tid, op: 'create', field: 'kind',
-            value: pick.kindPick ?? 'unknown' },
+            value: pick.kindPick ?? MINT_KIND },
           { target_type: 'stream_tag', target_id: link, op: 'create', field: 'stream_id', value: streamId },
           { target_type: 'stream_tag', target_id: link, op: 'create', field: 'tag_id', value: tid },
         ], `added ${pick.name}`, { after: refreshOpenViews });
@@ -10019,7 +10719,13 @@
 
     /* ---- the editor --------------------------------------------------------
        Two scopes, and they are kept apart on purpose. Detaching removes one
-       junction row. Retracting withdraws a thing other streams are using. */
+       junction row. Renaming and re-filing change a thing other streams are
+       using — which is why they are worded the way they are.
+       Retracting used to be the third button here and is not any more. It is
+       the one verb that reaches every use of the tag at once, so it lives on
+       the one surface that can show you how many that is: Index → Tags. Two
+       places that can retract is two places to keep in step, and this one
+       cannot tell you what it is about to touch. */
     function openTagEditor(anchor, tag, streamId) {
       const canEdit = !!ME.can?.edit;
       openPop(anchor, `
@@ -10037,9 +10743,8 @@
           ${tag.status === 'proposed' && canEdit
             ? `<div class="pop2-btns"><button data-act="confirm">Confirm — put it in autocomplete</button></div>`
             : ''}
-          ${canEdit ? `<div class="pop2-btns"><button data-act="retract" class="pop2-danger">Retract everywhere</button></div>` : ''}
           <div class="pop2-scope">${canEdit
-            ? 'Renaming moves its url too. Retracting hides it from every stream that uses it.'
+            ? 'Renaming moves its url too. To retract it everywhere, or to see what carries it, open Index → Tags.'
             : 'Only an editor can change the tag itself. You can still remove it from this stream.'}</div>
         </div>`, { kind: 'edit', tag, streamId });
     }
@@ -10105,8 +10810,15 @@
       const b = e.target.closest('[data-act="mint"]');
       if (!b || pop2Ctx?.kind !== 'new') return;
       const name = pop2.querySelector('[data-f="name"]')?.value.trim();
-      const kind = pop2.querySelector('[data-f="kind"]')?.value || 'unknown';
+      const kind = pop2.querySelector('[data-f="kind"]')?.value || MINT_KIND;
       if (!name) return void toast('bad', 'Needs a name', 'A tag is its name.');
+      /* Belt for the one rule every minting surface now shares. The field
+         opens on MINT_KIND and the chips only ever write one of the six, so
+         this cannot fire from the UI — it fires if somebody ever hands this
+         handler a form that predates the rule. */
+      if (!KINDS.includes(kind)) {
+        return void toast('bad', 'Needs a kind', 'Pick one of the six before creating it.');
+      }
       closePop();
       const tid = ulid26();
       await submit([
@@ -10146,14 +10858,32 @@
           { target_type: 'tag', target_id: tag.id, op: 'update', field: 'status', value: 'confirmed' }],
           `confirmed ${tag.name}`, { after: refreshOpenViews });
       }
-      if (b.dataset.act === 'retract') {
-        if (!confirm(`Retract "${tag.name}" from the whole archive?\n\n`
-          + 'It disappears from every stream using it and from autocomplete. '
-          + 'The row is tombstoned, not deleted, so it can be brought back.')) return;
-        return void await submit([
-          { target_type: 'tag', target_id: tag.id, op: 'delete' }],
-          `retracted ${tag.name}`, { after: refreshOpenViews });
+    });
+
+    /* Re-filing, from the Tags panel. Its own listener rather than a branch in
+       the editor's above: that one early-returns on anything that is not
+       kind:'edit', and two listeners on one element both run —
+       stopPropagation is not stopImmediatePropagation.
+       Registered HERE and not up beside tvKind() for the reason the mint
+       handler documents: `pop2` is a const declared in this section, and
+       touching it from earlier in the script is a temporal dead zone
+       ReferenceError, which kills the whole inline script. tvKind() itself is
+       a declaration and only calls hoisted functions, so it can live up
+       there. */
+    pop2.addEventListener('click', async (e) => {
+      const b = e.target.closest('[data-act="kind"]');
+      if (!b || pop2Ctx?.kind !== 'tvkind') return;
+      e.stopPropagation();
+      const { tag } = pop2Ctx;
+      const kind = pop2.querySelector('[data-f="kind"]')?.value;
+      closePop();
+      if (!kind || !ALL_KINDS.includes(kind)) {
+        return void toast('bad', 'Not a kind', 'Pick one of the six.');
       }
+      if (kind === tag.kind) return void toast('queued', 'Nothing changed', null, 2500);
+      await submit([{ target_type: 'tag', target_id: tag.id, op: 'update',
+                      field: 'kind', value: kind }],
+        `filed ${tag.name} under ${kind}`, { after: reloadTags });
     });
 
     /* Client-minted ULIDs are what make a create idempotent — retrying a
@@ -14235,12 +14965,78 @@
         <button type="button" data-rqsweep>Catch up</button></div>` : '';
 
       const idleFor = d.waiting_since ? d.now - d.waiting_since : 0;
-      const warn = idleFor > 180 ? `<div class="rq-warn">
+
+      /* A KIND THE WORKER NEVER ASKS FOR.
+         This is a different failure from a worker that is down, and waiting
+         three minutes to mention it is waiting for ever: a job whose kind is
+         not in the poll will not be taken in three minutes or three days, and
+         the queue looks exactly like a slow day the whole time. So it is said
+         at once and by name, and it is said instead of the idle warning —
+         "ls-jobs is not running" is the wrong advice when ls-jobs is plainly
+         running and taking other things.
+         Only when there IS a poll on record: before the worker has ever asked
+         for anything there is nothing to compare against, and an absent list
+         is not an empty one. */
+      const asks = Array.isArray(d.poll?.kinds) ? d.poll.kinds : null;
+      /* How long ago that list was asked for, which is what says whether it
+         describes a running worker or a dead one. */
+      const pollAge = Number.isFinite(Number(d.poll?.at)) ? d.now - Number(d.poll.at) : null;
+      const waitingNow = jobs.some((j) => j.status === 'approved');
+      const unasked = asks
+        ? [...new Set(jobs.filter((j) => j.status === 'approved' && !asks.includes(j.kind))
+            .map((j) => j.kind))]
+        : [];
+      /* `a, b or c`, because "a or b or c or d or e" is what a list of five
+         reads like and the panel can hold five: every kind waiting whose name
+         is not in the poll is named here. */
+      const orList = (xs) => (xs.length < 2 ? (xs[0] ?? '')
+        : `${xs.slice(0, -1).join(', ')} or ${xs[xs.length - 1]}`);
+      /* IS THAT LIST EVEN CURRENT? The first version of this did not ask, and
+         the omission made it confidently wrong: it read a poll from an hour
+         earlier and announced "the recorder does not ask for harvest", which
+         blames the kind list for a worker that had simply stopped polling. The
+         worker holds each claim open for about twenty-five seconds, so a poll
+         older than a minute means it is not asking for anything at all — a
+         different fault, a different fix, and the one that has to be said
+         first because nothing else can be diagnosed through it. */
+      const cold = pollAge === null || pollAge > 60;
+
+      const deaf = (!cold && unasked.length) ? `<div class="rq-warn">
+        <b>The recorder does not ask for ${esc(orList(unasked))}.</b>
+        It is asking for <code>${esc(asks.join(','))}</code> right now, so ${
+          unasked.length === 1 ? 'that job' : 'those jobs'} will wait for ever
+        rather than for a while. The list comes from
+        <code>archive_job_kinds</code> in the Pi's <code>config.json</code>, or
+        from a <code>--kinds</code> flag on <code>ls-jobs</code> — a value
+        written before a kind existed keeps excluding it. Removing the setting
+        falls back to everything this recorder can do.</div>` : '';
+
+      /* A worker that has stopped asking. Said whenever anything is waiting,
+         without the three-minute grace the idle warning has: the poll age is
+         direct evidence rather than an inference from a quiet queue, so there
+         is nothing to wait and see about. */
+      const mute = (cold && waitingNow) ? `<div class="rq-warn">
+        <b>The recorder has ${asks ? `not asked for work in ${
+            esc(since(d.poll.at, d.now))}` : 'never asked for work'}.</b>
+        It holds each request open for about twenty-five seconds, so it should
+        never be quiet for longer than that — <code>ls-jobs</code> is not
+        running on the Pi, cannot reach this archive, or died on its last
+        pass.${asks ? ` What it asked for last time was
+        <code>${esc(asks.join(','))}</code>, which is a snapshot and not what
+        it wants now.` : ''} Nothing is lost while it is down: the queue is
+        where the work waits, and it goes the moment the worker is back.
+        <br><br>Worth checking in this order — <code>systemctl --user status
+        ls-jobs</code> for a crash on the last pass, then whether
+        <code>ls_archive.py</code> is as new as <code>ls_jobs.py</code>, since
+        a mismatched pair raises on the first poll and takes the loop with
+        it.</div>` : '';
+
+      const warn = mute || deaf || (idleFor > 180 ? `<div class="rq-warn">
         <b>Nothing has picked this up in ${esc(since(d.waiting_since, d.now))}.</b>
         The recorder asks for work every twenty seconds or so, so this usually
         means <code>ls-jobs</code> is not running on the Pi, or cannot reach
         this archive. Nothing is lost while it is down — the queue is where the
-        work waits, and it goes the moment the worker is back.</div>` : '';
+        work waits, and it goes the moment the worker is back.</div>` : '');
 
       const rows = jobs.map((j) => {
         const live = j.status === 'claimed';
@@ -14254,9 +15050,15 @@
           approved: 'waiting', paused: 'paused', done: 'done',
           cancelled: 'cancelled', dismissed: 'dismissed',
         })[j.status] ?? 'failed';
+        /* `j.label` — built by the server, which is the only place that has
+           the payload. It used to be `j.title`, which comes off the snippet
+           join, so every kind that is not about a snippet said "a snippet
+           that is gone" — a clip cut out of a capture, a description asked of
+           a tag, a song being read. That sentence is kept for the one case it
+           is true of, which the server marks by sending no label at all. */
         const what = j.kind === 'fetch' && j.url
           ? `<span class="rq-url">${esc(shortUrl(j.url))}</span>`
-          : esc(j.title ?? 'a snippet that is gone');
+          : esc(j.label ?? 'a snippet that is gone');
         /* Only failures offer anything. A waiting job needs the recorder, not
            a button, and cancelling one is on the row too — but retry is the
            verb that was missing entirely: `failed` is terminal at this end on
@@ -14293,10 +15095,28 @@
          proves it is alive AND can reach this archive AND is pointed at the
          right roots. The cost is that a quiet week says "5d ago", which is
          honest — it IS the last time anything was proved. */
+      /* And what it asks for, beside who it is. The worker names itself, and
+         it names itself PiWorker — so the literal prefix that used to be here
+         printed the word twice. It is the card's own title anyway. */
+      /* WHEN it asked, and not only what — the half this was missing, and the
+         omission made the line misleading rather than merely incomplete.
+         "asks for fetch, promote, purge" reads as a live fact about a running
+         worker; if that poll was an hour ago because the process died, the
+         same words describe a worker that is asking for nothing at all. Those
+         are completely different faults with completely different fixes, and
+         the age is what tells them apart. The worker holds each claim open for
+         about twenty-five seconds, so anything past a minute means it is not
+         polling. */
+      const askLine = asks
+        ? ` · ${pollAge !== null && pollAge > 60 ? 'last asked' : 'asks'} for ${
+            esc(asks.join(', '))}${pollAge !== null
+            ? ` <b class="${pollAge > 60 ? 'rq-cold' : ''}">${esc(since(d.poll.at, d.now))} ago</b>`
+            : ''}`
+        : '';
       const who = d.worker
-        ? `<span class="ops-sub">PiWorker · ${esc(d.worker.name)} · last took
-             something ${esc(since(d.worker.last_seen, d.now))} ago</span>`
-        : '<span class="ops-sub">PiWorker · has never taken a job from this archive</span>';
+        ? `<span class="ops-sub">${esc(d.worker.name)} · last took
+             something ${esc(since(d.worker.last_seen, d.now))} ago${askLine}</span>`
+        : `<span class="ops-sub">has never taken a job from this archive${askLine}</span>`;
 
       box.innerHTML = warn + fix + `<div class="tq-head">
           <span class="tq-state ${idleFor > 180 ? 'is-off' : d.running ? 'is-on' : ''}"
@@ -15671,6 +16491,11 @@
        A surface is: { input, ac, state, tagSet, tagDrop, load }. `state`
        carries `q` and `tags`; the three functions are the panel's own. */
     const AC = { all: null, rows: [], at: -1, open: false, mode: 'and', s: null };
+    /* The whole reason the generation is watched. `acLoad()` fetches this once
+       and returns it forever, which is right for typing and wrong for the
+       minute after somebody mints a tag — including in the upload window's tag
+       field, which reads the same list. */
+    GEN_DROP.push(() => { AC.all = null; });
 
     /* The operator is read off the FRONT of the box while you type, so `-asmr`
        is an exclusion being composed and the list underneath is already drawn
@@ -16370,6 +17195,9 @@
         b.booted = true;
         picLoad(b, { reset: true });
       });
+      // Registered per board rather than from a list of panel ids that would
+      // have to be kept in step with picBoards().
+      genPanel(b.panelId, b);
     }
 
     for (const [kind, cfg] of Object.entries({
@@ -17148,6 +17976,56 @@
         tagIn.value = ''; closeAc(); paintTags();
       };
 
+      /* Whether this field can MINT, as opposed to suggest.
+         `change.apply` and not `edit`, because that is the capability the
+         answer actually turns on: a changeset from somebody without it is
+         queued, and a queued tag is `status: 'proposed'` and therefore not in
+         the vocabulary — so `taglets: ['sca-red']` on save would reference a
+         slug the promotion cannot match. Suggesting is the honest thing for
+         that person to be offered, and it is what they already get. */
+      const canMint = () => !!ME.can?.['change.apply'];
+
+      /* Minting from here, which the field could not do at all.
+         It was the one surface with autocomplete and no last option to create,
+         so filing a meme tag meant saving the upload, opening the picture and
+         doing it again in the taglet picker.
+         The tag is minted NOW and attached by slug on save, rather than both
+         in one changeset the way the pickers do it. That is forced rather than
+         chosen: this row is a quarantined upload and the snippet it becomes
+         does not exist yet, so there is no junction to write. The cost is a
+         tag left behind if the upload is then abandoned — retractable from
+         Index → Tags, and the reason the row says "into the vocabulary" rather
+         than "onto this". */
+      const mint = async (kind) => {
+        const name = tagIn.value.trim();
+        if (!name) return;
+        if (!KINDS.includes(kind)) return;
+        closeAc();
+        const tid = ulid26();
+        let r;
+        try {
+          r = await apiPost('/api/changesets', { reason: `created ${name}`, changes: [
+            { target_type: 'tag', target_id: tid, op: 'create', field: 'name', value: name },
+            { target_type: 'tag', target_id: tid, op: 'create', field: 'kind', value: kind },
+          ] });
+        } catch (e) { r = { status: 0, body: { error: e.message } }; }
+        if (r.status >= 400 || !r.status) {
+          return void toast('bad', 'Not created', r.body?.error ?? `HTTP ${r.status}`, 5000);
+        }
+        /* The server owns the slug — it can merge onto an existing row, and it
+           strips characters this would guess wrong at. So read the vocabulary
+           back and take what came out of it. apiPost already dropped AC.all on
+           the 2xx, so this refetches rather than returning the stale list. */
+        const all = await acLoad();
+        const made = all.find((t) => t.name.toLowerCase() === name.toLowerCase());
+        if (!made) {
+          return void toast('bad', 'Created, but not found',
+            'The tag was made; reopen this field to attach it.', 6000);
+        }
+        tagIn.value = '';
+        take(made);
+      };
+
       /* A name the archive does not have goes in as a SUGGESTION rather than
          an error. Somebody uploading a Selen Tatsuki clip when there is no
          Selen Tatsuki was previously stuck: tag it wrongly, or not at all.
@@ -17164,13 +18042,30 @@
         tagIn.value = ''; closeAc(); paintTags();
       };
 
+      /* Whether a "Create it" row belongs under the hits right now, and where
+         it sits in the arrow-key cycle.
+         It is offered ALONGSIDE matches and not only when there are none,
+         which is the divergence that sent people back into the picture: typing
+         "sca" found `scared` and left no way to say that the thing meant was a
+         new tag beginning with those letters. Never for an exact match, and
+         never when minting would only queue. */
+      const mintRow = (q) => {
+        if (!q || !canMint()) return -1;
+        if (hits.some((h) => h.t.name.toLowerCase() === q.toLowerCase())) return -1;
+        return hits.length;
+      };
+      const lastRow = (q) => (mintRow(q) >= 0 ? hits.length : hits.length - 1);
+
       const paintAc = (q) => {
-        if (!hits.length) {
+        const mi = mintRow(q);
+        if (!hits.length && mi < 0) {
+          /* Unchanged, and only reachable now for somebody who cannot mint:
+             the name rides along with the upload for an editor to decide. */
           acBox.innerHTML = `<div class="up-ac"><div class="up-ac-none"
             >nothing called “${esc(q)}” yet — <b>Enter</b> suggests it</div></div>`;
           return;
         }
-        acBox.innerHTML = `<div class="up-ac">` + hits.map((h, i) => {
+        const rows = hits.map((h, i) => {
           const t = h.t;
           const k = t.name.toLowerCase().indexOf(q.toLowerCase());
           const nm = k < 0 ? esc(t.name)
@@ -17179,7 +18074,23 @@
           return `<button class="up-ac-row${i === at ? ' at' : ''}" type="button"
                     data-i="${i}" data-kind="${esc(t.kind)}"><span>${nm}</span>
                     <span class="k">${esc(t.kind)}</span></button>`;
-        }).join('') + `</div>`;
+        });
+        /* The kind chips are `pop2-kinds`, the same component the pickers use,
+           so there is one chip row in the page rather than a third look for
+           one decision. Only the indent differs — that 37px is the picker's
+           art column, and there is none here. */
+        if (mi >= 0) {
+          rows.push(`<button class="up-ac-row mint${mi === at ? ' at' : ''}" type="button"
+                       data-upmint><span><b>+</b> Create “${esc(q)}”</span>
+                       <span class="k">into the vocabulary</span></button>
+                     <div class="pop2-kinds up-ac-kinds">${KINDS.map((k) =>
+                       `<button type="button" data-upmintkind="${k}"${
+                         k === MINT_KIND ? ' class="dflt"' : ''}
+                         title="${esc(KIND_GLOSS[k] || '')}${
+                           k === MINT_KIND ? ' — and what Enter files it as' : ''}"
+                         ><i style="background:var(--seg-${k})"></i>${k}</button>`).join('')}</div>`);
+        }
+        acBox.innerHTML = `<div class="up-ac">${rows.join('')}</div>`;
       };
 
       tagIn.addEventListener('input', () => {
@@ -17188,25 +18099,36 @@
         // Same vocabulary the search box uses, fetched once and shared.
         acLoad().then((all) => {
           if (tagIn.value.trim() !== q) return;
-          hits = acMatch(q, all); at = hits.length ? 0 : -1;
+          hits = acMatch(q, all);
+          // The mint row is selectable, so an empty match list is still a list
+          // with something on it for anybody who can create.
+          at = (hits.length || mintRow(q) >= 0) ? 0 : -1;
           paintAc(q);
         });
       });
 
       tagIn.addEventListener('keydown', (e) => {
+        const q = tagIn.value.trim();
         if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-          if (!hits.length) return;
+          const last = lastRow(q);
+          if (last < 0) return;
           e.preventDefault();
-          at = (at + (e.key === 'ArrowDown' ? 1 : -1) + hits.length) % hits.length;
-          paintAc(tagIn.value.trim());
+          const n = last + 1;
+          at = (at + (e.key === 'ArrowDown' ? 1 : -1) + n) % n;
+          paintAc(q);
           return;
         }
         // Tab and Enter both commit, matching the search box exactly — the
         // gesture people learned there is the one they will try here.
         if (e.key === 'Enter' || e.key === 'Tab' || e.key === ',') {
-          if (!tagIn.value.trim() && e.key === 'Tab') return;   // let Tab leave
+          if (!q && e.key === 'Tab') return;   // let Tab leave
           e.preventDefault();
-          return at >= 0 && hits[at] ? take(hits[at].t) : takeRaw();
+          if (at >= 0 && at === mintRow(q)) return mint(MINT_KIND);
+          if (at >= 0 && hits[at]) return take(hits[at].t);
+          /* No row under the cursor. For somebody who can create, Enter is a
+             mint filed under MINT_KIND — the same default the pickers take —
+             and for everybody else it is the suggestion it has always been. */
+          return canMint() && q ? mint(MINT_KIND) : takeRaw();
         }
         if (e.key === 'Backspace' && !tagIn.value && it.tags.length) {
           it.tags.pop(); paintTags();
@@ -17215,8 +18137,13 @@
       });
 
       acBox.addEventListener('click', (e) => {
+        // Before the row check: the chips sit under the mint row, not in it,
+        // but a click on one is a mint and must not fall through to a hit.
+        const kb = e.target.closest('[data-upmintkind]');
+        if (kb) return void mint(kb.dataset.upmintkind);
+        if (e.target.closest('[data-upmint]')) return void mint(MINT_KIND);
         const row = e.target.closest('.up-ac-row');
-        if (row) take(hits[Number(row.dataset.i)].t);
+        if (row?.dataset.i) take(hits[Number(row.dataset.i)].t);
       });
       box.addEventListener('click', (e) => { if (!e.target.closest('button')) tagIn.focus(); });
 
@@ -18202,10 +19129,12 @@
           ? `<div class="pop2-row mint" role="option" data-i="${i}" aria-selected="${i === at}">
                <span class="art">+</span><span class="nm">Create “${esc(r.name)}”</span></div>
              <div class="pop2-kinds">${TL_KINDS.map((k) =>
-               `<button data-mintkind="${k}" title="${esc(KIND_GLOSS[k] || '')}"
-                 ><i style="background:var(--seg-${k})"></i>${k}</button>`).join('')}
-               <span class="pop2-hint">…or Enter for general.</span></div>`
-          : `<div class="pop2-row" role="option" data-i="${i}" aria-selected="${i === at}">
+               `<button data-mintkind="${k}"${k === MINT_KIND ? ' class="dflt"' : ''}
+                 title="${esc(KIND_GLOSS[k] || '')}${
+                   k === MINT_KIND ? ' — and what Enter files it as' : ''}"
+                 ><i style="background:var(--seg-${k})"></i>${k}</button>`).join('')}</div>`
+          : `<div class="pop2-row" data-kind="${esc(r.t.kind || 'unknown')}"
+                 role="option" data-i="${i}" aria-selected="${i === at}">
                <span class="nm">${esc(r.t.name)}
                  <span class="sub">· ${esc(r.t.kind)}</span></span>
                <span class="n">${r.t.uses}</span></div>`).join('')
@@ -18260,7 +19189,7 @@
            request is one thing for a reviewer to accept or refuse. */
         await T.write([
           { target_type: 'tag', target_id: tid, op: 'create', field: 'name', value: r.name },
-          { target_type: 'tag', target_id: tid, op: 'create', field: 'kind', value: mintKind ?? 'general' },
+          { target_type: 'tag', target_id: tid, op: 'create', field: 'kind', value: mintKind ?? MINT_KIND },
           { target_type: T.junction, target_id: link, op: 'create', field: T.fk, value: id },
           { target_type: T.junction, target_id: link, op: 'create', field: 'tag_id', value: tid },
         ], `added ${r.name}`, id);
@@ -18379,6 +19308,10 @@
       loadSnips({ reset: true });
     }
     document.getElementById('tab-snippets').addEventListener('click', snipsShown);
+    /* ...and forgets it, off screen, when anything anywhere changes. This is
+       the "canonise a suggestion in Review, come back to Snippets, still see
+       the free-text suggestion" half of the staleness bug. */
+    genPanel('panel-snippets', SNIP);
 
     /* =====================================================================
        Review — the publication gate
@@ -19901,7 +20834,14 @@
          out of date. */
       if (decision === 'approve') await refreshOpenViews();
     });
-    const SG_KINDS = ['media', 'character', 'meta', 'general'];
+    /* All six, like every other minting surface. This offered four — the ones
+       a clip taglet was assumed to want — while the taglet picker two panels
+       over already offered the whole vocabulary, which is the same divergence
+       in miniature: one vocabulary, and a surface that hides part of it makes
+       the reviewer go somewhere else to file a `type` or an `elements`.
+       There is no default marked here because there is no Enter to default:
+       on this row every mint IS a click on a kind. */
+    const SG_KINDS = KINDS;
 
     async function loadSuggestions() {
       if (SG.loading) return;
@@ -19955,8 +20895,13 @@
                  ? `${g.clips.length} of ${g.count}` : g.count} snippet${
                  (g.count > g.clips.length ? g.clips.length : g.count) === 1 ? '' : 's'}</button>`
           : `<span class="lbl">Create as</span>${SG_KINDS.map((k) =>
+              /* --seg-, not --tl-. There has never been a --tl-media, a
+                 --tl-type or a --tl-elements, and an unresolvable var()
+                 invalidates the whole declaration — so half these swatches
+                 were drawing nothing at all. */
               `<button class="sg-kind" type="button" data-sgkind="${k}"
-                 ><i style="background:var(--tl-${k})"></i>${k}</button>`).join('')}`;
+                 title="${esc(KIND_GLOSS[k] || '')}"
+                 ><i style="background:var(--seg-${k})"></i>${k}</button>`).join('')}`;
 
         return `<article class="sg" data-sg="${esc(g.slug)}">
           <div class="sg-name">${esc(g.name)}</div>
@@ -20286,6 +21231,7 @@
       RV.booted = true;
       loadReview({ reset: true }).then(() => rvFocus(0));
     });
+    genPanel('panel-review', RV);
 
     (async function boot() {
       /* First, and not awaited. Everything below this waits on the month index,

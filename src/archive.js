@@ -1817,6 +1817,19 @@ export function propose(db, { authorId = null, person = null, trusted = false,
         .run(ulid(), csId, i, c.target_type, c.target_id, c.op,
              c.field ?? null, c.value ?? null, base === null ? null : String(base));
     });
+    /* A proposal is a write. It adds rows the read API serves — the review
+       queue, the stream's history, the "2 open suggestions" badge — and
+       `generation` is what every ETag is keyed on. Without this bump the
+       detail endpoint keeps answering 304 with a body that predates the
+       suggestion, so the person who just submitted one sees no trace of it
+       anywhere.
+
+       In the transaction, and unconditional. It was in the else branch below,
+       which meant it was a write after a commit with no retry under it — the
+       same hazard apply() had. Bumping on the auto path too costs one extra
+       increment of a counter, because apply() will bump again; that is
+       cheaper than a second unprotected write. */
+    bumpGeneration(db);
   });
 
   /* What apply() worked out, carried back out through propose().
@@ -1831,14 +1844,6 @@ export function propose(db, { authorId = null, person = null, trusted = false,
     const done = apply(db, csId, { reviewerId: authorId,
                                    note: 'author may edit directly', mediaRoot });
     resolved = done?.merged ?? null;
-  } else {
-    // A proposal is a write. It adds rows the read API serves — the review
-    // queue, the stream's history, the "2 open suggestions" badge — and
-    // `generation` is what every ETag is keyed on. Without this bump the
-    // detail endpoint keeps answering 304 with a body that predates the
-    // suggestion, so the person who just submitted one sees no trace of it
-    // anywhere. apply() bumps for the same reason; propose() simply never did.
-    bumpGeneration(db);
   }
   const out = summary(db, csId);
   if (resolved?.length) out.merged = resolved;
@@ -2195,6 +2200,17 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
     // field. A competing proposal is a different opinion, not a redundant one;
     // silently closing it would throw away a real suggestion. It goes stale
     // instead, and a reviewer is shown both values and decides.
+
+    /* Inside the transaction, and it used to be the line after it. Out there
+       it was the one write in apply() with no retry under it, so a SQLITE_BUSY
+       threw straight out of a changeset that HAD already committed — an error
+       for an edit that saved, and a retry that then failed differently. In
+       here it is covered by the same BEGIN IMMEDIATE retry as everything else,
+       and a failure rolls the apply back rather than half-landing it.
+       It also has to happen before the response is built: the generation is
+       what every cached list is keyed on, and the page now watches it to know
+       when to drop its own caches. */
+    bumpGeneration(db);
   });
 
   /* Derived state, refreshed AFTER the commit — and its failure is a logged
@@ -2219,7 +2235,6 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
     try { recompute(db, sid, { mediaRoot }); }
     catch (e) { restale.push(sid); console.error(`apply ${csId}: recompute ${sid} failed:`, e?.message ?? e); }
   }
-  bumpGeneration(db);
   const out = summary(db, csId);
   /* Said out loud in the response too. A caller that cares — the record editor
      refreshing a strip — can tell "applied, and the projection is current" from
