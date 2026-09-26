@@ -32,13 +32,16 @@ import {
   overBitrate, pcmArgs,
   peaksFromPcm, posterArgs, probeMedia, projectNote, propose, recompute, reject,
   resolveMedia, stillPosterArgs, wavePosterArgs,
+  canonModeration, idFromUrl,
   servedType, sourcesFor, stale, summary, thumbFor, watchSources,
 } from './archive.js';
 import {
-  ANON, COOKIE, ROLES, TTL, assertCapabilities, atLeast, can, capabilities,
-  identify, issueSession, requireCap, requireRole, revokeSession, sessionToken,
-  upsertPerson,
+  ANON, CAPABILITIES, CAP_WARNINGS, COOKIE, FLOOR, TTL, assertCapabilities, can,
+  capabilities, grantable, grantableBy, hashOf, identify, installRoles,
+  isSovereign, issueSession, loadRoles, requireCap, revokeSession, roleCaps,
+  roleName, roles, sessionToken, spendUse, upsertPerson,
 } from './auth.js';
+import { assertRoutes, render as renderRoutes } from './routes.js';
 
 /* A capability granted to nobody, or granted under a name that does not exist,
    is a permission that silently never applies — which from the outside looks
@@ -130,6 +133,87 @@ export function makeApp(config = CONFIG) {
   const R = open(config.db, { readonly: true });
   const W = open(config.db);
 
+  /* ── the roles, which are rows now ───────────────────────────────────────
+   *
+   * `installRoles` seeds the four defaults into an archive that does not have
+   * them, per role and only when the ROW is absent — so a role somebody has
+   * edited in the UI keeps its edits across a restart, which is the only
+   * reason the table is worth having. Then `loadRoles` makes the rows
+   * authoritative for `can()`.
+   *
+   * In this order and at this point: before any route is registered, because
+   * `requireCap` closures capture nothing but a name and every one of them
+   * asks the registry at request time — but also before the first request, so
+   * there is no window in which the archive is answering out of the seeds
+   * while the rows say something else.
+   *
+   * `unknown` is a `role_grant` row naming a capability this build does not
+   * have, which happens when one is renamed under a live database. It cannot
+   * grant anything, so it is reported rather than fatal — see loadRoles. */
+  const { made: seeded, repaired } = installRoles(W);
+  const roleState = { seeded, repaired, ...loadRoles(R) };
+  /* Said out loud and not just attached to the app, because each of these is a
+     case somebody has to act on and every one of them is invisible otherwise:
+     the row is in the table, the role editor will not show it, and nothing
+     refuses. One line each, naming the rows, and the fix is a DELETE. */
+  if (roleState.unknown.length) {
+    console.warn(`  roles       ${roleState.unknown.length} grant row(s) name a `
+      + `capability this build does not have and are ignored: `
+      + `${roleState.unknown.join(', ')}`);
+  }
+  /* A tick on the sovereign role changes nothing — it answers from the
+     vocabulary — so the danger is not the permission, it is that the table
+     reads as though the list were the truth. */
+  if (roleState.ignored.length) {
+    console.warn(`  roles       ${roleState.ignored.length} grant row(s) sit on a `
+      + `sovereign role, which holds everything regardless, and are ignored: `
+      + `${roleState.ignored.join(', ')}`);
+  }
+  /* And the one that means the archive arrived in a state it should not have
+     been in: nothing was sovereign, so nobody held everything. Repaired rather
+     than reported-and-left, because the alternative is an archive nobody can
+     fully administer and no way in to fix it. */
+  if (roleState.repaired.length) {
+    console.warn(`  roles       no role held every capability, which should be `
+      + `impossible — sovereignty restored to ${roleState.repaired.join(', ')}`);
+  }
+
+  /* ── gate grants, resolved with the identity rather than beside it ────────
+   *
+   * Moved up here from beside `gateSql`, where it lived, because it is part of
+   * answering "who is this" and the middleware below is where that is
+   * answered. The gate rule itself has left this file — it is
+   * `can(person, 'content.view', …)` in auth.js now — and what that rule needs
+   * is the held set ON the person. So the read belongs with the identity read.
+   *
+   * The cost, stated rather than glossed: this is now one indexed read per
+   * AUTHENTICATED REQUEST, including requests that never ask about a gate,
+   * where before it was one per call to `gateOk` or `gateSql`. On the routes
+   * that do gate — every media route goes through `snipVisible` — it is a wash
+   * or a saving, since `gateOk` used to query inside itself once per row it
+   * was asked about. On the routes that do not, it is a new lookup against a
+   * unique index on a table with a handful of rows. Worth it for the held set
+   * being a property of the identity rather than something three functions
+   * each fetch for themselves, which is how they drift. */
+  /* `capability = 'content.view'` is the whole reason that column was added,
+     and this is the line it was added for. This table now holds more than one
+     kind of grant, and the gate rule must see only the viewing ones — an
+     artist's scoped edit right is not a gate, and before the column there was
+     nothing on the row that could tell the two apart. auth.js warned against
+     exactly this and its warning is what the column answers: "unlocks a
+     restricted clip" and "may change this picture" are different values in one
+     column now rather than two readings of the same row.
+
+     `scope_gate IS NOT NULL` alongside it, because a content.view grant with
+     no gate names nothing — it would arrive here as `null` and any row whose
+     gate list contained null would open for them. There is no such row today
+     and the endpoint refuses to write one; this is the second lock. */
+  const GRANTS_OF = R.prepare(
+    `SELECT scope_gate FROM person_grant
+      WHERE person_id = ? AND capability = 'content.view'
+        AND scope_gate IS NOT NULL`);
+  const grantsOf = (id) => (id ? GRANTS_OF.all(id).map((r) => r.scope_gate) : []);
+
   const app = express();
   app.use(express.json({ limit: '1mb' }));
   app.disable('x-powered-by');
@@ -148,6 +232,12 @@ export function makeApp(config = CONFIG) {
     // Identity is resolved once per request and hung off req; every route and
     // guard reads the same answer.
     req.person = identify(R, req);
+    /* And the gate grants are part of that identity, because the rule that
+       reads them lives in auth.js and has no database. Guarded on `id`: ANON
+       is a frozen object and holds nothing, so there is nothing to load and
+       nowhere to put it. An absent `grants` denies gated content rather than
+       opening it — see `heldBy` in auth.js. */
+    if (req.person?.id) req.person.grants = grantsOf(req.person.id);
     next();
   });
 
@@ -208,9 +298,14 @@ export function makeApp(config = CONFIG) {
   ];
 
   const gateOn = () => !config.devAuth;
-  /* `atLeast` and not a truthy check on req.person: ANON is an object, so
-     `req.person` is always set and testing it would let everybody through. */
-  const signedIn = (req) => atLeast(req.person, 'viewer') && !!req.person?.id;
+  /* The id, and not a truthy check on req.person: ANON is an object, so
+     `req.person` is always set and testing it would let everybody through.
+     This used to read `atLeast(req.person, 'viewer') && !!req.person?.id`. The
+     rank half never decided anything — `atLeast(_, 'viewer')` is true for
+     anybody holding a role that exists, which is everybody who got this far —
+     so it was the id doing the work the whole time. Said plainly now that
+     there are no ranks to compare. */
+  const signedIn = (req) => !!req.person?.id;
 
   app.use((req, res, next) => {
     if (!gateOn() || signedIn(req)) return next();
@@ -296,9 +391,29 @@ export function makeApp(config = CONFIG) {
       'audio_codec', c.audio_codec, 'width', c.width, 'height', c.height,
       'fps', c.fps, 'probed_at', c.probed_at,
       'video_path', c.video_path, 'video_ok', c.video_ok, 'chat_path', c.chat_path,
+      'video_state', c.video_state, 'chat_state', c.chat_state,
       'chat_ok', c.chat_ok, 'thumb_path', c.thumb_path, 'mirror_url', c.mirror_url,
       'mirror_platform', c.mirror_platform, 'alive', c.alive))
     FROM capture c WHERE c.stream_id = s.id) AS caps`;
+
+  /* ── proposed is not vocabulary yet ───────────────────────────────────────
+     Every query that reads a tag through a junction says this, and it is one
+     fragment rather than thirteen hand-written copies because thirteen copies
+     is how one of them ends up missing the second half.
+
+     `retracted_at IS NULL` was the whole of it, and that was sound while a
+     tag row could not exist until an editor approved it. It can now:
+     propose() materialises a mint as `proposed` the moment it is suggested,
+     so that somebody with ten pictures of one character types her name once
+     instead of ten times. The price of that is exactly this line — a
+     suggested name must not appear on a public clip, must not filter, must
+     not gate and must not be counted, until somebody says yes.
+
+     Where a suggester is meant to SEE their own pending tag, the surface asks
+     for it explicitly (see the author clause in /api/tags and /api/taglets).
+     The default is confirmed, everywhere, and the exceptions are written out
+     loud. */
+  const TAG_LIVE = "t.retracted_at IS NULL AND t.status = 'confirmed'";
 
   // A tag is an entity now, so a stream carries enough of it to render the
   // chip without a second round trip: its art, its status, and the id of the
@@ -308,7 +423,7 @@ export function makeApp(config = CONFIG) {
       'thumb', t.thumb_path, 'status', t.status, 'parent_id', t.parent_id,
       'link_id', st.id))
     FROM stream_tag st JOIN tag t ON t.id = st.tag_id
-    WHERE st.stream_id = s.id AND t.retracted_at IS NULL) AS tags`;
+    WHERE st.stream_id = s.id AND ${TAG_LIVE}) AS tags`;
 
   function streamOut(row, notes) {
     const caps = JSON.parse(row.caps ?? '[]');
@@ -389,6 +504,11 @@ export function makeApp(config = CONFIG) {
         width: c.width ?? null, height: c.height ?? null,
         probed_at: c.probed_at ?? null,
         video_ok: !!c.video_ok, chat_ok: !!c.chat_ok,
+        /* WHY there is no file, which the boolean above cannot say. NULL is
+           sent through as `unverified` rather than as null, so a reader has
+           one vocabulary to handle instead of a vocabulary plus an absence. */
+        video_state: c.video_state ?? 'unverified',
+        chat_state: c.chat_state ?? 'unverified',
         // video_path was missing here, and video_ok — a boolean — was standing
         // in for it. The record editor's "hosted video" box reads this key, so
         // it rendered empty on every capture that HAS a file, the browse panel
@@ -477,22 +597,99 @@ export function makeApp(config = CONFIG) {
     return toks.map((t, i) => (i === toks.length - 1 ? `"${t}"*` : `"${t}"`)).join(' AND ');
   }
 
+  /* ── the gate, on a broadcast ─────────────────────────────────────────────
+   *
+   * A tag may carry a gate and a person may hold grants; anything wearing a
+   * gating tag is invisible to anyone not holding every gate on it. That rule
+   * lives in auth.js as `can(person, 'content.view', …)` and its two halves —
+   * `gateSql` for a list, `gatesOn` for one row — are in the gate block down
+   * beside the snippet routes, which is where the pair is documented.
+   *
+   * WHAT WAS MISSING until now is this collection. `tag.gate` arrived FROM the
+   * stream side — schema.sql says so on the table — and the enforcement never
+   * followed it here: the list did not filter, `/api/streams/:id` reported
+   * `t.gate` in its tag rows and acted on it nowhere, and `/media/video` read
+   * a path and served bytes. So gating a stream did nothing at all, which is
+   * worse than not having the feature, because the Admin panel counted the
+   * gate and the archive ignored it.
+   *
+   * The INDEX GAP is accepted, deliberately. A gated stream leaves a hole in
+   * the numbering — 703, 705, no 704 — and closing that would mean renumbering
+   * the archive around its audience, which is a worse lie than a gap. The gap
+   * says "there is something here you may not see", which is true, and it is
+   * the same disclosure the snippet rules already make.
+   *
+   * `/api/ingest/*` stays UNGATED and must: the recorder authenticates with a
+   * token rather than a session, holds no grants, and needs to see 704 to know
+   * what it has already filed. A gate that hid streams from the Pi would make
+   * the archive re-record them.
+   *
+   * Per-collection statement beside its own routes, which is the shape music
+   * already uses — the shared rule is central, the junction it reads is local.
+   */
+  const STREAM_GATES_ON = R.prepare(
+    `SELECT DISTINCT t.gate FROM stream_tag st JOIN tag t ON t.id = st.tag_id
+      WHERE st.stream_id = ? AND ${TAG_LIVE} AND t.gate IS NOT NULL`);
+
+  /** May this person see this broadcast? Fails CLOSED on an unusable id, for
+   *  the reason `gateOk` does: a throw where every other refusal is a 404 is
+   *  itself a disclosure, because it says the row exists. */
+  const streamGateOk = (id, req) =>
+    can(req?.person, 'content.view', { gates: gatesOn(STREAM_GATES_ON, id) });
+
+  /** The list fragment for streams, and the etag term that has to go with it.
+   *
+   *  `held` in the etag is not optional. These routes were `public` cacheable
+   *  on a key made of the query alone — which was correct while every viewer
+   *  got the same rows. The moment the body varies per person, a shared cache
+   *  hands one reader's answer to the next, so the grant set joins the key and
+   *  a signed-in response goes `private` with `Vary: Cookie`. `['*']` for
+   *  anyone who bypasses, so every editor shares one key instead of one each.
+   *  Lifted from the snippet list, which already had to solve this. */
+  const streamGate = (req) => ({
+    ...gateSql(req, { junction: 'stream_tag', fk: 'stream_id', alias: 's' }),
+    held: can(req?.person, 'gate.bypass') ? ['*'] : [...(req?.person?.grants ?? [])].sort(),
+  });
+
   // -------------------------------------------------------------------------
   // read
   // -------------------------------------------------------------------------
 
   app.get('/api/streams', (req, res) => {
     const { q = '', tag, month, state, before, before_id,
-            after, after_id, include = '' } = req.query;
+            after, after_id, include = '', idx } = req.query;
     const limit = Math.min(Math.max(Number(req.query.limit ?? 30) || 30, 1), config.pageMax);
     const wantNotes = String(include).split(',').includes('notes');
 
+    const gate = streamGate(req);
     const etag = etagFor('list', q, tag, month, state, before, before_id,
-                         after, after_id, limit, wantNotes);
-    if (fresh(req, res, etag)) return res.status(304).end();
+                         after, after_id, limit, wantNotes, gate.held, idx);
+    if (fresh(req, res, etag, { personal: !!req.person?.id })) return res.status(304).end();
 
     const where = ['s.retracted_at IS NULL'];
     const params = [];
+    /* Pushed FIRST, so the gate is part of every branch below rather than
+       something each one has to remember. The FTS branch returns early on an
+       unparseable query and that early return is the one path this does not
+       reach — correctly, since it returns no rows at all. */
+    if (gate.sql) { where.push(gate.sql); params.push(...gate.params); }
+
+    /* The vault index, exactly. Added because a caller that wants ONE entry by
+       the number a person types had no way to ask for it, and the Audit tool
+       asked anyway — `?idx=716` was simply ignored, the route answered with
+       the newest page, and the tool took row zero. It then queued audits
+       against entry #744 under the heading "716", twice.
+       A filter a caller invents and the server silently drops is worse than a
+       400: the answer looks like an answer. So an unusable value is refused.
+       Equality, never a LIKE: this is an identity, and 716 is not 7160. */
+    if (idx !== undefined) {
+      const n = Number(idx);
+      if (!Number.isInteger(n) || n < 1) {
+        return res.status(400).json({ error: 'idx must be a whole entry number' });
+      }
+      where.push('s.idx = ?');
+      params.push(n);
+    }
 
     if (q) {
       const match = ftsQuery(String(q));
@@ -510,8 +707,27 @@ export function makeApp(config = CONFIG) {
            AND n.rowid IN (SELECT rowid FROM note_fts WHERE note_fts MATCH ?)
         UNION
         SELECT s2.id FROM stream s2
-         WHERE s2.rowid IN (SELECT rowid FROM stream_fts WHERE stream_fts MATCH ?))`);
-      params.push(match, match);
+         WHERE s2.rowid IN (SELECT rowid FROM stream_fts WHERE stream_fts MATCH ?)
+        UNION
+        /* The OTHER platform's title. She names the YouTube stream one thing
+           and the Twitch one another, capture.title keeps both, and the
+           archive's own title can only be one of them — so searching the
+           wording you remember found nothing whenever you remembered the one
+           that lost.
+
+           LIKE and not FTS, deliberately. stream_fts is content='stream', so
+           it cannot index a column on another table; reaching these words
+           properly means either a denormalised column on stream or a second
+           virtual table, and both are a migration plus an index to keep in
+           step. At a few hundred streams and two captures each this scan is
+           not measurable, and the day it is, THAT is when it earns the
+           migration. The raw q rather than the FTS match string, because that
+           one carries operators this has no idea about. */
+        SELECT c.stream_id FROM capture c
+         WHERE c.title IS NOT NULL AND c.title LIKE ? ESCAPE '\\')`);
+      /* Escaped, or a title search for "100%" matches every stream. */
+      const like = '%' + String(q).replace(/[\\%_]/g, (ch) => '\\' + ch) + '%';
+      params.push(match, match, like);
     }
     if (tag) {
       // Matches the tag OR anything rolled up under it, so asking for
@@ -526,9 +742,16 @@ export function makeApp(config = CONFIG) {
          extra bound value overflows the statement: SQLITE_ERROR, column index
          out of range. Tag-alone worked, which is why this survived — the client
          never sent both until the tag library started filtering. */
+      /* `${TAG_LIVE}` here too, which it never had — not the status half and
+         not the tombstone half either. So filtering streams by a RETRACTED
+         tag's slug has always worked, quietly, and a pending one would have
+         joined it: guess a slug and the list narrows, which is the archive
+         confirming a name exists to somebody who was never shown it. Small
+         because you have to guess, and exactly the class of thing one shared
+         fragment exists to stop being a per-query decision. */
       where.push(`EXISTS (
         SELECT 1 FROM stream_tag st JOIN tag t ON t.id = st.tag_id
-         WHERE st.stream_id = s.id
+         WHERE st.stream_id = s.id AND ${TAG_LIVE}
            AND (t.slug = ? OR t.parent_id = (SELECT id FROM tag WHERE slug = ?)))`);
       const slug = String(tag).toLowerCase();
       params.push(slug, slug);
@@ -635,6 +858,21 @@ export function makeApp(config = CONFIG) {
     const row = R.prepare(
       `SELECT ${COLS}, ${CAPS}, ${TAGS} FROM stream s WHERE ${whereSql}`).get(value);
     if (!row) return res.status(404).json({ error: 'no such stream' });
+    /* The gate, for both detail routes at once — by id and by index — because
+       they are the same question and gating them separately is how one of them
+       eventually is not.
+       The SAME 404, byte for byte, as a stream that does not exist. "Never
+       existed" and "exists and is not yours" must be one answer or the id
+       space is an oracle, which is the rule /m/<id> and the media routes
+       already follow.
+       `req` defaults to null here and that is not decoration — a caller that
+       passes none gets a refusal rather than a bypass. It also found a real
+       bug: `can()`'s object form asks the bypass first, and the rank check it
+       used to do threw on a person nobody identified. It returns false now,
+       and the bypass is `gate.bypass` — a tick rather than a rung. */
+    if (!streamGateOk(row.id, req)) {
+      return res.status(404).json({ error: 'no such stream' });
+    }
     const out = streamOut(row, notesFor([row.id]).get(row.id) ?? []);
 
     // The timeline is projected once by recompute() and read back here, so the
@@ -676,13 +914,29 @@ export function makeApp(config = CONFIG) {
 
   // Registered before /api/streams/:id so 'idx' is never read as an id.
   app.get('/api/streams/idx/:idx', (req, res) => {
-    const etag = etagFor('idx', req.params.idx, req.query.rail);
-    if (fresh(req, res, etag)) return res.status(304).end();
+    /* The grant set in the key, and private when signed in — the answer now
+       depends on who is asking, and a shared cache does not know that unless
+       the key says so. This is the route that produces the visible gap: ask
+       for 704 and get the same 404 as an index nobody ever recorded. */
+    const gate = streamGate(req);
+    const etag = etagFor('idx', req.params.idx, req.query.rail, gate.held);
+    if (fresh(req, res, etag, { personal: !!req.person?.id })) return res.status(304).end();
     return oneStream(res, 's.idx = ?', Number(req.params.idx), req);
   });
 
   app.get('/api/streams/:id/history', (req, res) => {
     // Public on purpose: an archive that hides its edits is worth less.
+    /* ...but public about a broadcast you may SEE. The gate is about audience,
+       not about edits, and a changeset names its fields and their old values —
+       so an ungated history is the gated stream's title, its dates and every
+       correction ever made to it, handed to anyone with the id. Which would
+       make this the way around the gate rather than an exception to it.
+       Same 404 as the detail route, for the same reason: one answer for "never
+       existed" and "not yours". The policy is unchanged for every stream a
+       reader can actually reach, which is all of them today. */
+    if (!streamGateOk(req.params.id, req)) {
+      return res.status(404).json({ error: 'no such stream' });
+    }
     const rows = R.prepare(
       `SELECT DISTINCT cs.id, cs.reason, cs.status, cs.created_at, cs.reviewed_at,
               a.handle AS author, r.handle AS reviewer
@@ -735,7 +989,7 @@ export function makeApp(config = CONFIG) {
    * a hope. A platform VOD would mean a download and a second failure mode;
    * cliprip-studio already does that job.
    */
-  app.post('/api/clips', requireRole('editor'), (req, res) => {
+  app.post('/api/clips', requireCap('clip.cut'), (req, res) => {
     const b = req.body ?? {};
     const row = R.prepare(
       `SELECT id, idx, title, started_at, tz_offset_min, duration_s
@@ -908,7 +1162,7 @@ export function makeApp(config = CONFIG) {
    * leave the file to be asked for again, or a dropped connection costs you a
    * re-cut.
    */
-  app.get('/api/clips/:id/file', requireRole('editor'), (req, res) => {
+  app.get('/api/clips/:id/file', requireCap('clip.cut'), (req, res) => {
     const j = R.prepare("SELECT * FROM job WHERE id = ? AND kind = 'clip'").get(req.params.id);
     if (!j) return res.status(404).json({ error: 'no such clip job' });
     if (j.status !== 'done') {
@@ -932,7 +1186,7 @@ export function makeApp(config = CONFIG) {
     });
   });
 
-  app.post('/api/notes/srt', requireRole('editor'), (req, res) => {
+  app.post('/api/notes/srt', requireCap('note.export'), (req, res) => {
     const b = req.body ?? {};
     const row = R.prepare(
       `SELECT id, idx, title, started_at, tz_offset_min, duration_s
@@ -1056,8 +1310,9 @@ export function makeApp(config = CONFIG) {
   });
 
   app.get('/api/streams/:id', (req, res) => {
-    const etag = etagFor('s', req.params.id, req.query.rail);
-    if (fresh(req, res, etag)) return res.status(304).end();
+    const gate = streamGate(req);
+    const etag = etagFor('s', req.params.id, req.query.rail, gate.held);
+    if (fresh(req, res, etag, { personal: !!req.person?.id })) return res.status(304).end();
     return oneStream(res, 's.id = ?', req.params.id, req);
   });
 
@@ -1089,10 +1344,12 @@ export function makeApp(config = CONFIG) {
   app.get('/api/tags', (req, res) => {
     const q = String(req.query.q ?? '').trim().toLowerCase();
     const limit = Math.min(Math.max(Number(req.query.limit ?? 500) || 500, 1), 500);
-    // Proposed tags are hidden from the picker by default — that is the whole
-    // point of the status — but an editor reviewing the queue needs to see them.
+    /* Proposed tags are hidden from the picker by default — that is the whole
+       point of the status — but somebody reviewing the queue needs to see
+       them, and `review.read` is that capability by name: it is what the
+       Review tab itself asks for, and a proposed tag is a queue row. */
     const wantProposed = String(req.query.status ?? '') === 'all'
-      && atLeast(req.person, 'editor');
+      && can(req.person, 'review.read');
 
     /* ?retracted=1 — the tombstones, and ONLY the tombstones.
     
@@ -1105,14 +1362,56 @@ export function makeApp(config = CONFIG) {
        else can be minted under it. Before this there was no surface anywhere
        that would admit those rows existed — which is exactly how a mint could
        report success and produce nothing visible. */
-    const wantDead = String(req.query.retracted ?? '') === '1'
-      && can(req.person, 'tag.purge');
+    /* ?retracted=1 from somebody without `tag.purge` answers THE QUESTION
+       ASKED, and answers it empty.
+
+       `&& can(...)` used to sit on the same expression as the flag, so a
+       refusal became `wantDead = false` — the WHERE flipped to
+       `retracted_at IS NULL` and the caller got the whole LIVE vocabulary
+       where it had asked for the dead. The tombstone panel rendered every
+       live tag with a Purge button on it.
+
+       A 403 was the first fix and it was wrong too, for the reason the
+       previous comment here gave: one route serves both the tag PICKER and
+       the tombstone panel, and a stale tab still sending the flag would turn
+       a demotion into a broken picker. Both fixes answered a different
+       question than the one asked — one with the wrong rows, one with an
+       error.
+
+       Empty is the answer that is true from where the caller stands: "which
+       tombstones may I see" is legitimately "none". It cannot be mistaken
+       for the live list, it cannot break a picker that never sends the flag,
+       and it is the disclosure rule the rest of the archive already follows —
+       `snipVisible` returns nothing rather than erroring, the media routes
+       404 rather than 403, and `upOwn` says "it does not exist" rather than
+       "exists but not yours". */
+    const askedDead = String(req.query.retracted ?? '') === '1';
+    if (askedDead && !can(req.person, 'tag.purge')) {
+      return res.json({ tags: [] });
+    }
+    const wantDead = askedDead;
 
     const where = [wantDead ? 't.retracted_at IS NOT NULL' : 't.retracted_at IS NULL'];
     const params = [];
     // A tombstone's status is whatever it was when it died and is not a filter
     // anybody wants applied to a list of things to destroy.
-    if (!wantProposed && !wantDead) where.push(`t.status = 'confirmed'`);
+    /* …AND THEIR OWN. A suggester's mint is a real row from the moment they
+       suggest it, and the reason it is a row at all is so they can use it
+       again — ten pictures of one character, her name typed once. Which means
+       the one picker that must show a `proposed` tag is its author's.
+       `author_id`, not the role: this is not a weaker editor: it is exactly
+       one row, belonging to the person looking at it. Everybody else's
+       pending names stay invisible, which is the answer to the case that
+       decided this — a slur suggested in bad faith is never offered to a
+       second person, and so can never be attached to anything by one. */
+    if (!wantProposed && !wantDead) {
+      if (req.person?.id) {
+        where.push(`(t.status = 'confirmed' OR (t.status = 'proposed' AND t.author_id = ?))`);
+        params.push(req.person.id);
+      } else {
+        where.push(`t.status = 'confirmed'`);
+      }
+    }
     /* `?surface=` was here, and filtered the vocabulary down to the kinds
        that surface was allowed to offer. It is gone: one vocabulary, searched
        whole, everywhere. The parameter is still ACCEPTED and ignored rather
@@ -1187,11 +1486,18 @@ export function makeApp(config = CONFIG) {
     if (!t) return res.status(404).json({ error: 'no such tag' });
     const lim = Math.min(Math.max(Number(req.query.limit ?? 40) || 40, 1), 200);
 
+    /* The stream gate, which this route needed as much as the snippet half
+       below already did — and more bluntly, because "what uses this tag" is
+       the one place somebody would look for the gated thing by name. Without
+       it, gating a stream hid it from the list and left it here with its title
+       and date. */
+    const sg = streamGate(req);
     const streams = R.prepare(
       `SELECT s.id, s.idx, s.title, s.local_date AS date, s.duration_s, s.timeline_json
          FROM stream s JOIN stream_tag st ON st.stream_id = s.id
         WHERE st.tag_id = ? AND s.retracted_at IS NULL
-        ORDER BY s.started_at DESC LIMIT ?`).all(t.id, lim);
+          ${sg.sql ? `AND ${sg.sql}` : ''}
+        ORDER BY s.started_at DESC LIMIT ?`).all(t.id, ...sg.params, lim);
 
     const me = req.person?.id ?? null;
     const vis = snipVisibleSql(req);
@@ -1207,11 +1513,17 @@ export function makeApp(config = CONFIG) {
     /* The sub-chapters, not the block itself. Listing the block that carries
        the tag tells you what you already clicked on — what is worth reading is
        what happened inside it. */
+    /* And the chapters inside it, which carry `stream_id` and `idx` and a
+       human-written label — enough to reconstruct what a gated broadcast was
+       about even without its own row. Gated on the same terms; `insideFrom`
+       already joins `stream s`, so the fragment drops straight in. */
     const inside = R.prepare(
       `SELECT sub.id, sub.start_s, sub.end_s, sub.label, sub.kind, sub.stream_id,
               s.idx, host.label AS under
          FROM ${insideFrom({ tag: '?', withStream: true })}
-        ORDER BY s.started_at DESC, sub.start_s LIMIT ?`).all(t.id, lim);
+          ${sg.sql ? `AND ${sg.sql}` : ''}
+        ORDER BY s.started_at DESC, sub.start_s LIMIT ?`)
+      .all(t.id, ...sg.params, lim);
 
     res.json({
       streams: streams.map((r) => ({
@@ -1241,11 +1553,21 @@ export function makeApp(config = CONFIG) {
       pct: Math.max(0.5, ((x.end_s - x.start_s) / span) * 100) }));
   }
 
+  /* Gated, unlike the other counts in this file, and the difference is that
+     this one is NAVIGABLE. The calendar is built from it, so an ungated month
+     puts a day on the index page that leads to an empty list — a phantom entry
+     is a broken screen, where a census that is merely too high is a number
+     nobody acts on. The remaining ungated counts (`/api/tags`'s four,
+     `/api/health`'s census) are the second kind and are recorded in AUTH.md
+     rather than changed here, because for an editor — who bypasses anyway —
+     counting everything is the correct answer. */
   app.get('/api/months', (req, res) => {
+    const gate = streamGate(req);
     res.json({ months: R.prepare(
       `SELECT local_month AS month, COUNT(*) streams,
-              SUM(COALESCE(duration_s, 0)) seconds FROM stream
-       WHERE retracted_at IS NULL GROUP BY local_month ORDER BY month DESC`).all() });
+              SUM(COALESCE(duration_s, 0)) seconds FROM stream s
+       WHERE s.retracted_at IS NULL ${gate.sql ? `AND ${gate.sql}` : ''}
+       GROUP BY local_month ORDER BY month DESC`).all(...gate.params) });
   });
 
   app.get('/api/health', (req, res) => {
@@ -1256,7 +1578,7 @@ export function makeApp(config = CONFIG) {
        still uncorrected — and a stranger who can read that knows the size and
        shape of the archive without being allowed to see any of it. Docker only
        ever looks at the status code. */
-    if (!atLeast(req.person, 'viewer') || !req.person?.id) {
+    if (!req.person?.id) {
       return res.json({ ok: true });
     }
     const c = (sql) => R.prepare(sql).get().c;
@@ -1312,15 +1634,21 @@ export function makeApp(config = CONFIG) {
 
   /** The mispairings behind `captures_out_of_span`, so they can be worked
    *  through rather than merely counted. */
+  /* This one hands back `s.idx` and `s.title` — not a census, the streams
+     themselves — so it is the one diagnostic that had to join the gate. Its
+     neighbour above already makes this argument about strangers and guards
+     itself; this route was written beside it and did not, and the difference
+     matters more here because it names things rather than counting them. */
   app.get('/api/health/out-of-span', (req, res) => {
+    const gate = streamGate(req);
     res.json({ captures: R.prepare(
       `SELECT s.id AS stream_id, s.idx, s.title, s.duration_s,
               cp.id AS capture_id, cp.platform, cp.remote_id, cp.offset_s
        FROM stream s JOIN capture cp ON cp.stream_id = s.id
-       WHERE s.retracted_at IS NULL AND (
+       WHERE s.retracted_at IS NULL ${gate.sql ? `AND ${gate.sql}` : ''} AND (
          (s.duration_s IS NOT NULL AND ABS(cp.offset_s) > s.duration_s)
          OR (s.duration_s IS NULL AND ABS(cp.offset_s) > 3600))
-       ORDER BY ABS(cp.offset_s) DESC`).all() });
+       ORDER BY ABS(cp.offset_s) DESC`).all(...gate.params) });
   });
 
   // -------------------------------------------------------------------------
@@ -1331,11 +1659,21 @@ export function makeApp(config = CONFIG) {
     const p = req.person;
     res.json({ id: p.id, handle: p.handle, role: p.role, provider: p.provider,
                display_name: p.display_name ?? null, avatar_url: p.avatar_url ?? null,
+               /* ONE namespace, as of step B. `at` used to sit beside this
+                  with a boolean per rung, because 42 routes asked for a rung
+                  and the page had no capability to ask for instead. Both ends
+                  of that are converted now, so the payload says what somebody
+                  may DO and nothing about where they stand. See auth.js, where
+                  `ranks()` used to be, for why it is deleted and not kept
+                  around unused. */
                can: capabilities(p),
-               // So the page can tell "there is nothing here" from "there is
-               // something here you may not see" without probing for it.
-               grants: R.prepare('SELECT name FROM person_grant WHERE person_id = ?')
-                 .all(p.id ?? '').map((r) => r.name),
+               /* So the page can tell "there is nothing here" from "there is
+                  something here you may not see" without probing for it.
+                  Gate names, which is what that question is about — and the
+                  same shape the page has always received, now that the table
+                  holds more than one kind of grant. `grantsOf` is the one
+                  place that decides what a gate grant is. */
+               grants: grantsOf(p.id ?? null),
                // So the UI knows whether to offer the dev sign-in at all,
                // rather than probing a 404 to find out.
                dev_auth: !!config.devAuth,
@@ -1356,7 +1694,11 @@ export function makeApp(config = CONFIG) {
                   broken server, and that made a list of private channel names
                   readable by anybody who asked. Only somebody who can actually
                   upload needs it. */
-               discord: p.id && atLeast(p, 'suggester')
+               /* `snippet.upload` and not a rung: the comment above says
+                  "only somebody who can actually upload needs it", and that
+                  is now sayable — it is the capability `/api/uploads/link`
+                  asks for, which is the one route this list is for. */
+               discord: p.id && can(p, 'snippet.upload')
                  ? [...discordChannels().values()] : [] });
   });
 
@@ -1366,7 +1708,11 @@ export function makeApp(config = CONFIG) {
     if (!config.devAuth) return res.status(404).json({ error: 'dev auth is disabled' });
     const { handle, role = 'admin' } = req.body ?? {};
     if (!handle) return res.status(400).json({ error: 'handle is required' });
-    if (!ROLES.includes(role)) return res.status(400).json({ error: `role must be one of ${ROLES}` });
+    // `roles()` and not a frozen list: the set of roles is rows now, so a
+    // custom one is a legitimate thing to sign in as during development.
+    if (!roles().includes(role)) {
+      return res.status(400).json({ error: `role must be one of ${roles().join(', ')}` });
+    }
     const id = upsertPerson(W, { provider: 'dev', providerUid: handle, handle,
                                  displayName: handle, defaultRole: config.defaultRole });
     W.prepare('UPDATE person SET role = ? WHERE id = ?').run(role, id);
@@ -1480,6 +1826,133 @@ export function makeApp(config = CONFIG) {
     res.json({ ok: true });
   });
 
+  /* ── API tokens ───────────────────────────────────────────────────────────
+   *
+   * A token for a script, rather than a session for a browser. Same table, for
+   * a reason worth stating: `session` was already a hashed, expiring,
+   * revocable bearer token with a sweep over it. A second table would be a
+   * second sweep, a second revoke path, and a second chance to get the hashing
+   * wrong — so it gained four columns instead. See their comments in
+   * schema.sql, and `can()` in auth.js for the narrowing.
+   *
+   * WHO MAY MINT. For yourself, scoped to capabilities you already hold:
+   * nobody, beyond being signed in — such a token can only ever do less than
+   * you can, so issuing one to yourself is not an escalation in any direction.
+   * For SOMEBODY ELSE it is `people.manage`, because that is handing out
+   * authority and is the capability that already means exactly that.
+   */
+  const TOKEN_TTL_MAX = 30 * 24 * 3600;
+
+  app.post('/api/auth/tokens', requireCap('token.manage'), (req, res) => {
+    const me = req.person?.id ?? null;
+    if (!me) return res.status(401).json({ error: 'sign in first' });
+    /* A scoped token cannot mint tokens. Otherwise the narrowing is a speed
+       bump: a token scoped to nothing could issue itself a token scoped to
+       everything its owner has, and the ceiling would be decorative. */
+    if (req.person?.scope != null) {
+      return res.status(403).json({ error: 'a token cannot mint tokens' });
+    }
+
+    const body = req.body ?? {};
+    /* By HANDLE as well as by id, and this is not a convenience: nothing in
+       the API lists people, so a person_id is not a thing the caller can find
+       out. You know who you are minting for by their name. */
+    const byHandle = body.handle
+      ? R.prepare('SELECT id FROM person WHERE handle = ? AND provider <> \'system\'')
+        .get(String(body.handle))?.id ?? '\u0000none'
+      : null;
+    const forWhom = String(body.person_id ?? '') || byHandle || me;
+    if (forWhom !== me && !can(req.person, 'people.manage')) {
+      return res.status(403).json({
+        error: 'minting a token for somebody else needs people.manage' });
+    }
+    const who = R.prepare('SELECT id, handle, role, banned FROM person WHERE id = ?')
+      .get(forWhom);
+    if (!who) return res.status(404).json({ error: 'no such person' });
+    if (who.banned) return res.status(409).json({ error: 'that account is banned' });
+
+    /* The scope, checked against what the HOLDER may do — not against what the
+       minter may do. can() would refuse the token at request time anyway, so a
+       scope naming something they lack is simply dead weight; refusing it here
+       means nobody is handed a token that quietly does less than the label on
+       it says. */
+    const asked = [...new Set([].concat(body.scope ?? [])
+      .flatMap((x) => String(x).split(/[\s,]+/)).filter(Boolean))];
+    if (!asked.length) {
+      return res.status(400).json({ error: 'a token needs a scope — say what it may do',
+                                    capabilities: CAPABILITIES });
+    }
+    const unknown = asked.filter((c) => !CAPABILITIES.includes(c));
+    if (unknown.length) {
+      return res.status(400).json({ error: 'no such capability', unknown,
+                                    capabilities: CAPABILITIES });
+    }
+    const holder = { ...who, scope: null };
+    const beyond = asked.filter((c) => !can(holder, c));
+    if (beyond.length) {
+      return res.status(409).json({
+        error: `${who.handle} cannot do that, so a token for it would do nothing`,
+        beyond, role: who.role });
+    }
+
+    const ttl = Math.max(60, Math.min(Number(body.ttl_s) || 24 * 3600, TOKEN_TTL_MAX));
+    const out = issueSession(W, who.id, 'api token', {
+      ttl, scope: asked.join(' '), uses: body.uses, by: me,
+      label: body.label ?? null,
+    });
+    logEvent(req, 'issued a token', 'person', who.id,
+             { scope: asked, ttl_s: ttl, uses: out.uses_left,
+               label: body.label ?? null });
+    /* The secret, once. It is stored as a SHA-256 and there is no route that
+       can give it back — which is the property that makes a leaked database
+       not a pile of live credentials, and the reason the answer says so. */
+    res.status(201).json({
+      token: out.token, expires_at: out.expiresAt, scope: asked,
+      uses_left: out.uses_left, person: { id: who.id, handle: who.handle },
+      note: 'shown once — the archive keeps only a hash of it',
+    });
+  });
+
+  /** What tokens exist. Yours, or everybody's with `people.manage`. */
+  app.get('/api/auth/tokens', requireCap('token.manage'), (req, res) => {
+    const me = req.person?.id ?? null;
+    if (!me) return res.status(401).json({ error: 'sign in first' });
+    const all = can(req.person, 'people.manage') && String(req.query.all ?? '') === '1';
+    const rows = R.prepare(
+      /* `token_hash` is the id here, and handing it out is safe: it is the
+         SHA-256 of the secret, so it identifies a row to revoke and cannot be
+         presented as one. Only scoped rows — a browser session is not a thing
+         to list on a tokens screen, and rendering somebody's live login beside
+         their API keys invites revoking the wrong one. */
+      `SELECT s.token_hash AS id, s.person_id, s.label, s.scope, s.uses_left,
+              s.created_at, s.expires_at, p.handle, b.handle AS by_handle
+         FROM session s
+         JOIN person p ON p.id = s.person_id
+         LEFT JOIN person b ON b.id = s.created_by
+        WHERE s.scope IS NOT NULL AND s.expires_at > ?
+          ${all ? '' : 'AND s.person_id = ?'}
+        ORDER BY s.created_at DESC LIMIT 200`)
+      .all(...(all ? [now()] : [now(), me]));
+    res.json({ tokens: rows.map((r) => ({ ...r, scope: r.scope.split(' ') })) });
+  });
+
+  /** Revoke one. Yours, or anybody's with `people.manage`. */
+  app.delete('/api/auth/tokens/:id', requireCap('token.manage'), (req, res) => {
+    const me = req.person?.id ?? null;
+    if (!me) return res.status(401).json({ error: 'sign in first' });
+    const row = R.prepare(
+      'SELECT person_id, label, scope FROM session WHERE token_hash = ? AND scope IS NOT NULL')
+      .get(req.params.id);
+    if (!row) return res.status(404).json({ error: 'no such token' });
+    if (row.person_id !== me && !can(req.person, 'people.manage')) {
+      return res.status(404).json({ error: 'no such token' });
+    }
+    W.prepare('DELETE FROM session WHERE token_hash = ?').run(req.params.id);
+    logEvent(req, 'revoked a token', 'person', row.person_id,
+             { label: row.label, scope: row.scope.split(' ') });
+    res.json({ ok: true });
+  });
+
   // -------------------------------------------------------------------------
   // write — one path
   // -------------------------------------------------------------------------
@@ -1585,7 +2058,7 @@ export function makeApp(config = CONFIG) {
     }
   }
 
-  app.post('/api/changesets', requireRole('suggester'), (req, res) => {
+  app.post('/api/changesets', requireCap('change.propose'), (req, res) => {
     /* The only way any decision in the archive changes — and therefore the
        only place per-change authorisation has to happen. `person` carries both
        questions into propose(): whether these particular changes are theirs to
@@ -1689,7 +2162,21 @@ export function makeApp(config = CONFIG) {
     }
     try {
       if (decision !== 'approve') {
-        return res.json(reject(W, req.params.id, { reviewerId: req.person.id, note }));
+        const out = reject(W, req.params.id, { reviewerId: req.person.id, note });
+        /* A rejection that un-creates a tag has to say so, in both halves.
+           The cascade is its own changeset, so its removal lines come from
+           logChangeset the same way every other detach does; the tag itself is
+           gone by now, which is why the name is carried out of reject() rather
+           than read back here — `withdrew` is the only place it still exists.
+           `withdrew` is the verb a submission already uses for the same shape:
+           nothing was destroyed that anybody had, the ask was taken back. */
+        for (const w of out.withdrew ?? []) {
+          if (w.changeset_id) logChangeset(req, w.changeset_id);
+          logEvent(req, 'withdrew', 'tag', w.id,
+                   { name: w.name, slug: w.slug, detached: w.detached,
+                     was: 'proposed', changeset_id: req.params.id }, req.params.id);
+        }
+        return res.json(out);
       }
       const out = apply(W, req.params.id, { reviewerId: req.person.id, note, force: !!force,
                                             mediaRoot: config.mediaRoot });
@@ -1706,9 +2193,411 @@ export function makeApp(config = CONFIG) {
     } catch (e) { return changeError(res, e); }
   });
 
+  /* ---- claims -------------------------------------------------------------
+   *
+   * What somebody asserted that no evidence can show. See the schema for why
+   * the table exists at all; these are the two reads and two writes over it.
+   *
+   * APPEND-ONLY, latest wins, so every read is "the newest live row for this
+   * key" rather than "the row". A claim that turned out to be wrong is
+   * answered again and the older one stays visible.
+   */
+  const CLAIM_LIVE = `SELECT * FROM claim
+     WHERE subject_type = ? AND subject = ? AND withdrawn_at IS NULL`;
+
+  /** Every live claim about one subject, newest first. */
+  const claimsFor = (type, subject) => R.prepare(
+    `${CLAIM_LIVE} ORDER BY established_at DESC, id DESC`).all(type, subject);
+
+  /** The answer to one exact question, or null.
+   *
+   *  This is the read the audit does before asking — "has anybody already
+   *  settled this for this subject" — and it is why a question, once answered,
+   *  is never asked again.
+   *
+   *  `platform` is matched including NULL, which the bare `= ?` would not do:
+   *  a claim about the broadcast as a whole carries no platform, and in SQLite
+   *  `NULL = NULL` is not true. Getting that wrong would make whole-broadcast
+   *  claims unfindable and ask every question forever.
+   */
+  const claimAnswer = (type, subject, platform, assertion) => R.prepare(
+    `${CLAIM_LIVE} AND assertion = ?
+       AND platform IS ?
+     ORDER BY established_at DESC, id DESC LIMIT 1`)
+    .get(type, subject, assertion, platform ?? null) ?? null;
+
+  /* ── answering what evidence cannot settle ────────────────────────────────
+   *
+   * An audit that cannot decide something from files, logs and platforms asks
+   * instead of guessing, and this is where the answer lands. The next audit
+   * reads it and says nothing, which is what makes the question a one-off
+   * rather than a thing the sweep re-raises every week.
+   *
+   * `review.decide` and not a new capability: settling what the archive
+   * records about an entry is the same act as deciding a proposal, and
+   * whoever may do one may do the other.
+   */
+  const CLAIM_SUBJECTS = new Set(['stream', 'date']);
+  const CLAIM_ASSERTIONS = new Set(['no_broadcast', 'broadcast', 'declined',
+                                    'identified']);
+  const CLAIM_PLATFORMS = new Set(['youtube', 'twitch']);
+  const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
+
+  app.get('/api/claims', requireCap('review.read'), (req, res) => {
+    const type = String(req.query.subject_type ?? 'stream');
+    const subject = String(req.query.subject ?? '');
+    if (!CLAIM_SUBJECTS.has(type)) {
+      return res.status(400).json({ error: 'subject_type must be stream or date' });
+    }
+    if (!subject) return res.status(400).json({ error: 'which subject?' });
+    /* One exact question rather than the list, which is the shape the audit
+       actually asks in: "has anybody settled THIS for this subject". Answered
+       here rather than by handing back everything and letting each caller
+       filter, because the matching is where the trap is — `platform IS ?`
+       and not `= ?`, since a whole-broadcast claim carries no platform and in
+       SQLite `NULL = NULL` is not true. A caller filtering for itself would
+       get that wrong quietly and ask its question forever. */
+    if (req.query.assertion) {
+      const assertion = String(req.query.assertion);
+      if (!CLAIM_ASSERTIONS.has(assertion)) {
+        return res.status(400).json({
+          error: 'no such assertion', assertions: [...CLAIM_ASSERTIONS] });
+      }
+      const platform = req.query.platform == null || req.query.platform === ''
+        ? null : String(req.query.platform).toLowerCase();
+      return res.json({ claim: claimAnswer(type, subject, platform, assertion) });
+    }
+
+    /* Withdrawn ones included here and nowhere else. Every other reader wants
+       the answer; this is the surface a person uses to see that somebody once
+       answered differently, which is most of the value of keeping them. */
+    const rows = String(req.query.include ?? '') === 'withdrawn'
+      ? R.prepare(`SELECT * FROM claim WHERE subject_type = ? AND subject = ?
+                    ORDER BY established_at DESC, id DESC`).all(type, subject)
+      : claimsFor(type, subject);
+    res.json({ claims: rows, count: rows.length });
+  });
+
+  /* Everything an audit is still waiting to be told, across every entry.
+   *
+   * Flat and newest-first rather than grouped by stream: the job is "clear the
+   * open questions", not "inspect one entry", and grouping would make the
+   * commonest case — four questions about one entry nobody has said anything
+   * about — look like four entries needing attention.
+   */
+  app.get('/api/questions', requireCap('review.read'), (req, res) => {
+    const limit = Math.min(Math.max(Number(req.query.limit ?? 100) || 100, 1), 500);
+    /* Not scoped to `subject_type = 'stream'`, though the column exists and
+       `claim`'s twin of it is already exercised. Nothing can ask about a date
+       yet — that is C4, where "was there a broadcast you missed" becomes a
+       question — so a filter for it here would be a clause no test could
+       falsify, which this project has twice decided is worse than none. The
+       row carries its own type instead, and the join simply yields no idx for
+       a subject that is not a stream. The column stays because adding one to
+       an existing table costs a migration and adding it now costs a line. */
+    const rows = R.prepare(
+      `SELECT q.*, s.idx, s.title
+         FROM question q LEFT JOIN stream s ON s.id = q.subject
+        ORDER BY q.asked_at DESC, q.id DESC LIMIT ?`).all(limit);
+    res.json({
+      questions: rows.map((q) => ({
+        ...q,
+        // Parsed here so no caller has to remember it is JSON in a column.
+        answers: (() => { try { return JSON.parse(q.answers); } catch { return []; } })(),
+      })),
+      count: rows.length,
+    });
+  });
+
+  /** Check one claim and write it, or say why not.
+   *
+   *  Shared by the two doors that file one — `POST /api/claims`, which is
+   *  somebody recording a fact outright, and `POST /api/questions/:id/answer`,
+   *  which is somebody answering something the audit asked. Two insert sites
+   *  would be two places for `source` to stop meaning `human`, and that is the
+   *  one field the whole table's worth rests on.
+   *
+   *  Returns `{ err: [status, body] }` or `{ claim }`.
+   */
+  const fileClaim = (person, { type, subject, assertion, platform, value }) => {
+    /* eslint-disable-next-line no-param-reassign -- `value` is normalised
+       below when it turns out to be a link; the caller's object is not
+       touched, because it was destructured. */
+    if (!CLAIM_SUBJECTS.has(type)) {
+      return { err: [400, { error: 'subject_type must be stream or date' }] };
+    }
+    if (!CLAIM_ASSERTIONS.has(assertion)) {
+      return { err: [400, { error: 'no such assertion',
+                            assertions: [...CLAIM_ASSERTIONS] }] };
+    }
+    if (platform !== null && !CLAIM_PLATFORMS.has(platform)) {
+      return { err: [400, { error: 'platform must be youtube, twitch or absent' }] };
+    }
+    // `identified` without the id is the one combination that says nothing.
+    if (assertion === 'identified' && !value) {
+      return { err: [400, { error: 'identified needs the id it identifies' }] };
+    }
+    /* A LINK IS THE NATURAL THING TO PASTE, so take one.
+     *
+     * This used to file whatever was typed, verbatim. Pasting a VOD url into
+     * a box labelled "video or vod id" put a url where every reader expects
+     * an id: it matched nothing, settled nothing, and the next audit asked
+     * the same question again. The answer looked accepted and did nothing,
+     * which is the worst of the three possible outcomes.
+     *
+     * A bare id is left exactly as it arrived — `idFromUrl` only speaks up
+     * for something it recognises as a link, so this narrows nothing.
+     *
+     * The platform the link belongs to is CHECKED rather than used: a Twitch
+     * url answering a question about YouTube is a mistake worth a sentence,
+     * and silently filing it against the platform the question named would
+     * point a capture at another site's video. */
+    if (assertion === 'identified') {
+      const got = idFromUrl(value);
+      if (got.id) {
+        if (platform && got.platform !== platform) {
+          return { err: [400, {
+            error: `that is a ${got.platform} link, and the question is about `
+                 + `${platform}`,
+          }] };
+        }
+        value = got.id;
+      }
+    }
+    if (type === 'date') {
+      if (!ISO_DAY.test(subject)) {
+        return { err: [400, { error: 'a date subject is YYYY-MM-DD' }] };
+      }
+    } else if (!R.prepare('SELECT 1 FROM stream WHERE id = ?').get(subject)) {
+      return { err: [404, { error: 'no such stream' }] };
+    }
+
+    /* `human`, always, and not whatever the caller typed. These routes exist
+       for a person answering a question; a tracker's claim arrives by another
+       path with its own coverage. Letting the body choose would mean a person
+       could file an answer as though a platform had confirmed it, which is
+       the one way a claim table stops being worth reading. */
+    const id = ulid();
+    W.prepare(`INSERT INTO claim(id, subject_type, subject, platform, assertion,
+                 value, source, coverage, established_at, established_by)
+               VALUES(?,?,?,?,?,?,'human',NULL,?,?)`)
+      .run(id, type, subject, platform, assertion, value, now(), person.id);
+    return { claim: R.prepare('SELECT * FROM claim WHERE id = ?').get(id) };
+  };
+
+  const claimBody = (b) => ({
+    type: String(b.subject_type ?? 'stream'),
+    subject: String(b.subject ?? ''),
+    assertion: String(b.assertion ?? ''),
+    platform: b.platform == null || b.platform === ''
+      ? null : String(b.platform).toLowerCase(),
+    value: b.value == null ? null : String(b.value).trim() || null,
+  });
+
+  /* Filing a claim outright, with no question behind it. Closing a question
+     is NOT done from here — it has its own route below, and the reason is
+     that an answer to a question is not always a claim. Two doors that both
+     close questions would be two places to decide what an answer means. */
+  app.post('/api/claims', requireCap('review.decide'), (req, res) => {
+    const want = claimBody(req.body ?? {});
+    const out = fileClaim(req.person, want);
+    if (out.err) return res.status(out.err[0]).json(out.err[1]);
+    logEvent(req, 'answered', want.type === 'date' ? 'date' : 'stream',
+             want.subject, { assertion: want.assertion,
+                             platform: want.platform, value: want.value });
+    bumpGeneration(W);
+    res.json({ claim: out.claim });
+  });
+
+  /* ── answering a question, which is not always filing a claim ─────────────
+   *
+   * Every question until now could be answered with a fact: there was no
+   * broadcast, I did not keep it, it is this id. A chat too short to merge is
+   * the first that cannot. The chat WAS kept — it is just short — so none of
+   * the four assertions is true of it, and what the entry is waiting for is
+   * not a fact at all but WORK: go and fetch the rest, or stop waiting.
+   *
+   * So an answer is one of two things, and this is the route that knows which.
+   * An assertion files a claim; an ACTION queues a job on the Pi, because the
+   * files, the network and the give-up ledger are all there and none of them
+   * is here. Either way the question closes — and if the audit still wants to
+   * know after the work has run, it asks again, which it is the authority on.
+   *
+   * The answer must be one the QUESTION offered. Before this, the panel drew
+   * the right buttons and nothing enforced it: a caller could file
+   * `identified` against a question that only ever offered `declined`. The
+   * worker's list stops being decorative here.
+   */
+  /* The two fetches are the third and fourth, and they are what made the set
+     worth having. The first two are the two answers to "this chat is short";
+     a fetch answers "this file was never here", which until now could only be
+     answered with a fact about WHY — and on an entry whose VOD link is
+     sitting on the capture row, every available fact was false.
+     TWO of them and not one `fetch`, because a VOD is hours of video and its
+     chat is a few megabytes. Wanting the second and not the first is the
+     ordinary case. The answer names the file, so there is no table here
+     mapping a question kind to one — a table that could drift out of step
+     with the worker's questions and start guessing at what to download. */
+  const QUESTION_ACTIONS = new Set(['repair', 'give_up',
+                                    'fetch_video', 'fetch_chat']);
+  const FETCH_WHAT = { fetch_video: 'video', fetch_chat: 'chat' };
+
+  app.post('/api/questions/:id/answer', requireCap('review.decide'), (req, res) => {
+    const q = R.prepare('SELECT * FROM question WHERE id = ?').get(req.params.id);
+    /* Gone rather than never-was, almost always: the last audit dropped it
+       because it stopped being true, or somebody else answered it a moment
+       ago. Said as its own sentence so a stale panel reads as stale rather
+       than broken. */
+    if (!q) return res.status(404).json({ error: 'that question is no longer open' });
+    const answer = String(req.body?.answer ?? '');
+    let offered = [];
+    try { offered = JSON.parse(q.answers); } catch { /* stored malformed */ }
+    if (!Array.isArray(offered) || !offered.includes(answer)) {
+      return res.status(400).json({
+        error: 'that is not one of the answers this question offers',
+        answers: Array.isArray(offered) ? offered : [] });
+    }
+
+    if (QUESTION_ACTIONS.has(answer)) {
+      const s = R.prepare(
+        'SELECT id, idx FROM stream WHERE id = ? AND retracted_at IS NULL')
+        .get(q.subject);
+      if (!s) return res.status(404).json({ error: 'no such stream' });
+      /* Same refusal as the audit button's, for the same reason: the Pi
+         addresses entries by the vault index and has nothing to look for
+         without one. */
+      if (!s.idx) {
+        return res.status(400).json({
+          error: 'this stream has no vault index, so there is nothing to repair' });
+      }
+      const platform = String(q.platform ?? '').toLowerCase();
+      if (!CLAIM_PLATFORMS.has(platform)) {
+        return res.status(400).json({
+          error: 'this question names no platform, so there is no repair to run' });
+      }
+      /* Matched on the platform as well as the entry. One entry can be short
+         on both, and a check on the index alone would silently answer "already
+         queued" to the second — which reads, in the panel, as a click that
+         did nothing. */
+      /* On the COLUMN now, not on `payload LIKE '%"idx":744%'` — which also
+         matches 1744, and would have answered "already queued" about another
+         entry's repair. The platform still comes out of the payload, because
+         it is a property of the job and not of the stream, but json_extract
+         reads the named key instead of matching a substring. */
+      /* Which errand this is. A repair and a give-up are two answers about a
+         capture that is HERE; a fetch is about one that is not, and the two
+         cannot share a kind — `chat_repair` works relative to a file on the
+         NAS and has nothing to work relative to when there is no file. */
+      /* Only a pull has a `what`. Setting one for a repair too would narrow
+         the already-queued check below against a payload that has none —
+         which never matches, so every second click would queue a duplicate
+         repair. */
+      const what = FETCH_WHAT[answer] ?? null;
+      const kind = what ? 'pull' : 'chat_repair';
+      /* Matched on WHAT as well, for a pull. One platform can be missing its
+         video and its chat, and the entry whose whole problem is that nothing
+         from it was recorded is missing both — a check on the platform alone
+         would answer "already queued" to the second click, which reads in the
+         panel as a button that did nothing. */
+      const open = R.prepare(
+        `SELECT id FROM job WHERE kind = ?
+           AND status IN ('approved','claimed') AND stream_id = ?
+           AND json_valid(payload)
+           AND json_extract(payload, '$.platform') = ?
+           AND (? IS NULL OR json_extract(payload, '$.what') = ?)`)
+        .get(kind, s.id, platform, what ?? null, what ?? null);
+      const jobId = open ? open.id : enqueueJob(kind, {
+        payload: kind === 'pull'
+          ? { idx: s.idx, stream_id: s.id, platform, what }
+          : { idx: s.idx, stream_id: s.id, platform, action: answer },
+        by: req.person.id });
+      W.prepare('DELETE FROM question WHERE id = ?').run(q.id);
+      logEvent(req, answer === 'repair' ? 'asked for a chat repair'
+                 : what ? `asked for the ${what} to be pulled`
+                 : 'let a chat go', 'stream', s.id,
+               { idx: s.idx, platform, what: what ?? null });
+      bumpGeneration(W);
+      return res.json({ action: answer, job_id: jobId, what: what ?? null,
+                        already: !!open, closed: q.id });
+    }
+
+    const value = req.body?.value == null
+      ? null : String(req.body.value).trim() || null;
+    const out = fileClaim(req.person, {
+      type: q.subject_type, subject: q.subject, assertion: answer,
+      platform: q.platform == null ? null : String(q.platform).toLowerCase(),
+      value });
+    if (out.err) return res.status(out.err[0]).json(out.err[1]);
+    /* Closed by id and nothing else. Working out in SQL which OTHER open
+       questions this claim settles would be a second copy of a rule the
+       worker already owns, and the two would drift; the next audit is the
+       authority and re-asks anything this did not actually settle. */
+    W.prepare('DELETE FROM question WHERE id = ?').run(q.id);
+    logEvent(req, 'answered', q.subject_type === 'date' ? 'date' : 'stream',
+             q.subject, { assertion: answer, platform: q.platform, value });
+    bumpGeneration(W);
+    res.json({ claim: out.claim, closed: q.id });
+  });
+
+  /* Withdrawn rather than deleted: an answer somebody gave and took back is
+     part of the record. There is also no natural opposite of `no_broadcast`
+     to assert instead, which is the other half of why this exists. */
+  app.post('/api/claims/:id/withdraw', requireCap('review.decide'), (req, res) => {
+    const c = R.prepare('SELECT * FROM claim WHERE id = ?').get(req.params.id);
+    if (!c) return res.status(404).json({ error: 'no such claim' });
+    if (c.withdrawn_at) {
+      return res.status(409).json({ error: 'that answer was already withdrawn' });
+    }
+    W.prepare('UPDATE claim SET withdrawn_at = ?, withdrawn_by = ? WHERE id = ?')
+      .run(now(), req.person.id, c.id);
+    logEvent(req, 'withdrew an answer', c.subject_type === 'date' ? 'date' : 'stream',
+             c.subject, { assertion: c.assertion, platform: c.platform });
+    bumpGeneration(W);
+    res.json({ claim: R.prepare('SELECT * FROM claim WHERE id = ?').get(c.id) });
+  });
+
   // -------------------------------------------------------------------------
   // machine ingest — ls-rec posts captures as they happen
   // -------------------------------------------------------------------------
+
+  /* ── the recorder is somebody ──────────────────────────────────────────────
+     `person.provider` has always listed `system` alongside discord, twitch and
+     dev, and nothing used it. The Pi does more to this archive than most
+     accounts ever will — it promotes, purges, rescans, fetches art and saves
+     songs — and every one of those was logged as `anonymous`, role `viewer`,
+     `actor_id` null: indistinguishable from a stranger who wandered in.
+
+     So it gets a row. Not for authority — the role is `viewer` and the ingest
+     token is still the only thing that opens these routes — but so that one
+     query answers "what did this worker do" whether the worker is a person, a
+     bot or a Raspberry Pi. A Discord bot later is one more row and no new code.
+
+     Cached because it is read on every poll, and lazily made because a fresh
+     database has no rows at all. `upsertPerson` does not count `system` rows
+     when it decides who becomes the first admin, which matters precisely
+     because the Pi polls every twenty seconds and would otherwise get there
+     first. */
+  const RECORDER = { at: 0, person: null };
+  function recorder() {
+    if (RECORDER.person) return RECORDER.person;
+    try {
+      const id = upsertPerson(W, {
+        provider: 'system', providerUid: 'recorder', handle: 'the recorder',
+        displayName: 'ls-rec', defaultRole: 'viewer',
+      });
+      /* `provider` rides along on the object because logEvent reads it: a
+         machine's denormalised `actor_role` says `system` rather than
+         `viewer`, which is the truth and is what the log wants to badge. The
+         role on the ROW stays `viewer`, so if any check ever runs against
+         this person it grants nothing. */
+      RECORDER.person = { id, handle: 'the recorder', role: 'viewer',
+                          provider: 'system' };
+    } catch (e) {
+      console.error('recorder person:', e?.message ?? e);
+      return null;
+    }
+    return RECORDER.person;
+  }
 
   function requireIngest(req, res, next) {
     if (!config.ingestToken) {
@@ -1720,6 +2609,12 @@ export function makeApp(config = CONFIG) {
     if (got !== config.ingestToken) {
       return res.status(401).json({ error: 'bad or missing ingest token' });
     }
+    /* Set AFTER the token check, so a caller that failed it is never anybody.
+       Every `logEvent(req, …)` reachable from here now names the recorder
+       without its call site having to know, and the two places that read
+       `req.person?.id` for a job's `requested_by` start attributing the Pi's
+       own jobs to the Pi instead of to nobody. */
+    req.person = recorder() ?? req.person;
     next();
   }
 
@@ -1741,6 +2636,77 @@ export function makeApp(config = CONFIG) {
       WHERE cs.status = 'applied' AND c.target_type = ? AND c.target_id = ?
         AND c.field IS NOT NULL`).all(type, id).map((r) => r.field);
 
+  /* ── THE STATE MANIFEST ───────────────────────────────────────────────────
+   *
+   *  Every field the recorder is allowed to have an opinion about, and which
+   *  KIND of thing each one is. This is the whole of the read-back contract,
+   *  written once, in one place, and checked against the schema at boot.
+   *
+   *  It exists because of how the audit used to work, which was one
+   *  direction: the Pi derived values from files and posted them, and nothing
+   *  ever compared them against what was already here. A wrong derivation
+   *  therefore could not be noticed — it just became the new truth. Sending
+   *  what we hold, first, is what puts a comparison (and a person) in the way.
+   *
+   *  The kinds are the load-bearing part:
+   *
+   *    measured   a witness observed this about a file or a platform. The
+   *               recorder can check it, because it can go and look at the
+   *               same thing.
+   *
+   *    derived    computed FROM measurements. The recorder must not propose
+   *               one directly. `started_at` is the axis every note, chapter
+   *               and chat message on the entry is measured from — a
+   *               derivation that quietly moves it moves all of them, which
+   *               is exactly what happened when it was `min()` over whatever
+   *               happened to be measurable that day.
+   *
+   *  A field missing from here is a field nobody ever checks, silently, which
+   *  is the same failure as a job kind missing from one of four lists. So the
+   *  assertion below is not decoration: it fails the boot.
+   */
+  const STATE_MANIFEST = {
+    version: 1,
+    stream: {
+      title: 'measured',            // the platform's own title for it
+      started_at: 'derived',        // the axis zero
+      duration_s: 'derived',        // the BROADCAST's length, not a file's
+      tz_offset_min: 'measured',    // the vault says so
+      chat_path: 'measured',        // a file, or no file
+      /* All read off the merged chat's header, which is a file the merge
+         produced — so they describe a derivation, and none of them can be
+         proposed without the merge having run. */
+      chat_sources: 'derived',
+      chat_version: 'derived',
+      chat_messages: 'derived',
+      chat_first_ms: 'derived',
+      chat_last_ms: 'derived',
+      chat_moderation: 'derived',
+    },
+    capture: {
+      remote_id: 'measured',
+      url: 'measured',
+      title: 'measured',
+      video_path: 'measured',
+      chat_path: 'measured',
+      /* THE TWO THE RECORDER IS THE ONLY WITNESS TO. See the schema note
+         above these columns: the platform's t=0 and this file's frame 0, both
+         in wall time, because wall time is the only frame all three clocks
+         share. Nothing recovers them afterwards. */
+      remote_start_wall: 'measured',
+      local_start_wall: 'measured',
+      local_start_precision_s: 'measured',
+      file_duration_s: 'measured',        // ffprobe, the file on disk
+      remote_duration_s: 'measured',      // what the platform says
+      /* Both already derived by `recompute()` from the two wall times and
+         stream.started_at, and both already not writable through a
+         changeset. Listed so the recorder is TOLD they are off limits rather
+         than left to find out by having a proposal refused. */
+      broadcast_started_at: 'derived',
+      offset_s: 'derived',
+    },
+  };
+
   const LOOKUP_CAP = ['id', 'platform', 'remote_id', 'url', 'title', 'video_path',
                       'chat_path', 'thumb_path', 'mirror_url', 'file_duration_s',
                       'broadcast_started_at', 'offset_s', 'remote_start_wall',
@@ -1757,6 +2723,48 @@ export function makeApp(config = CONFIG) {
 
   const shape = (row, keys) => Object.fromEntries(keys.map((k) => [k, row?.[k] ?? null]));
 
+  /* The manifest against the schema, at boot, the way `assertRoutes` does it.
+     A name here that is not a column would be sent as a perpetual null and
+     read as "the archive holds nothing for this"; the recorder would then
+     propose a value for it on every sweep, for ever, about a field that does
+     not exist. Cheap to check once, invisible otherwise. */
+  (function assertStateManifest() {
+    const cols = (t) => new Set(R.prepare(`PRAGMA table_info(${t})`).all().map((c) => c.name));
+    for (const [table, fields] of [['stream', STATE_MANIFEST.stream],
+                                   ['capture', STATE_MANIFEST.capture]]) {
+      const have = cols(table);
+      const bad = Object.keys(fields).filter((f) => !have.has(f));
+      if (bad.length) {
+        throw new Error(`STATE_MANIFEST names ${table} field(s) that do not exist: ${bad.join(', ')}`);
+      }
+      const kinds = Object.values(fields).filter((k) => k !== 'measured' && k !== 'derived');
+      if (kinds.length) {
+        throw new Error(`STATE_MANIFEST.${table} has unknown kind(s): ${[...new Set(kinds)].join(', ')}`);
+      }
+    }
+  }());
+
+  /* What the archive currently holds, shaped by the manifest and nothing else.
+     Separate from `lookupStream` on purpose: that one is the read-before-write
+     the push uses and its field list is about what the push needs. This one is
+     about what a person is going to be shown beside a verdict. */
+  function stateOf(s) {
+    const caps = R.prepare('SELECT * FROM capture WHERE stream_id = ? ORDER BY platform').all(s.id);
+    return {
+      manifest: STATE_MANIFEST,
+      stream: { id: s.id, idx: s.idx,
+                ...shape(s, Object.keys(STATE_MANIFEST.stream)) },
+      captures: caps.map((c) => ({ id: c.id, platform: c.platform,
+                                   ...shape(c, Object.keys(STATE_MANIFEST.capture)) })),
+      /* Which capture the axis is measured from. `offset_s = 0` is what makes
+         one the reference, and it is already how the player and the merge
+         think — so it is read here rather than invented. Null means nothing
+         claims to be the reference, which is a thing the recorder must be
+         able to SAY rather than guess its way around. */
+      reference: caps.find((c) => c.offset_s === 0)?.platform ?? null,
+    };
+  }
+
   function lookupStream(streamId) {
     const s = R.prepare('SELECT * FROM stream WHERE id = ?').get(streamId);
     if (!s) return null;
@@ -1767,6 +2775,14 @@ export function makeApp(config = CONFIG) {
         .all(s.id).map((c) => ({
           ...shape(c, LOOKUP_CAP), human_fields: humanFields('capture', c.id),
         })),
+      /* Carried on the read the worker ALREADY does, rather than behind a
+         second call it would have to remember to make. An audit's first
+         question about anything it cannot settle is "has this been answered",
+         and the answer arrives in the same packet as everything else it needs
+         to know. A worker that never looks at them asks a question twice,
+         which is annoying; one that cannot get them without a second request
+         eventually skips it, which is the failure worth designing out. */
+      claims: claimsFor('stream', s.id),
     };
   }
 
@@ -1829,12 +2845,18 @@ export function makeApp(config = CONFIG) {
     }
 
     const streamId = byRemote ?? byIdx;
+    const srow = streamId
+      ? R.prepare('SELECT * FROM stream WHERE id = ?').get(streamId) : null;
     res.json({
       found: Boolean(streamId),
       by: byRemote ? 'remote_id' : (byIdx ? 'idx' : null),
       conflict,
       next_index: nextIdx(),
       stream: streamId ? lookupStream(streamId) : null,
+      /* Carried on the read the worker ALREADY makes, for the same reason the
+         claims are: a second call is a second thing to remember, and the one
+         that gets skipped. A worker too old to know about this ignores it. */
+      state: srow ? stateOf(srow) : null,
     });
   });
 
@@ -1851,39 +2873,43 @@ export function makeApp(config = CONFIG) {
     'video_path', 'chat_path', 'thumb_path', 'mirror_url', 'duration_s',
     'started_at', 'tz_offset_min', 'broadcast_started_at', 'record_started_at',
     'local_start_precision_s', 'stream', 'clear',
+    /* Why there is no local copy. An observation like every other field here
+       — the worker looked, or the worker was told by the person who deleted
+       it — and not an opinion the archive forms for itself. */
+    'video_state', 'chat_state',
+    /* The id this capture ENDED UP with, when that is not the one it was
+       filed under. Only Twitch needs it: the recorder catches the channel
+       live and gets a broadcast id, the VOD is minted minutes later with a
+       different number, and until now nothing carried the second one — so
+       ls-audit repaired it afterwards out of a cache, badly. The packet is
+       still addressed by `remote_id`, because that is what the row is filed
+       under and the whole point is to find it. */
+    'final_remote_id',
   ]);
+  const MEDIA_STATES = new Set(['kept', 'declined', 'lost', 'unverified']);
   const INGEST_STREAM = new Set([
     'title', 'started_at', 'tz_offset_min', 'chat_path', 'chat_sources',
     // chat_meta_path is deliberately absent: it is derived from the path in
     // the same packet, so a caller cannot claim that a description belongs to
     // a file it does not describe.
+    //
+    // The other road in is a CHANGESET — an audit run from the website lands
+    // that way rather than here — and it writes one named column at a time,
+    // so it cannot fold the rule into a single UPDATE the way this route
+    // does. `apply()` in archive.js repairs it after the fact instead, and
+    // carries the other half of this comment.
     'chat_version', 'chat_messages', 'chat_first_ms', 'chat_last_ms',
     'chat_moderation',
   ]);
   const CHAT_META = ['chat_version', 'chat_messages', 'chat_first_ms',
                      'chat_last_ms', 'chat_moderation'];
-  const MODERATION = new Set(['complete', 'none', 'unknown']);
-
-  /** Moderation coverage as one canonical string, or null if it is not one.
-   *
-   *  Canonical because it is COMPARED, not merely stored. ls-audit reads the
-   *  stream back before every write and skips whatever already matches, and
-   *  that comparison is a string one — so {"YT":"a","TW":"b"} and
-   *  {"TW":"b","YT":"a"} being two spellings of one fact would make this field
-   *  collide on every sweep for the rest of the project's life. Sorted keys,
-   *  no spaces, and the same shape produced on the ls-audit side.
-   */
-  const canonModeration = (v) => {
-    let o = v;
-    if (typeof o === 'string') { try { o = JSON.parse(o); } catch { return null; } }
-    if (!o || typeof o !== 'object' || Array.isArray(o)) return null;
-    const keys = Object.keys(o).sort();
-    if (!keys.length) return null;
-    for (const k of keys) {
-      if (!['YT', 'TW'].includes(k) || !MODERATION.has(String(o[k]))) return null;
-    }
-    return JSON.stringify(Object.fromEntries(keys.map((k) => [k, String(o[k])])));
-  };
+  /* canonModeration now lives in archive.js and is imported. It moved because
+     there are two roads in — this route, and the changeset an audit run from
+     the website becomes — and the value is COMPARED as a string on every
+     sweep. Two copies of a canonicaliser that have to agree exactly is a
+     different thing from the two-place rule in apply(): that one is one
+     invariant reached by two mechanics, this is one wire format, so it gets
+     one validator. */
   // Clearing is for paths only. A file can genuinely stop existing, so "this
   // path is no longer true" is an observation. A title or a clock going blank
   // is never an observation, so those can be corrected but never emptied.
@@ -1916,6 +2942,30 @@ export function makeApp(config = CONFIG) {
       return res.status(400).json({
         error: 'only media paths may be cleared', fields: unclearable,
       });
+    }
+
+    /* Refused rather than coerced, the same rule the chat numbers follow just
+       below: a state nobody recognises stored as-is would put a word on the
+       panel that no reader has a branch for, and silently dropping it would
+       lose an observation the worker actually made. */
+    const badState = ['video_state', 'chat_state'].filter(
+      (k) => b[k] !== undefined && b[k] !== null && !MEDIA_STATES.has(String(b[k])));
+    if (badState.length) {
+      return res.status(400).json({
+        error: `video_state and chat_state must be one of ${[...MEDIA_STATES].join(', ')}`,
+        fields: badState });
+    }
+
+    /* A replacement id has to look like one. It is written into the column the
+       whole table is addressed by, so a blank or a stray object here would
+       orphan the row from everything that points at it. */
+    let finalId = null;
+    if (b.final_remote_id !== undefined && b.final_remote_id !== null) {
+      finalId = String(b.final_remote_id).trim();
+      if (!finalId || !/^[0-9A-Za-z_-]{1,64}$/.test(finalId)) {
+        return res.status(400).json({
+          error: 'final_remote_id must be a plain video id' });
+      }
     }
 
     const t = now();
@@ -1995,7 +3045,7 @@ export function makeApp(config = CONFIG) {
      * outside, so a rejected packet rolls back rather than committing whatever
      * it had managed first. */
     const refuse = (status, body) => { const e = new Error('refused'); e.refuse = { status, body }; throw e; };
-    let idx, state, refused = [];
+    let idx, state, refused = [], succeeded = null;
     try {
     tx(W, () => {
     // Upsert on (platform, remote_id): retries are free and a crashed daemon
@@ -2070,7 +3120,8 @@ export function makeApp(config = CONFIG) {
     const cols = {};
     const maybe = { url: b.url, title: b.title, video_path: b.video_path,
                     chat_path: b.chat_path, thumb_path: b.thumb_path,
-                    mirror_url: b.mirror_url, file_duration_s: b.duration_s };
+                    mirror_url: b.mirror_url, file_duration_s: b.duration_s,
+                    video_state: b.video_state, chat_state: b.chat_state };
     for (const [k, v] of Object.entries(maybe)) if (v !== undefined && v !== null) cols[k] = v;
     // ...and then whatever was explicitly named as no longer true. Listed
     // second so `clear` wins over a stale value sent in the same packet.
@@ -2124,6 +3175,42 @@ export function makeApp(config = CONFIG) {
     } else if (Object.keys(cols).length) {
       W.prepare(`UPDATE capture SET ${Object.keys(cols).map((k) => `${k}=?`).join(',')},
                  updated_at=? WHERE id=?`).run(...Object.values(cols), t, captureId);
+    }
+
+    /* ── the id this capture ended up with ────────────────────────────────
+       Twitch, and only Twitch: the recorder catches the channel live and gets
+       a BROADCAST id, then the VOD is minted at the end carrying a different
+       number. Both ids are real and neither is a mistake — the first is what
+       existed while recording, the second is what the video is called — so
+       this is a succession, not a correction, and the packet is still
+       addressed by the id the row is filed under.
+
+       Refused if something else already holds the new id. `capture` has
+       UNIQUE(stream_id, platform) but nothing stops two rows on two streams
+       from claiming one remote_id, and a silent collision here would point
+       two streams at one video with no way to tell which was right.
+
+       Only on an existing row, because on an INSERT the caller should simply
+       send the right `remote_id` in the first place. */
+    if (finalId && captureId !== null && finalId !== remoteId) {
+      const taken = W.prepare(
+        `SELECT id, stream_id FROM capture
+          WHERE platform = ? AND remote_id = ? AND id <> ?`).get(platform, finalId, captureId);
+      if (taken) {
+        refuse(409, {
+          error: 'another capture already holds that id',
+          capture_id: taken.id, on_stream: taken.stream_id, wanted: finalId });
+      }
+      W.prepare('UPDATE capture SET remote_id = ?, updated_at = ? WHERE id = ?')
+        .run(finalId, t, captureId);
+      /* The url goes with it unless the packet named one itself. A watch link
+         built from the broadcast id is the 404 this whole field exists to
+         stop, so leaving it behind would fix the id and keep the symptom. */
+      if (cols.url === undefined && platform === 'TW') {
+        W.prepare('UPDATE capture SET url = ? WHERE id = ?')
+          .run(`https://www.twitch.tv/videos/${finalId}`, captureId);
+      }
+      succeeded = { from: remoteId, to: finalId };
     }
 
     // Stream-level corrections, for a caller reconciling a whole entry rather
@@ -2212,10 +3299,20 @@ export function makeApp(config = CONFIG) {
        a recorder retry into a duplicate. */
     try { state = recompute(W, streamId, { mediaRoot: config.mediaRoot }); }
     catch (e) { console.error(`ingest ${streamId}: recompute failed:`, e?.message ?? e); }
+    /* An id changing hands is the one thing in this route worth a line in the
+       log. Everything else it writes is a measurement being refined; this
+       renames the thing the archive identifies a video BY, and six months from
+       now "why does this capture point at a different video than the filename
+       on disk" needs an answer. */
+    if (succeeded) {
+      logEvent(req, 'took the published id', 'stream', streamId,
+               { platform, ...succeeded });
+    }
     bumpGeneration(W);
     res.json({ id: streamId, index: idx, capture_id: captureId, created,
                paired_with: pairedWith, vod_state: state?.vod_state ?? null,
                chat_state: state?.chat_state ?? null,
+               ...(succeeded ? { succeeded } : {}),
                /* Said out loud rather than silently dropped. A recorder that
                   keeps reporting a title somebody has corrected should be able
                   to see that it is being ignored, and why. */
@@ -2334,7 +3431,14 @@ export function makeApp(config = CONFIG) {
     return '.bin';
   };
 
-  app.post('/api/uploads', requireRole('suggester'), async (req, res) => {
+  /* `requireCap` and not `requireRole('suggester')`, which is what it was.
+     Same people: `snippet.upload` is granted from suggester up, so no browser
+     notices. What changed at the time was that a SCOPED TOKEN could reach this
+     route where it could reach no rank-gated one, so converting a route was
+     the act of making it reachable by a token — one at a time and never by
+     accident. Every route asks a capability now, which is what makes a token's
+     scope mean the same thing everywhere. */
+  app.post('/api/uploads', requireCap('snippet.upload'), async (req, res) => {
     if (!config.quarantineRoot) {
       return res.status(503).json({ error: 'uploads are disabled; set TENMA_QUARANTINE_ROOT' });
     }
@@ -2352,15 +3456,70 @@ export function makeApp(config = CONFIG) {
     }
     const K = UP_KIND[kind];
 
-    const pending = R.prepare(
-      `SELECT count(*) c FROM snippet
-        WHERE author_id = ? AND kind = ? AND status = 'proposed'
-          AND retracted_at IS NULL`).get(me, kind).c;
-    if (pending >= K.pending) {
-      return res.status(429).json({
-        error: `you already have ${pending} ${pending === 1 ? K.one : K.noun}`
-          + ' waiting for review',
-        pending, limit: K.pending });
+    /* ── the companion JSON ─────────────────────────────────────────────────
+       Title and taglets, in the same request as the bytes. A HEADER, beside
+       the `x-upload-kind` and `x-upload-name` this route already takes, which
+       keeps the body pure bytes — the route streams 200 MB videos through a
+       Transform and must not start buffering, and the two alternatives both
+       cost something real: multipart means a parser dependency, and JSON with
+       the file base64'd inside it inflates every byte by a third.
+
+       Optional in both directions. Nothing sends it today, and PATCH is still
+       there for metadata that outgrows a header. */
+    let meta = null;
+    const metaRaw = req.get('x-upload-meta');
+    if (metaRaw) {
+      try {
+        meta = JSON.parse(decodeURIComponent(metaRaw));
+      } catch {
+        try { meta = JSON.parse(metaRaw); } catch { meta = undefined; }
+      }
+      if (!meta || typeof meta !== 'object' || Array.isArray(meta)) {
+        return res.status(400).json({
+          error: 'x-upload-meta must be a JSON object, URI-encoded',
+          takes: ['title', 'taglets'] });
+      }
+    }
+
+    /* ── the budget, or the cap ─────────────────────────────────────────────
+       A TOKEN WITH A BUDGET replaces the pending cap rather than dodging it.
+       The cap exists so one careless authenticated session cannot fill the
+       quarantine mount in an afternoon, and it does that job by counting what
+       is waiting for review — which stops a bulk push dead at twenty, and
+       would have stopped the first one within a minute.
+
+       A deliberately-issued "good for 150 uploads" is the better bound: it is
+       finite, it is spent whether the rows get reviewed or not, and somebody
+       chose the number out loud. So a scoped token carrying `uses_left` is
+       counted against its own budget, and every other caller against the cap
+       exactly as before.
+
+       Spent BEFORE the bytes are read, so a push cut off mid-file has still
+       used its allowance — the alternative is a budget that can be drained for
+       free by a thousand aborted requests. */
+    const budget = req.person?.scope != null && req.person?.uses_left != null;
+    let usesLeft = null;
+    if (budget) {
+      /* `< 0` and not `<= 0`. A token with one use left spends it and honestly
+         has zero remaining — reading that zero as a refusal made a budget of
+         three take two images and turn down the third. */
+      usesLeft = spendUse(W, req.person.token_hash);
+      if (usesLeft < 0) {
+        return res.status(429).json({
+          error: 'that token has no uploads left on it',
+          uses_left: 0, token: req.person.label ?? null });
+      }
+    } else {
+      const pending = R.prepare(
+        `SELECT count(*) c FROM snippet
+          WHERE author_id = ? AND kind = ? AND status = 'proposed'
+            AND retracted_at IS NULL`).get(me, kind).c;
+      if (pending >= K.pending) {
+        return res.status(429).json({
+          error: `you already have ${pending} ${pending === 1 ? K.one : K.noun}`
+            + ' waiting for review',
+          pending, limit: K.pending });
+      }
     }
 
     const id = ulid();
@@ -2460,6 +3619,59 @@ export function makeApp(config = CONFIG) {
          second copy of a restricted clip and putting it in front of a reviewer
          — which is worse on every axis that matters here. */
       const mayName = snipVisible(twin, req);
+      /* ── and for a PUSH, a duplicate is not a failure ────────────────────
+         This is what makes a bulk push re-runnable, and without it the whole
+         API is a thing somebody has to babysit. A script that dies at image 87
+         of 140 cannot simply be started again: the first 87 answer 409, their
+         sidecar tags never land, and the only way forward is to work out by
+         hand where it stopped.
+
+         So a caller that sent metadata gets 200 with the row that already
+         exists, and the metadata is applied to it. The bytes were already
+         here, which is the definition of the work being done — the second run
+         is therefore not a duplicate upload, it is the same upload asserted
+         again. Idempotent by the file's own hash, which is the only identity
+         the archive trusts for this.
+
+         Only where the caller may still edit the row and only where they sent
+         something to apply: without `meta` this stays the 409 it always was,
+         because "your file is already here" is the honest answer to somebody
+         who asked nothing else. */
+      /* Not restricted to `proposed`, which was the first shape and was wrong
+         in exactly the case this exists for: a PUBLISHING token confirms every
+         row it makes, so every re-run would meet a confirmed twin and refuse —
+         the feature would work only for tokens that queue. So: your own row
+         while it is still yours to edit, or anybody holding the verdict, which
+         is the same authority that published it in the first place. */
+      const mayRedo = (twin.author_id === me && twin.status === 'proposed')
+        || can(req.person, 'review.decide');
+      /* A TOKEN always gets this answer, with or without metadata to apply.
+         The first version required `meta`, and an end-to-end run of the push
+         script caught what that costs: a folder where some pictures have no
+         sidecar is only partly re-runnable — the bare ones come back 409 and
+         a script cannot tell "already here" from "refused". Idempotency has to
+         be a property of the ROUTE, not of what the caller happened to send.
+
+         Still a 409 through the browser, where the duplicate notice is the
+         right answer and the upload window is built around it. `scope` is what
+         tells the two apart, the same way it does for publishing. */
+      if ((meta || req.person?.scope != null) && mayName && mayRedo) {
+        /* `meta?` throughout, because a token reaches here with none: a
+           picture in the folder that has no sidecar beside it is a perfectly
+           ordinary thing to re-send, and the first version of this dereferenced
+           `meta` and took the server down with it on exactly that file. */
+        const tags = meta?.taglets !== undefined
+          ? applyTaglets(req, twin.id, meta.taglets) : null;
+        if (typeof meta?.title === 'string') {
+          W.prepare('UPDATE snippet SET title = ?, updated_at = ? WHERE id = ?')
+            .run(meta.title.trim().slice(0, 300), now(), twin.id);
+        }
+        if (tags || meta) bumpGeneration(W);
+        return res.json({
+          snippet: { id: twin.id, title: twin.title, status: twin.status },
+          already: true, ...(tags ?? {}),
+        });
+      }
       return res.status(409).json({
         error: mayName
           ? 'the archive already has this exact file'
@@ -2497,7 +3709,16 @@ export function makeApp(config = CONFIG) {
        that into a title produces a row labelled with gibberish that reads as
        a name somebody chose. Empty is the honest starting state, and the
        submitter can write a few words if the picture wants them. */
-    const given = String(req.get('x-upload-name') ?? '').slice(0, 200);
+    /* URI-decoded if it will decode, used as sent if it will not — the same
+       tolerant read `/api/music/upload` does, and for the same reason: a
+       header has to be latin-1, so any client with a non-ASCII filename has
+       to encode it. The browser sends `file.name` raw and a raw ASCII name
+       decodes to itself, so both clients land on the same string. This was
+       missing here while the music route had it, and `pushpics.py` encodes —
+       so a pushed `my clip.mp4` became the title `my%20clip`. */
+    let given = String(req.get('x-upload-name') ?? '').slice(0, 300);
+    try { given = decodeURIComponent(given); } catch { /* as sent, then */ }
+    given = given.slice(0, 200);
     const title = kind === 'snippet'
       ? (given.replace(/\.[a-z0-9]{1,8}$/i, '').replace(/[_-]+/g, ' ').trim()
          || 'Untitled upload')
@@ -2562,11 +3783,50 @@ export function makeApp(config = CONFIG) {
     logEvent(req, 'uploaded', 'snippet', id,
              { kind, name: given || title, bytes, duration_s: p?.duration_s ?? null });
 
+    /* ── the sidecar, in the same request ───────────────────────────────────
+       Applied here rather than left to a PATCH, so there is no moment where a
+       row exists with none of the metadata that came with it. Which matters
+       most in the case just below: a published row cannot be patched at all,
+       because `upOwn` refuses anything that is no longer `proposed`. */
+    const tags = meta?.taglets !== undefined
+      ? applyTaglets(req, id, meta.taglets) : null;
+    if (meta && typeof meta.title === 'string') {
+      W.prepare('UPDATE snippet SET title = ?, updated_at = ? WHERE id = ?')
+        .run(meta.title.trim().slice(0, 300), now(), id);
+    }
+
+    /* ── and whether it waits for a verdict ─────────────────────────────────
+       THE TOKEN DECIDES, bounded by what its holder may do — and the bound
+       needs no new field, because the scope is already a capability list:
+       a token scoped `snippet.upload review.decide` publishes, one scoped
+       `snippet.upload` queues, and the mint route refuses a scope its holder
+       cannot back. So a suggester's push token can never carry it, however it
+       is asked for.
+
+       `scope != null` is what keeps this a TOKEN rule. An editor uploading
+       through the browser still lands in the queue exactly as before: their
+       own review panel is where they were going to look anyway, and quietly
+       publishing everything an editor drags in is a behaviour change nobody
+       asked for. */
+    const publishing = req.person?.scope != null && can(req.person, 'review.decide');
+    if (publishing) {
+      W.prepare("UPDATE snippet SET status = 'confirmed', updated_at = ? WHERE id = ?")
+        .run(now(), id);
+      logEvent(req, 'approved', 'snippet', id, { via: 'api token' });
+    }
+    if (tags || meta || publishing) bumpGeneration(W);
+
     res.status(201).json({
       snippet: snipRow(R.prepare('SELECT * FROM snippet WHERE id = ?').get(id), { me }),
       // What still has to happen before anyone but the submitter sees it.
       // For a still: nothing. It is already showable and already has a poster.
       next: cls === 'still' ? null : 'normalize',
+      /* Said out loud for a script, which cannot see the red chip a browser
+         gets: these are the names the archive did not have. A push of a
+         hundred wants that per image, or a typo'd tag is invisible until
+         somebody notices the gallery is missing a filter. */
+      ...(tags ?? {}),
+      ...(usesLeft === null ? {} : { uses_left: usesLeft }),
     });
   });
 
@@ -2580,20 +3840,85 @@ export function makeApp(config = CONFIG) {
 
      Partial by design. The panel saves a title before the tags are typed, so a
      field that is absent is left alone rather than cleared. */
+  /** Set an upload's taglets, and say what happened to each name.
+   *
+   *  Lifted out of PATCH /api/uploads/:id so the byte route can apply the same
+   *  rules in the same request the file arrives in. That is not tidiness: the
+   *  two calls used to be mandatory in order — bytes, then metadata — and a
+   *  push that died between them left a published row with no tags, which
+   *  `upOwn` then refuses to patch because it is no longer `proposed`. One
+   *  route, one transaction, no window.
+   *
+   *  Returns the slugs that matched and the names that did not, because a
+   *  hundred-image push needs to be TOLD which of its tags the archive did
+   *  not have. Through the browser those are a red chip somebody can see; a
+   *  script sees nothing unless the answer says so.
+   */
+  const applyTaglets = (req, snippetId, taglets) => {
+    /* Matched on the SLUG, but the display name is what gets kept for a
+       suggestion — "Selen Tatsuki" is what an editor needs to read, and
+       `selen-tatsuki` is what the page sent. Both are carried so neither has
+       to be reconstructed. */
+    const raw = [].concat(taglets ?? [])
+      .map((x) => String(x ?? '').trim()).filter(Boolean).slice(0, 40);
+    /* slugify, not a hand-rolled lowercase-and-hyphenate. They agree on
+       `Selen Tatsuki` and disagree on everything with punctuation or an accent
+       in it — so `Amelia Watson!` matched no taglet, was filed as a stray, and
+       sat in the queue as a name the archive already had. The vocabulary is
+       keyed by slugify(); every comparison against it has to be too. */
+    const want = [...new Set(raw.map(slugify))];
+    /* Confirmed, or pending AND THEIRS. The middle clause is the whole of the
+       ten-pictures case: a name this person minted a minute ago is a real row
+       with a real slug, so it matches here and the junction is written like
+       any other. Somebody else's pending name is not matchable by guessing the
+       slug, which is the part that matters. */
+    const found = want.length
+      ? R.prepare(`SELECT id, slug FROM tag
+                    WHERE slug IN (${want.map(() => '?').join(',')})
+                      AND retracted_at IS NULL
+                      AND (status = 'confirmed'
+                           OR (status = 'proposed' AND author_id = ?))`)
+        .all(...want, req.person?.id ?? '-')
+      : [];
+    const known = new Set(found.map((r) => r.slug));
+    /* Names the archive does not have AND nobody minted. Still kept as text on
+       the clip rather than minted from here: minting is a deliberate press in
+       the picker, and a name typed into a box — or listed in a sidecar — has
+       not been asked for as vocabulary. A typo should stay a stray. */
+    const strays = [...new Map(raw
+      .filter((x) => !known.has(slugify(x)))
+      .map((x) => [slugify(x), x.slice(0, 80)])).values()].slice(0, 12);
+
+    const t = now();
+    tx(W, () => {
+      W.prepare('DELETE FROM snippet_taglet WHERE snippet_id = ?').run(snippetId);
+      const ins = W.prepare(
+        `INSERT INTO snippet_taglet(id, snippet_id, tag_id, created_at, updated_at)
+         VALUES(?,?,?,?,?)`);
+      for (const f of found) ins.run(ulid(), snippetId, f.id, t, t);
+      W.prepare('UPDATE snippet SET taglet_suggestions = ?, updated_at = ? WHERE id = ?')
+        .run(strays.length ? JSON.stringify(strays) : null, t, snippetId);
+    });
+    return { attached: found.map((r) => r.slug), strays };
+  };
+
   const upOwn = (req, id) => {
     const s = R.prepare('SELECT * FROM snippet WHERE id = ? AND retracted_at IS NULL').get(id);
     if (!s) return { err: [404, 'no such upload'] };
     const mine = !!s.author_id && s.author_id === req.person?.id;
-    // Not yours and you are not an editor: it does not exist, rather than
-    // "exists but you may not". Same disclosure rule as the media routes.
-    if (!mine && !atLeast(req.person, 'editor')) return { err: [404, 'no such upload'] };
+    /* Not yours and you may not read the queue: it does not exist, rather
+       than "exists but you may not". Same disclosure rule as the media routes.
+       `review.read` is the capability for it — this row is a `proposed`
+       upload, which is a queue row, and seeing other people's is exactly what
+       that name means. */
+    if (!mine && !can(req.person, 'review.read')) return { err: [404, 'no such upload'] };
     if (s.status !== 'proposed') {
       return { err: [409, 'that has already been reviewed'] };
     }
     return { s };
   };
 
-  app.patch('/api/uploads/:id', requireRole('suggester'), (req, res) => {
+  app.patch('/api/uploads/:id', requireCap('snippet.upload'), (req, res) => {
     const { s, err } = upOwn(req, req.params.id);
     if (err) return res.status(err[0]).json({ error: err[1] });
 
@@ -2619,46 +3944,7 @@ export function makeApp(config = CONFIG) {
        destroys a curated vocabulary faster than anything else. The panel
        already refuses these in red — this is the same rule where it counts,
        because the panel is not a security boundary. */
-    if (taglets !== undefined) {
-      /* Matched on the SLUG, but the display name is what gets kept for a
-         suggestion — "Selen Tatsuki" is what an editor needs to read, and
-         `selen-tatsuki` is what the page sent. Both are carried so neither
-         has to be reconstructed. */
-      const raw = [].concat(taglets ?? [])
-        .map((x) => String(x ?? '').trim()).filter(Boolean).slice(0, 40);
-      /* slugify, not a hand-rolled lowercase-and-hyphenate. They agree on
-         `Selen Tatsuki` and disagree on everything with punctuation or an
-         accent in it — so `Amelia Watson!` matched no taglet, was filed as a
-         stray, and sat in the queue as a name the archive already had. The
-         vocabulary is keyed by slugify(); every comparison against it has to
-         be too. */
-      const want = [...new Set(raw.map(slugify))];
-      const found = want.length
-        ? R.prepare(`SELECT id, slug FROM tag
-                      WHERE slug IN (${want.map(() => '?').join(',')})
-                        AND retracted_at IS NULL`).all(...want)
-        : [];
-      const known = new Set(found.map((r) => r.slug));
-
-      /* Names the archive does not have. Kept as text on the clip rather than
-         minted as `proposed` taglets: a proposed taglet is autocompleted, and
-         then the second person to want this name is offered it before anybody
-         agreed it should exist — and a typo becomes vocabulary the moment a
-         second clip picks it up. */
-      const strays = [...new Map(raw
-        .filter((x) => !known.has(slugify(x)))
-        .map((x) => [slugify(x), x.slice(0, 80)])).values()].slice(0, 12);
-
-      tx(W, () => {
-        W.prepare('DELETE FROM snippet_taglet WHERE snippet_id = ?').run(s.id);
-        const ins = W.prepare(
-          `INSERT INTO snippet_taglet(id, snippet_id, tag_id, created_at, updated_at)
-           VALUES(?,?,?,?,?)`);
-        for (const f of found) ins.run(ulid(), s.id, f.id, t, t);
-        W.prepare('UPDATE snippet SET taglet_suggestions = ?, updated_at = ? WHERE id = ?')
-          .run(strays.length ? JSON.stringify(strays) : null, t, s.id);
-      });
-    }
+    if (taglets !== undefined) applyTaglets(req, s.id, taglets);
 
     /* Auto-transcribe on means whisper writes one after approval, which is
        what `none` has always meant. Off with prose means a human wrote it, so
@@ -2725,7 +4011,7 @@ export function makeApp(config = CONFIG) {
    *  The bytes go with it: nothing ever pointed at them, no reviewer spent
    *  attention on them, and leaving them for a sweep that does not exist yet
    *  is how a quarantine mount fills up with things nobody wants. */
-  app.delete('/api/uploads/:id', requireRole('suggester'), (req, res) => {
+  app.delete('/api/uploads/:id', requireCap('snippet.upload'), (req, res) => {
     const { s, err } = upOwn(req, req.params.id);
     if (err) return res.status(err[0]).json({ error: err[1] });
 
@@ -2792,10 +4078,89 @@ export function makeApp(config = CONFIG) {
   function logEvent(req, verb, targetType, targetId, detail = null, changesetId = null) {
     try {
       const p = req?.person ?? null;
+      /* `system` rather than the row's role for a machine. `actor_role` is
+         free text and denormalised on purpose — it is the role AT THE TIME,
+         a fact about the event — and "viewer the recorder" would be true of
+         the row and useless on the line. The recorder's row keeps `viewer` so
+         it can never authorize anything. */
+      const role = p?.provider === 'system' ? 'system' : (p?.role ?? 'viewer');
       EVENT_INS.run(ulid(), now(), p?.id ?? null, p?.handle ?? 'anonymous',
-                    p?.role ?? 'viewer', verb, targetType, String(targetId),
+                    role, verb, targetType, String(targetId),
                     detail ? JSON.stringify(detail) : null, changesetId);
     } catch (e) { console.error('log:', e?.message ?? e); }
+  }
+
+  /** What a finished job did, in the words a person would use.
+   *
+   *  The Pi's work was not merely logged as `anonymous` — it was not logged at
+   *  all. Nothing reachable from `requireIngest` wrote an event, so the only
+   *  record of a promote or a music fetch was the `job` row, which the Worker
+   *  queue reads and nothing else does. "What happened to this snippet" could
+   *  not say "the recorder moved it out of quarantine two minutes ago".
+   *
+   *  Logged against the THING THAT CHANGED and not against the job, which is
+   *  the grain every other line in this table uses — so one snippet's story
+   *  reads in order regardless of whether a person or a Pi moved it, and the
+   *  archive-wide log gets one line per change rather than one per poll.
+   *
+   *  `rescan` is deliberately absent. It changes captures it was not asked
+   *  about and usually changes nothing; what it found is already written onto
+   *  the rows, and a line per sweep would be the noise that makes a log stop
+   *  being read.
+   */
+  function logJobLanded(req, job, status, error) {
+    const ok = status === 'done';
+    const say = (verb, type, id) => {
+      if (!id) return;
+      logEvent(req, verb, type, id,
+               ok ? { job_id: job.id } : { job_id: job.id, why: error ?? null });
+    };
+    switch (job.kind) {
+      case 'promote':
+        if (ok) say('moved the master into the archive', 'snippet', job.snippet_id);
+        return;
+      case 'fetch':
+        return say(ok ? 'fetched the clip' : 'could not fetch the clip',
+                   'snippet', job.snippet_id);
+      case 'purge':
+        if (ok) say('destroyed the file', 'snippet', job.snippet_id);
+        return;
+      case 'clip':
+        if (ok) say('cut the clip', 'snippet', job.snippet_id);
+        return;
+      case 'harvest': {
+        let pay = null;
+        try { pay = job.payload ? JSON.parse(job.payload) : null; } catch { /* not ours */ }
+        if (!pay?.tag_id) return;
+        /* Two different jobs share this kind and the payload says which. The
+           art one is the interesting line; the search one answered a question
+           somebody asked out loud, and its own press is already on the log. */
+        return say(pay.art_url
+          ? (ok ? 'fetched the art' : 'could not fetch the art')
+          : (ok ? 'answered with candidates' : 'found nothing in the catalogue'),
+          'tag', pay.tag_id);
+      }
+      case 'music_probe':
+        return say(ok ? "read the song's page" : "could not read the song's page",
+                   'music', musicJobTarget(job));
+      case 'music_fetch':
+        return say(ok ? 'saved the song' : 'could not save the song',
+                   'music', musicJobTarget(job));
+      case 'audit': {
+        /* Only the FAILURE. A successful audit writes its own line from
+           `auditLanded`, carrying the findings — which is the whole content of
+           the event — and two lines about one job would read as two audits.
+           A failed one writes nothing there, because it returns before it gets
+           that far, so without this a request that never came back would leave
+           no trace at all. */
+        if (ok) return;
+        let pay = null;
+        try { pay = job.payload ? JSON.parse(job.payload) : null; } catch { /* not ours */ }
+        return say('could not audit this stream', 'stream', pay?.stream_id);
+      }
+      default:
+        return;
+    }
   }
 
   /** Turn an applied changeset into the lines a person would write.
@@ -2817,13 +4182,28 @@ export function makeApp(config = CONFIG) {
       const name = (id) => R.prepare('SELECT name FROM tag WHERE id = ?').get(id)?.name ?? id;
 
       /* A junction's rows share a target_id and mean nothing apart: one says
-         which snippet, the other says which taglet. Collected first, written
-         once. */
+         which thing, the other says which taglet. Collected first, written
+         once.
+
+         ALL THREE junctions, which it used to not be: the loop began
+         `if (c.target_type !== 'snippet_taglet') continue`, so a tag coming
+         off a STREAM or a SONG was logged nowhere at all. That is most of the
+         archive — a media tag lives on streams — and it meant the one case
+         retracting a game tag everywhere was written for produced no removal
+         lines whatsoever. */
+      const OWNER = { snippet_taglet: ['snippet_id', 'snippet'],
+                      stream_tag: ['stream_id', 'stream'],
+                      music_tag: ['music_id', 'music'] };
+      const TITLE = { snippet: 'SELECT title AS label FROM snippet WHERE id = ?',
+                      stream: `SELECT COALESCE('#' || idx || ' ' || title, title) AS label
+                                 FROM stream WHERE id = ?`,
+                      music: 'SELECT title AS label FROM music WHERE id = ?' };
       const links = new Map();
       for (const c of rows) {
-        if (c.target_type !== 'snippet_taglet') continue;
-        const l = links.get(c.target_id) ?? { op: c.op };
-        if (c.field === 'snippet_id') l.snippet = c.value ?? c.base_value;
+        const own = OWNER[c.target_type];
+        if (!own) continue;
+        const l = links.get(c.target_id) ?? { op: c.op, type: own[1] };
+        if (c.field === own[0]) l.owner = c.value ?? c.base_value;
         if (c.field === 'tag_id') l.taglet = c.value ?? c.base_value;
         /* A delete arrives as the bare row plus the pair recorded on its way
            out, so whichever arrives second must not downgrade the verb. */
@@ -2831,9 +4211,15 @@ export function makeApp(config = CONFIG) {
         links.set(c.target_id, l);
       }
       for (const l of links.values()) {
-        if (!l.snippet || !l.taglet) continue;
-        logEvent(req, l.op === 'delete' ? 'untagged' : 'tagged', 'snippet', l.snippet,
-                 { taglet: name(l.taglet), taglet_id: l.taglet }, csId);
+        if (!l.owner || !l.taglet) continue;
+        /* The owner's title goes IN, denormalised, for the same reason
+           `actor_handle` is: the archive-wide log otherwise renders a bare
+           ULID and has to join to say more, and after a purge that join
+           returns nothing — so the line that recorded the removal becomes
+           unreadable exactly when it is the only record left. */
+        const title = R.prepare(TITLE[l.type]).get(l.owner)?.label ?? null;
+        logEvent(req, l.op === 'delete' ? 'untagged' : 'tagged', l.type, l.owner,
+                 { taglet: name(l.taglet), taglet_id: l.taglet, title }, csId);
       }
 
       for (const c of rows) {
@@ -2866,12 +4252,15 @@ export function makeApp(config = CONFIG) {
 
   /** One snippet's story, resolved into names.
    *
-   *  Admin-only, alongside the archive-wide log. Editors are arguably the ones
-   *  who most want it, and that is a change of one word here when it is
-   *  wanted — but a surface that names who purged what is the one to be late
-   *  rather than early with.
+   *  `review.decide` — editors and up, the same people the review panel opens
+   *  for. This was admin-only, on the reasoning that a surface naming who
+   *  purged what is one to be late rather than early with. The owner's call
+   *  overrides it, and the reasoning was the wrong way round anyway: the
+   *  person deciding whether an entry is bad is the person who needs to know
+   *  who okayed it, and an editor who cannot ask has to bring every doubt to
+   *  an admin.
    */
-  app.get('/api/snippets/:id/history', requireRole('admin'), (req, res) => {
+  app.get('/api/snippets/:id/history', requireCap('review.decide'), (req, res) => {
     const rows = R.prepare(
       `SELECT * FROM event WHERE target_id = ? ORDER BY at ASC, id ASC LIMIT 500`)
       .all(req.params.id);
@@ -2884,17 +4273,40 @@ export function makeApp(config = CONFIG) {
    *  leaves a tombstone that is invisible in every list, so "who deleted that"
    *  is exactly the line a per-snippet panel can never be opened to read. The
    *  entry that matters most is the one whose subject is gone.
+   *
+   *  `review.decide`, matching the panel and the per-snippet route. Note what
+   *  an editor can now read that they could not: who purged something, and
+   *  every action an admin took. That is the point rather than a side effect —
+   *  a log only one person may read is not a check on anything — but it does
+   *  mean the log is now a surface the trust level of `editor` covers, which
+   *  is worth remembering the day somebody is made one.
    */
-  app.get('/api/events', requireRole('admin'), (req, res) => {
+  app.get('/api/events', requireCap('review.decide'), (req, res) => {
     const limit = Math.min(Math.max(Number(req.query.limit ?? 100) || 100, 1), 500);
     const before = req.query.before ?? null;
     const verb = req.query.verb ? String(req.query.verb) : null;
     const who = req.query.actor ? String(req.query.actor) : null;
+    /* ?target= — "what happened to this thing", which is the other half of the
+       question this table exists to answer and had no caller until now.
+       `ix_event_target(target_id, at DESC)` was built for it: its own comment
+       says "the two questions the log is ever asked, and they want different
+       orders: one snippet's story, and the archive's." One route answers both,
+       so there is no second history endpoint per kind of row to keep in step —
+       `/api/snippets/:id/history` was the first of those and is the last.
+
+       `target_type` is accepted alongside it and is NOT how a target is found:
+       an id is already unique, and requiring the type would mean the caller
+       had to know it. It narrows a type-wide sweep — every `tag` event — which
+       is a different question and a rarer one. */
+    const target = req.query.target ? String(req.query.target) : null;
+    const ttype = req.query.target_type ? String(req.query.target_type) : null;
 
     const where = ['1=1'], params = [];
     if (before) { where.push('e.id < ?'); params.push(String(before)); }
     if (verb) { where.push('e.verb = ?'); params.push(verb); }
     if (who) { where.push('e.actor_handle = ?'); params.push(who); }
+    if (target) { where.push('e.target_id = ?'); params.push(target); }
+    if (ttype) { where.push('e.target_type = ?'); params.push(ttype); }
 
     const rows = R.prepare(
       `SELECT e.* FROM event e WHERE ${where.join(' AND ')}
@@ -2949,10 +4361,22 @@ export function makeApp(config = CONFIG) {
          written before that says `taglet`, and a log that cannot resolve its
          own past is not a log. Both read from the one table now. */
       : (r.target_type === 'tag' || r.target_type === 'taglet')
-        ? R.prepare('SELECT name FROM tag WHERE id = ?').get(r.target_id)
+        ? R.prepare('SELECT name, retracted_at FROM tag WHERE id = ?').get(r.target_id)
         : r.target_type === 'person'
           ? R.prepare('SELECT handle FROM person WHERE id = ?').get(r.target_id)
-          : null;
+          /* Streams and songs, which this could not name. It did not have to
+             while every tag event was about a snippet — and then the junction
+             log learned the other two junctions, so `tagged` and `untagged`
+             started arriving against a stream and a song and rendering as a
+             bare ULID. A stream reads as its own index and title, the way it
+             does in the review queue's name map. */
+          : r.target_type === 'stream'
+            ? R.prepare(`SELECT COALESCE('#' || idx || ' ' || title, title) AS title,
+                                retracted_at FROM stream WHERE id = ?`).get(r.target_id)
+            : r.target_type === 'music'
+              ? R.prepare('SELECT title, retracted_at FROM music WHERE id = ?')
+                .get(r.target_id)
+              : null;
     return {
       id: r.id, at: r.at, verb: r.verb,
       actor: r.actor_handle, actor_role: r.actor_role, actor_id: r.actor_id,
@@ -2961,13 +4385,18 @@ export function makeApp(config = CONFIG) {
          taglet retracted. The line still renders; it just cannot say more than
          the id it holds. */
       target: t ? (t.title ?? t.name ?? t.handle ?? null) : null,
-      target_gone: r.target_type === 'snippet' ? !!t?.retracted_at : !t,
+      /* A row that is tombstoned is not gone and should not read as gone —
+         it is retracted, and a history is exactly where you go to find out
+         what happened to it. Asked of every type that tombstones rather than
+         of snippets alone, which was the old spelling and left a retracted
+         stream looking like a deleted one. */
+      target_gone: t ? !!t.retracted_at : true,
       detail, changeset_id: r.changeset_id,
     };
   };
 
   /** What the transcription queue is doing, for the admin panel. */
-  app.get('/api/transcribe', requireRole('admin'), (req, res) => {
+  app.get('/api/transcribe', requireCap('ops.read'), (req, res) => {
     const ready = whisperReady();
     const rows = R.prepare(
       `SELECT j.id, j.status, j.snippet_id, j.attempts, j.error, j.created_at,
@@ -2991,7 +4420,7 @@ export function makeApp(config = CONFIG) {
   });
 
   /** The big switch. */
-  app.post('/api/transcribe/pause', requireRole('admin'), (req, res) => {
+  app.post('/api/transcribe/pause', requireCap('ops.manage'), (req, res) => {
     const want = req.body?.on;
     transcribeOn = typeof want === 'boolean' ? want : !transcribeOn;
     logEvent(req, transcribeOn ? 'resumed transcription' : 'paused transcription',
@@ -3007,7 +4436,7 @@ export function makeApp(config = CONFIG) {
      One endpoint for all three slots. The alternative was a second copy of
      /api/transcribe per task, and three near-identical reports is how two of
      them come to disagree about what "ready" means. */
-  app.get('/api/models', requireRole('admin'), (req, res) => {
+  app.get('/api/models', requireCap('ops.read'), (req, res) => {
     const t = now();
     const queue = (kind) => R.prepare(
       `SELECT count(*) n,
@@ -3057,7 +4486,7 @@ export function makeApp(config = CONFIG) {
   });
 
   /** Choose a model, or switch a slot off. */
-  app.patch('/api/models/:task', requireRole('admin'), (req, res) => {
+  app.patch('/api/models/:task', requireCap('ops.manage'), (req, res) => {
     const task = String(req.params.task);
     if (!MODEL_TASKS.includes(task)) return res.status(404).json({ error: 'no such task' });
     const m = modelRow(task);
@@ -3098,7 +4527,7 @@ export function makeApp(config = CONFIG) {
   /** Go and ask the sidecar. By hand, because a poll would be waking an idle
    *  container to repeat itself; the panel is opened when somebody wants to
    *  know. */
-  app.post('/api/models/:task/check', requireRole('admin'), async (req, res) => {
+  app.post('/api/models/:task/check', requireCap('ops.manage'), async (req, res) => {
     const task = String(req.params.task);
     if (!MODEL_TASKS.includes(task)) return res.status(404).json({ error: 'no such task' });
     res.json({ model: await modelCheck(task) });
@@ -3106,7 +4535,7 @@ export function makeApp(config = CONFIG) {
 
   /** The OCR switch, the same shape and the same non-persistence as the
    *  transcription one above it. */
-  app.post('/api/ocr/pause', requireRole('admin'), (req, res) => {
+  app.post('/api/ocr/pause', requireCap('ops.manage'), (req, res) => {
     const want = req.body?.on;
     ocrOn = typeof want === 'boolean' ? want : !ocrOn;
     logEvent(req, ocrOn ? 'resumed reading pictures' : 'paused reading pictures',
@@ -3117,7 +4546,7 @@ export function makeApp(config = CONFIG) {
   /** Read this one again. The picture equivalent of retranscribe, and it
    *  refuses the same thing: a transcript a human has edited is the archive's
    *  answer, and a machine must not overwrite it without being told twice. */
-  app.post('/api/snippets/:id/reocr', requireRole('editor'), (req, res) => {
+  app.post('/api/snippets/:id/reocr', requireCap('transcript.run'), (req, res) => {
     const s = R.prepare(
       `SELECT id, kind, container, video_codec, width, height, transcript_status
          FROM snippet WHERE id = ? AND retracted_at IS NULL`).get(req.params.id);
@@ -3146,7 +4575,7 @@ export function makeApp(config = CONFIG) {
   });
 
   /** One job: pause it, put it back, stop it, or give up on it. */
-  app.post('/api/jobs/:id/:verb', requireRole('admin'), (req, res) => {
+  app.post('/api/jobs/:id/:verb', requireCap('job.control'), (req, res) => {
     const verb = String(req.params.verb);
     if (!['pause', 'resume', 'cancel', 'retry', 'dismiss'].includes(verb)) {
       return res.status(404).json({ error: 'no such action' });
@@ -3309,17 +4738,28 @@ export function makeApp(config = CONFIG) {
     res.json({ ok: true, status: 'failed', was_running: killed });
   });
 
-  app.get('/api/grants', requireRole('admin'), (req, res) => {
+  app.get('/api/grants', requireCap('grant.manage'), (req, res) => {
     const gates = R.prepare(
       `SELECT t.gate AS name, count(DISTINCT st.snippet_id) AS clips,
               group_concat(DISTINCT t.slug) AS taglets,
               group_concat(DISTINCT t.id) AS taglet_ids
          FROM tag t LEFT JOIN snippet_taglet st ON st.tag_id = t.id
-        WHERE t.gate IS NOT NULL AND t.retracted_at IS NULL
+        WHERE t.gate IS NOT NULL AND ${TAG_LIVE}
         GROUP BY t.gate ORDER BY t.gate`).all();
+    /* Gate grants only, because this card is the GATE panel: its chips are
+       removable gates and its dropdown offers gate names. A scoped edit grant
+       listed here would render as a gate somebody could revoke by that name,
+       and the DELETE route would then not find it — a row that shows as one
+       thing and behaves as another, which is the ambient-grant hazard arriving
+       through the UI rather than through the table.
+
+       So the filter is not cosmetic and it is not deferred: the panel that
+       shows scoped grants is step seven's, where the first one exists. Until
+       then this card tells the truth by naming what it is about. */
     const people = R.prepare(
-      `SELECT p.id, p.handle, p.role, group_concat(g.name) AS grants
+      `SELECT p.id, p.handle, p.role, group_concat(g.scope_gate) AS grants
          FROM person p JOIN person_grant g ON g.person_id = p.id
+        WHERE g.capability = 'content.view' AND g.scope_gate IS NOT NULL
         GROUP BY p.id ORDER BY p.handle`).all()
       .map((r) => ({ ...r, grants: String(r.grants ?? '').split(',').filter(Boolean) }));
     res.json({
@@ -3341,16 +4781,55 @@ export function makeApp(config = CONFIG) {
     res.json({ grants: grantsOf(req.person?.id ?? null) });
   });
 
-  app.post('/api/people/:id/grants', requireRole('admin'), (req, res) => {
-    const name = String(req.body?.name ?? '').trim().toLowerCase();
-    if (!name || name.length > 64) return res.status(400).json({ error: 'a grant needs a name' });
+  app.post('/api/people/:id/grants', requireCap('grant.manage'), (req, res) => {
+    /* `name` is still the wire word for a gate, because the Admin panel's
+       dropdown sends it and the gate is still the only grant anybody holds.
+       What changed is that the row it writes now says so: `content.view`
+       explicitly rather than by being the only thing this table could mean.
+
+       A caller may instead name a `capability` and its scope directly, which
+       is what step seven's grant screen will send. Both shapes land in the
+       same row. */
+    const asked = String(req.body?.capability ?? '').trim();
+    const capability = asked || 'content.view';
+    if (!grantable(capability)) {
+      return res.status(400).json({ error: `no such capability: ${capability}` });
+    }
+    const gate = String(req.body?.name ?? req.body?.scope_gate ?? '').trim().toLowerCase();
+    const scopeTag = String(req.body?.scope_tag ?? '').trim() || null;
+    const scopeKind = String(req.body?.scope_kind ?? '').trim().toLowerCase() || null;
+
+    /* A content.view grant IS its gate — `grantsOf` selects on `scope_gate IS
+       NOT NULL` and a row without one would name nothing while sitting in the
+       list looking like a permission. Refused here rather than tolerated
+       there. */
+    if (capability === 'content.view' && !gate) {
+      return res.status(400).json({ error: 'a view grant needs a gate name' });
+    }
+    if (gate.length > 64) return res.status(400).json({ error: 'gate name too long' });
+    if (scopeTag) {
+      const t = R.prepare('SELECT id FROM tag WHERE id = ?').get(scopeTag);
+      if (!t) return res.status(404).json({ error: 'no such taglet to scope to' });
+    }
     const p = R.prepare('SELECT id FROM person WHERE id = ?').get(req.params.id);
     if (!p) return res.status(404).json({ error: 'no such person' });
-    // Idempotent on the UNIQUE index: granting twice is not a second grant.
+    /* Idempotent on the UNIQUE index: granting twice is not a second grant.
+       ON CONFLICT DO NOTHING and no longer OR IGNORE, which is not a
+       modernisation. OR IGNORE ignores EVERY constraint failure, so a row that
+       violated NOT NULL was silently dropped and this route answered 201
+       having written nothing. Measured while rebuilding the table, on exactly
+       the case the rebuild exists for. This form ignores the conflict it means
+       and raises everything else. */
     W.prepare(
-      `INSERT OR IGNORE INTO person_grant(id, person_id, name, granted_by, created_at)
-       VALUES(?,?,?,?,?)`).run(ulid(), p.id, name, req.person.id, now());
-    logEvent(req, 'granted', 'person', p.id, { gate: name });
+      `INSERT INTO person_grant(id, person_id, capability, scope_gate, scope_tag,
+                                scope_kind, granted_by, created_at)
+       VALUES(?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`)
+      .run(ulid(), p.id, capability, gate || null, scopeTag, scopeKind,
+           req.person.id, now());
+    logEvent(req, 'granted', 'person', p.id,
+             { capability, ...(gate ? { gate } : {}),
+               ...(scopeTag ? { scope_tag: scopeTag } : {}),
+               ...(scopeKind ? { scope_kind: scopeKind } : {}) });
     /* The generation is what expires every cached list — a grant that does not
        bump it leaves the person looking at the page they had before it, for as
        long as the validator holds. */
@@ -3358,11 +4837,23 @@ export function makeApp(config = CONFIG) {
     res.status(201).json({ grants: grantsOf(p.id) });
   });
 
-  app.delete('/api/people/:id/grants/:name', requireRole('admin'), (req, res) => {
-    W.prepare('DELETE FROM person_grant WHERE person_id = ? AND name = ?')
+  app.delete('/api/people/:id/grants/:name', requireCap('grant.manage'), (req, res) => {
+    /* `:name` is a GATE name, which is what the Admin panel's chips carry, so
+       this route revokes viewing grants and says so in the WHERE. Without the
+       capability term it would also delete a scoped edit grant that happened
+       to carry the same string in `scope_gate` — and since a scoped grant's
+       gate is NULL that cannot happen today, which is exactly why it is worth
+       pinning now rather than after the first one exists.
+
+       Revoking a scoped grant is step seven's route, because it is addressed
+       by tag rather than by gate and a path segment cannot carry a conjunction
+       honestly. */
+    W.prepare(
+      `DELETE FROM person_grant
+        WHERE person_id = ? AND capability = 'content.view' AND scope_gate = ?`)
       .run(req.params.id, String(req.params.name).toLowerCase());
     logEvent(req, 'revoked', 'person', req.params.id,
-             { gate: String(req.params.name).toLowerCase() });
+             { capability: 'content.view', gate: String(req.params.name).toLowerCase() });
     bumpGeneration(W);
     res.json({ grants: grantsOf(req.params.id) });
   });
@@ -3371,7 +4862,7 @@ export function makeApp(config = CONFIG) {
    *  editor: flagging `funny` as a gate would hide a third of the archive from
    *  everyone, which is a bigger blast radius than any single edit an editor
    *  can make. */
-  app.post('/api/taglets/:id/gate', requireRole('admin'), (req, res) => {
+  app.post('/api/taglets/:id/gate', requireCap('gate.set'), (req, res) => {
     const t = R.prepare(
       'SELECT id, slug FROM tag WHERE id = ? AND retracted_at IS NULL').get(req.params.id);
     if (!t) return res.status(404).json({ error: 'no such taglet' });
@@ -3410,9 +4901,16 @@ export function makeApp(config = CONFIG) {
      the recorder already downloads those directly, no yt-dlp and no account.
      The two lists had drifted into being exact opposites: this one took the
      shape the recorder refuses and refused the shape the recorder takes. */
+  /* `pbs.twimg.com` is the same distinction one step further on. `twitter.com`
+     gets you a tweet's VIDEO, through yt-dlp, and can never get you its
+     pictures — yt-dlp has no image support at all, so an image-only post
+     failed however it was pasted, with a message about X stonewalling that
+     was the wrong diagnosis. The picture is a plain file on a CDN, which is
+     the shape `cdn.discordapp.com` already covers, so what gets pasted is the
+     image address rather than the post. */
   const LINK_HOSTS = (process.env.TENMA_LINK_HOSTS
     || 'youtube.com,youtu.be,twitch.tv,twitter.com,x.com,'
-     + 'cdn.discordapp.com,media.discordapp.net')
+     + 'cdn.discordapp.com,media.discordapp.net,pbs.twimg.com')
     .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
 
   /* ── which Discord channels may be pasted from ──────────────────────────
@@ -3581,11 +5079,29 @@ export function makeApp(config = CONFIG) {
         u.searchParams.delete(k);
       }
       u.hostname = 'cdn.discordapp.com';
+    } else if (host === 'pbs.twimg.com') {
+      /* Twitter's own resizer, and the same call as the Discord one above for
+         the same reason: `name` is the size, and what the browser hands you
+         from "Copy image address" is whatever size the timeline happened to
+         be showing — `name=small`, `name=360x360`, `name=900x900`. Keeping
+         that is an archive of thumbnails. `orig` is the upload.
+
+         `format` STAYS, unlike Discord's, because it is not a resize — it is
+         the only place Twitter says whether the file is a JPEG or a PNG, the
+         path having no extension at all. Dropping it would leave the
+         recorder naming a picture `.mp4`.
+
+         The older `/media/<id>.jpg:large` shape carries the size after a
+         colon in the PATH instead, so it is normalised the same way rather
+         than left as the one spelling that still archives a thumbnail. */
+      const colon = u.pathname.lastIndexOf(':');
+      if (colon > u.pathname.lastIndexOf('/')) u.pathname = u.pathname.slice(0, colon);
+      u.searchParams.set('name', 'orig');
     }
     return u.href;
   };
 
-  app.post('/api/uploads/link', requireRole('suggester'), (req, res) => {
+  app.post('/api/uploads/link', requireCap('snippet.upload'), (req, res) => {
     const me = req.person?.id ?? null;
     if (!me) return res.status(401).json({ error: 'sign in first' });
 
@@ -3730,7 +5246,7 @@ export function makeApp(config = CONFIG) {
      probe. The one route that makes them builds the payload out of capture
      rows instead, so the URLs are always ones the archive already recorded. */
   const JOB_KINDS = ['fetch', 'promote', 'purge', 'normalize', 'transcribe',
-                     'ocr', 'music_probe', 'music_fetch', 'clip'];
+                     'ocr', 'music_probe', 'music_fetch', 'clip', 'audit'];
   /* What the RECORDER may claim. `normalize` is missing on purpose: it runs in
      this process, against the cache mount, and a Pi that claimed one would
      hold a lease on work it cannot do and cannot see the files for. Kept as a
@@ -3753,8 +5269,32 @@ export function makeApp(config = CONFIG) {
      product is a file the person downloads rather than one the archive
      ingests, which is why it lands in quarantine: that is the only place this
      container may write, and a clip is a working file by definition. */
+  /* `audit` is the Pi's, and it could not be anything else: it reads the NAS,
+     runs ffprobe, and asks Helix which VOD a broadcast became. What comes home
+     is a PLAN — findings, and proposed field changes — which the archive turns
+     into an open changeset rather than applying. That is the shape the whole
+     round rests on: an audit result is somebody's opinion about a row, and the
+     archive already has a reviewable, attributable, undoable way to hold one
+     of those. */
+  /* `chat_repair` is the Pi's, and it is the one kind whose whole reason for
+     existing is that it downloads. An audit will not pull chat with nobody
+     watching — that rule is the recorder's and predates this — so a chat too
+     short to merge comes home as a question instead, and saying yes to it
+     queues this. Visible, cancellable, one at a time, and the bandwidth is
+     spent because somebody clicked. Its quieter half, `give_up`, spends
+     nothing and is still the Pi's: the ledger it writes lives there. */
+  /* `pull` is `chat_repair`'s sibling and the gap beside it. A repair mends a
+     capture that is on the NAS and short; a pull gets one that was never
+     there. That is the ordinary shape of a collab — the recorder was given
+     one link, the other platform's broadcast exists here as a URL somebody
+     pasted onto a capture and nothing more — and until this kind existed the
+     only answers that question offered were "there was no broadcast" and "I
+     did not keep it", both of which are false on that entry. Same reasoning
+     as chat_repair for why it is the Pi's: it downloads, and it writes to a
+     NAS this container mounts read-only on purpose. */
   const PI_KINDS = ['fetch', 'promote', 'purge', 'rescan', 'harvest',
-                    'music_probe', 'music_fetch', 'clip'];
+                    'music_probe', 'music_fetch', 'clip', 'audit',
+                    'chat_repair', 'pull'];
   /* `ocr` is not the Pi's either, and for a different reason than normalize:
      the model lives in a sidecar container on THIS docker network, so a Pi
      that claimed one would be holding a lease on work it cannot reach. */
@@ -3779,11 +5319,24 @@ export function makeApp(config = CONFIG) {
    *  `proposed` exists for the day a suggester may ask for one. */
   const enqueueJob = (kind, { snippetId = null, url = null, payload = null, by = null } = {}) => {
     const t = now(), id = ulid();
+    /* Lifted from the payload rather than passed separately, deliberately.
+       Every stream-scoped caller already puts `stream_id` there because that
+       is what the worker reads, and a second parameter would be a second
+       place for the two to disagree — one caller setting the column and not
+       the payload makes a job the panel can see and the Pi cannot act on.
+       One source, copied out.
+       Checked against the table because the column has a foreign key: a
+       payload naming a stream that does not exist would otherwise take down
+       an enqueue that has nothing wrong with it. */
+    const sid = payload && typeof payload.stream_id === 'string'
+      && W.prepare('SELECT 1 FROM stream WHERE id = ?').get(payload.stream_id)
+      ? payload.stream_id : null;
     W.prepare(
-      `INSERT INTO job(id, kind, status, snippet_id, url, payload,
+      `INSERT INTO job(id, kind, status, snippet_id, stream_id, url, payload,
                        requested_by, approved_by, created_at, updated_at)
-       VALUES(?,?,'approved',?,?,?,?,?,?,?)`)
-      .run(id, kind, snippetId, url, payload ? JSON.stringify(payload) : null, by, by, t, t);
+       VALUES(?,?,'approved',?,?,?,?,?,?,?,?)`)
+      .run(id, kind, snippetId, sid, url,
+           payload ? JSON.stringify(payload) : null, by, by, t, t);
     return id;
   };
 
@@ -3793,8 +5346,376 @@ export function makeApp(config = CONFIG) {
    * a job that could reach one URL and not the other must not silently mark
    * the second one anything.
    */
-  const PROBE_INT = ['file_duration_s', 'width', 'height'];
+  /* `remote_duration_s` is here, so a probe that reached the platform writes
+     what it said. It is NOT `file_duration_s` and must never be written as
+     one: that column is what ffprobe measured off the disk, and collapsing
+     the two would destroy the disagreement this exists to show. */
+  const PROBE_INT = ['file_duration_s', 'width', 'height', 'remote_duration_s'];
   const PROBE_TEXT = ['container', 'video_codec', 'audio_codec'];
+
+  /* What an audit is allowed to propose, per scope. A subset of WRITABLE and
+     not a reference to it: the audit observes files and platforms, so it has
+     business proposing what it measured and none at all proposing a title
+     somebody typed or a stream's index. Listed here rather than filtered at
+     the call site because "what may a worker's opinion touch" is a fact about
+     the system, not about one report. */
+  const AUDIT_CAP_FIELDS = new Set([
+    'url', 'title', 'video_path', 'chat_path', 'file_duration_s',
+    'remote_start_wall', 'local_start_wall', 'local_start_precision_s',
+    'video_state', 'chat_state',
+  ]);
+  const AUDIT_STREAM_FIELDS = new Set([
+    'title', 'started_at', 'tz_offset_min', 'chat_path', 'chat_sources',
+    /* The description of the merged file, which has to travel WITH the path
+       and used to travel nowhere. `lookupStream` already reads these five
+       back so ls-audit's diff can see them as unchanged on a re-run — and
+       that read was the tell: the archive was showing a worker values it
+       would not accept from it, so every sweep proposed them again and this
+       filter dropped them again, silently, forever.
+
+       The visible symptom was worse than a collision. `chat_path` landed
+       alone, `chat_meta_path` in apply() then cleared the five as belonging
+       to the previous file, and the theater — handed a log that could not
+       say what it was — warned that a brand-new merge came from an old
+       storage format and might be missing messages. */
+    'chat_version', 'chat_messages', 'chat_first_ms', 'chat_last_ms',
+    'chat_moderation',
+  ]);
+
+  /** An audit came home. Findings go in the log; changes become a proposal.
+   *
+   *  Deliberately NOT applied. `rescanLanded` writes straight to the capture
+   *  rows and is right to — a probe reports what ffprobe measured, and there
+   *  is no editorial question in a codec name. An audit is different in kind:
+   *  it reconciles a vault, a filesystem and two platforms, and every
+   *  disagreement it finds has a wrong side that cannot be known from here.
+   *  So it proposes, and the review panel renders it like every other opinion
+   *  about a row — reviewable, attributable, undoable.
+   *
+   *  The Pi sends `{platform, remote_id}` and never a capture id, which is the
+   *  same split the rest of the pipeline uses: the worker observes, the
+   *  archive addresses. A worker that named row ids would be a worker that
+   *  could point one at another stream's video.
+   */
+  function auditLanded(job, status, result, error) {
+    if (status !== 'done' || !result || typeof result !== 'object') return;
+    const idx = Number(result.idx ?? JSON.parse(job.payload ?? '{}')?.idx);
+    const s = Number.isFinite(idx)
+      ? W.prepare('SELECT id, idx FROM stream WHERE idx = ?').get(idx) : null;
+    if (!s) {
+      console.error(`audit ${job.id}: no stream #${idx}`);
+      return;
+    }
+
+    /* The findings, as one event. They are a reading rather than a change —
+       "the file is on disk", "this id is a broadcast id" — so they belong in
+       the log where the history panel already shows them, next to whatever
+       the audit went on to propose. */
+    const findings = Array.isArray(result.findings) ? result.findings : [];
+    const worst = String(result.worst ?? 'ok');
+    try {
+      logEvent({ person: recorder() }, 'audited this stream', 'stream', s.id, {
+        worst,
+        checked: findings.length,
+        // Only the ones worth reading back. A log line listing eight ticks is
+        // the summary-count mistake in a different place.
+        notable: findings.filter((f) => f?.level !== 'ok')
+          .map((f) => `[${String(f.platform ?? '').toUpperCase()}] ${f.message}`)
+          .slice(0, 12),
+      });
+    } catch (e) { console.error(`audit ${job.id}: log failed:`, e?.message ?? e); }
+
+    /* The MEASUREMENTS, which the log deliberately does not carry: the two
+       platform clocks, the durations, how much chat there is and whether it
+       got merged. A log line is a sentence about one thing being wrong; this
+       is the page somebody reads to decide whether a run went well.
+
+       One row per stream, replaced. A measurement describes the entry as it
+       is NOW, and the previous audit's numbers describe an entry that has
+       since been merged or repaired — keeping them would be keeping numbers
+       whose only honest label is "these used to be true". That an audit ran
+       at all survives in the event above.
+
+       The findings are stored BESIDE the measurements even though they are
+       already in the log, because the report is read as one thing: a panel
+       that drew the numbers and then made somebody open the history for the
+       verdicts would be splitting one report across two screens. The log
+       keeps its copy for history; this one is the current state.
+
+       An audit from a worker too old to measure sends no `report`, and that
+       must leave the entry with no row rather than a row full of nulls —
+       silence is readable as "not measured", a row of dashes is not. */
+    /* `!Array.isArray` is not belt-and-braces: `typeof [] === 'object'`, so a
+       list sails through the object check, gets stored, and comes back out of
+       the route spread over an object — a panel drawing `0: 1, 1: 2` where
+       the measurements were. Worse, it does that by REPLACING a good report,
+       so one malformed run throws away numbers that were right. */
+    if (result.report && typeof result.report === 'object'
+        && !Array.isArray(result.report)) {
+      try {
+        /* The read-back rides on the same row and the same upsert. Its own
+           table would be a second thing to keep in step with a report it is
+           always written beside, and its own write would be a second way for
+           half of an audit to land. `!Array.isArray` for the same reason as
+           above: a list passes `typeof === 'object'` and comes back out
+           spread over an object. */
+        const st = (result.state && typeof result.state === 'object'
+                    && !Array.isArray(result.state))
+          ? JSON.stringify(result.state) : null;
+        W.prepare(`INSERT INTO audit_report(stream_id, idx, worst, body,
+                     findings, state, ran_at, ran_by)
+                   VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(stream_id) DO UPDATE SET
+                     idx = excluded.idx, worst = excluded.worst,
+                     body = excluded.body, findings = excluded.findings,
+                     -- A worker too old to send one must not blank the last
+                     -- good read-back: it kept the value it could not have
+                     -- known about, and excluded.state alone would clear it.
+                     state = COALESCE(excluded.state, audit_report.state),
+                     ran_at = excluded.ran_at, ran_by = excluded.ran_by`)
+          .run(s.id, s.idx ?? null, worst, JSON.stringify(result.report),
+               JSON.stringify(findings), st, now(), recorder()?.id ?? null);
+      } catch (e) {
+        console.error(`audit ${job.id}: report failed:`, e?.message ?? e);
+      }
+    }
+
+    /* What it could not settle. Replaced wholesale rather than added to: this
+       audit already consulted the claims before asking, so its list IS what is
+       still open, and anything missing from it has been answered or stopped
+       being true. Accumulating would mean deciding in SQL whether a claim
+       settles a question — a second copy of a rule the worker already owns,
+       and the reason a panel would start showing questions answered weeks ago.
+       Done in one transaction so a half-replaced set is never visible. */
+    try {
+      const asked = (Array.isArray(result.questions) ? result.questions : [])
+        .filter((q) => q && typeof q === 'object' && q.kind && q.message);
+      tx(W, () => {
+        W.prepare('DELETE FROM question WHERE subject_type = ? AND subject = ?')
+          .run('stream', s.id);
+        for (const q of asked) {
+          W.prepare(`INSERT INTO question(id, subject_type, subject, platform,
+                       kind, message, answers, asked_at, asked_by)
+                     VALUES(?,'stream',?,?,?,?,?,?,?)`)
+            .run(ulid(), s.id, q.platform ?? null, String(q.kind),
+                 String(q.message),
+                 JSON.stringify(Array.isArray(q.answers) ? q.answers : []),
+                 now(), recorder()?.id ?? null);
+        }
+      });
+      if (asked.length) bumpGeneration(W);
+    } catch (e) {
+      console.error(`audit ${job.id}: questions failed:`, e?.message ?? e);
+    }
+
+    /* Now the plan. Every value is compared against what the archive holds and
+       dropped when it already matches — an audit that proposed forty no-op
+       changes every run would make the review queue useless, which is the
+       failure `_classify` exists to prevent on the ls-audit side. */
+    const changes = [];
+    const same = (a, b) => String(a ?? '') === String(b ?? '');
+
+    const sIn = result.stream && typeof result.stream === 'object' ? result.stream : {};
+    for (const [field, value] of Object.entries(sIn)) {
+      if (!AUDIT_STREAM_FIELDS.has(field) || value === null || value === undefined) continue;
+      /* `pinned()` — a field a person has already decided is not a field a
+         timer may re-decide. The ingest route learned this the hard way: an
+         editor corrected a title, the next packet put the recorder's back, and
+         the log went on reporting the human's value while the row held the
+         machine's. */
+      if (pinned(W, s.id, field)) continue;
+      if (same(W.prepare(`SELECT ${field} AS v FROM stream WHERE id = ?`).get(s.id)?.v, value)) {
+        continue;
+      }
+      changes.push({ op: 'update', target_type: 'stream', target_id: s.id, field, value });
+    }
+
+    for (const c of (Array.isArray(result.captures) ? result.captures : [])) {
+      const plat = String(c?.platform ?? '').toUpperCase().slice(0, 2);
+      if (!['YT', 'TW'].includes(plat)) continue;
+      const row = W.prepare(
+        'SELECT * FROM capture WHERE stream_id = ? AND platform = ?').get(s.id, plat);
+      /* No row means the audit found a platform the archive has never heard
+         of. Creating one from here is a different decision than correcting a
+         field — it is the ingest route's job, with its pairing rules — so
+         this says so in the findings and proposes nothing. */
+      if (!row) continue;
+      /* And a capture whose id has moved on is the succession case, which the
+         ingest route handles with `final_remote_id` and a uniqueness check.
+         A changeset could repoint it silently past both, so it does not. */
+      if (c.remote_id && !same(row.remote_id, c.remote_id)) continue;
+      for (const [field, value] of Object.entries(c)) {
+        if (!AUDIT_CAP_FIELDS.has(field) || value === null || value === undefined) continue;
+        if (same(row[field], value)) continue;
+        changes.push({ op: 'update', target_type: 'capture', target_id: row.id,
+                       field, value });
+      }
+    }
+
+    if (!changes.length) return;
+    try {
+      /* `trusted`, because the author is a worker and not a person, and
+         `autoApply: false` explicitly: `can()` on a viewer-role recorder would
+         answer no anyway, and relying on that would mean this line changed
+         meaning the day the recorder's role did. */
+      propose(W, { changes, trusted: true, autoApply: false,
+                   reason: `audit of #${s.idx}` });
+      bumpGeneration(W);
+    } catch (e) {
+      /* Never fatal. The job HAS landed and the findings are already logged;
+         answering a landed report with a 500 is what makes a worker retry
+         into a duplicate. */
+      console.error(`audit ${job.id}: could not propose:`, e?.message ?? e);
+    }
+  }
+
+  /** A chat repair came home.
+   *
+   *  It merges a chat on the NAS and reports what it did — and until now
+   *  nothing read that, so the archive never learned the entry had a new
+   *  merged file. `chat_path` still pointed at the old short capture, the
+   *  review queue stayed empty, and the only way to close the loop was to
+   *  know, unprompted, to run a second audit.
+   *
+   *  That is the whole gap between "the repair finished" and "my data is
+   *  right", and it was being crossed by the person rather than by the
+   *  archive.
+   *
+   *  So a repair that actually merged something queues the audit itself. NOT
+   *  a direct write: what changed on disk is a file this process cannot see,
+   *  and the audit is the thing that measures it, proposes `chat_path` and
+   *  the description together, and fills the report the panel draws. Writing
+   *  the path from here would be guessing at a filename and skipping every
+   *  check that makes the write trustworthy.
+   *
+   *  Only when it merged. A repair that ran and found nothing, or that was
+   *  told to stop waiting, changed no file — auditing after those is a
+   *  sweep that proposes nothing, which is how a queue fills with noise.
+   */
+  function reauditAfter(job, result, say) {
+    const sid = job.stream_id
+      ?? (() => { try { return JSON.parse(job.payload ?? '{}').stream_id ?? null; }
+                  catch { return null; } })();
+    const s = sid
+      ? W.prepare('SELECT id, idx FROM stream WHERE id = ? AND retracted_at IS NULL').get(sid)
+      : null;
+    if (!s?.idx) return;
+    /* Already one in flight? The person may have pressed Audit again while
+       the work was running, and two audits of one entry produce two
+       changesets proposing the same thing. */
+    const open = W.prepare(
+      `SELECT id FROM job WHERE kind = 'audit' AND status IN ('approved','claimed')
+         AND stream_id = ?`).get(s.id);
+    if (open) return;
+    try {
+      enqueueJob('audit', { payload: { idx: s.idx, stream_id: s.id },
+                            by: recorder()?.id ?? null });
+      logEvent({ person: recorder() }, say, 'stream', s.id,
+               { idx: s.idx, platform: result.platform ?? null });
+      bumpGeneration(W);
+    } catch (e) {
+      /* Never fatal. The work HAS landed and its own row says so; failing
+         the report of a job that succeeded is what makes a worker retry. */
+      console.error(`${job.kind} ${job.id}: could not queue the audit:`, e?.message ?? e);
+    }
+  }
+
+  function chatRepairLanded(job, status, result) {
+    if (status !== 'done' || !result || typeof result !== 'object') return;
+    if (result.action === 'give_up' || !result.merged) return;
+    reauditAfter(job, result, 'queued an audit after a chat repair');
+  }
+
+  /** A file that was never here, fetched.
+   *
+   *  Re-audited on `ran` and not only on `merged`, which is where this
+   *  differs from a repair: a pulled VIDEO merges nothing, and it is the
+   *  single largest change that can happen to an entry. Waiting for a merge
+   *  would mean the one case that most needs re-reading is the one case that
+   *  never gets re-read.
+   */
+  function pullLanded(job, status, result) {
+    if (status !== 'done' || !result || typeof result !== 'object') return;
+    if (!result.ran && !result.merged) return;
+    reauditAfter(job, result, 'queued an audit after a pull');
+  }
+
+  /** A file the recorder was asked to destroy, destroyed.
+   *
+   *  THIS IS THE PIECE THAT MAKES DELETING SAFE. Until now a finished purge
+   *  wrote a log line and nothing else — fine for a snippet, which is
+   *  retracted before it is ever queued, and wrong for a capture: the file
+   *  would be gone and `video_path` would still name it. Doing this by hand
+   *  had the same hole in the other order, and no order closes it, because
+   *  the archive and the disk are two things and only a report can join them.
+   *
+   *  So the row is corrected HERE, on the report, and never at the moment the
+   *  button is pressed. A purge that failed — a permission, a read-only
+   *  mount, a worker that died — leaves the row exactly as it was, still
+   *  naming a file that is still there. That is the only arrangement where
+   *  "the archive says it is gone" means it is gone.
+   *
+   *  `declined`, not `lost`. The state vocabulary already carries the
+   *  difference and `recompute()` already reads it: `lost` is a file that
+   *  went missing, `declined` is one somebody removed on purpose, and
+   *  recompute excludes declined from the sums so a deliberate deletion does
+   *  not make the entry read as damaged. The path is cleared because it names
+   *  nothing now; what was deleted survives in the event log, which is where
+   *  an irreversible act belongs.
+   */
+  function purgeLanded(job, status, result, error) {
+    let pay = null;
+    try { pay = job.payload ? JSON.parse(job.payload) : null; } catch { /* not ours */ }
+    /* Snippet purges come through here too and are none of this function's
+       business — they are keyed by `snippet_id` and were finished the moment
+       the file went. */
+    if (!pay?.capture_id) return;
+    const c = W.prepare('SELECT id, stream_id, platform, video_path FROM capture WHERE id = ?')
+      .get(pay.capture_id);
+    if (!c) return;
+    if (status !== 'done') {
+      /* Said out loud. A deletion that did not happen, left silent, is a
+         person believing they have reclaimed space they still owe. */
+      try {
+        logEvent({ person: recorder() }, 'could not delete the duplicate recording',
+                 'stream', c.stream_id,
+                 { platform: c.platform, path: pay.path ?? c.video_path,
+                   why: error ?? 'the worker did not say' });
+      } catch (e) { console.error(`purge ${job.id}: log failed:`, e?.message ?? e); }
+      return;
+    }
+    /* The path it actually deleted, against the one the row still holds. They
+       differ when somebody corrected `video_path` while the job was queued,
+       and then this report is about a file the row no longer claims — so it
+       clears nothing and says so. */
+    if (pay.path && c.video_path && pay.path !== c.video_path) {
+      try {
+        logEvent({ person: recorder() }, 'deleted a recording the entry had moved on from',
+                 'stream', c.stream_id, { platform: c.platform, deleted: pay.path,
+                                          now_holds: c.video_path });
+      } catch { /* the log is a courtesy here */ }
+      return;
+    }
+    try {
+      tx(W, () => {
+        W.prepare(`UPDATE capture SET video_path = NULL, video_state = 'declined',
+                     video_ok = 0, video_bytes = NULL, updated_at = ?
+                    WHERE id = ?`).run(now(), c.id);
+      });
+      logEvent({ person: recorder() }, 'deleted a duplicate recording', 'stream',
+               c.stream_id, { platform: c.platform, path: pay.path ?? null,
+                              bytes: pay.bytes ?? null });
+      /* Derived state last, and outside the transaction for the same reason
+         apply() does it there: recompute stats every capture file, and a
+         failure here leaves stale columns that the next write fixes — where
+         a throw would leave the row half-corrected. */
+      try { recompute(W, c.stream_id, { mediaRoot: config.mediaRoot }); }
+      catch (e) { console.error(`purge ${job.id}: recompute failed:`, e?.message ?? e); }
+      bumpGeneration(W);
+    } catch (e) {
+      console.error(`purge ${job.id}: could not correct the row:`, e?.message ?? e);
+    }
+  }
 
   function rescanLanded(job, status, result) {
     if (status !== 'done' || !result || typeof result !== 'object') return;
@@ -3814,6 +5735,32 @@ export function makeApp(config = CONFIG) {
          check, a timeout — and a probe that failed is not a VOD that died.
          Leaving the column alone is the whole point of it being nullable. */
       if (r.alive === 0 || r.alive === 1) { put('alive', r.alive); put('checked_at', t); }
+
+      /* WHEN THE BROADCAST BEGAN, and only into an empty column.
+       *
+       * The platform's own `release_timestamp` is rank 80 in the recorder's
+       * witness table. The recorder's own measurement at detection is rank
+       * 100 and is the one number in this system nothing can ever take
+       * again — so a probe fills a gap here and never, ever overwrites a
+       * reading. `remote_start_wall` holding something already means some
+       * witness answered, and a network call is not entitled to argue with
+       * it from here.
+       *
+       * When they disagree it is said out loud instead: the row keeps what
+       * it had, and `note` carries what the platform thinks, so the
+       * disagreement reaches a person rather than being resolved by
+       * whichever ran last. */
+      const start = Number(r.remote_start_wall);
+      if (Number.isFinite(start) && start > 0) {
+        const held = W.prepare('SELECT remote_start_wall FROM capture WHERE id = ?')
+          .get(id)?.remote_start_wall;
+        if (held === null || held === undefined) put('remote_start_wall', Math.trunc(start));
+        else if (Math.abs(held - start) > 2) {
+          logEvent({ person: recorder() }, 'the platform disagrees about when a broadcast began',
+                   'stream', cap.stream_id,
+                   { capture: id, held, platform_says: Math.trunc(start) });
+        }
+      }
 
       for (const k of PROBE_INT) {
         if (Number.isFinite(Number(r[k]))) put(k, Math.trunc(Number(r[k])));
@@ -4053,6 +6000,18 @@ export function makeApp(config = CONFIG) {
       const n = Array.isArray(p?.captures) ? p.captures.length : 0;
       return n ? `re-read ${n} capture${n === 1 ? '' : 's'}` : 're-read a stream';
     }
+    if (r.kind === 'audit') {
+      return p?.idx ? `audit #${p.idx}` : 'audit a stream';
+    }
+    if (r.kind === 'pull') {
+      /* Which file, on which platform, for which entry. All three, because
+         one entry can have four of these open at once and "pull" four times
+         in the queue says nothing about any of them. */
+      const what = p?.what === 'both' ? 'video and chat' : (p?.what ?? 'file');
+      const where = p?.platform === 'youtube' ? 'YouTube'
+        : p?.platform === 'twitch' ? 'Twitch' : null;
+      return `pull #${p?.idx ?? '?'}'s ${where ? `${where} ` : ''}${what}`;
+    }
     if (r.kind === 'music_probe' || r.kind === 'music_fetch') {
       const verb = r.kind === 'music_probe' ? 'read' : 'download';
       /* `channel`, not an artist column — there is not one. A song that has
@@ -4072,8 +6031,24 @@ export function makeApp(config = CONFIG) {
 
   const jobRow = (r) => ({
     id: r.id, kind: r.kind, status: r.status,
-    snippet_id: r.snippet_id, url: r.url,
-    payload: r.payload ? JSON.parse(r.payload) : null,
+    snippet_id: r.snippet_id, stream_id: r.stream_id ?? null, url: r.url,
+    /* Null rather than a throw. This used to be a bare `JSON.parse`, and the
+       route it is reached through is the recorder's CLAIM — so one row whose
+       payload was not valid JSON took the whole archive process down the next
+       time the Pi polled, which it does every twenty-five seconds for ever.
+       Nothing writes a bad payload today; everything goes through
+       JSON.stringify. But "nothing writes one" is not a property this can
+       rely on, because the failure is not a 500 on one request — it is an
+       unhandled throw out of a handler, and the server does not come back.
+       A hand-edited row, a restore from a truncated dump, or one future
+       caller passing a string is enough.
+       The worker is handed `null` and fails the job with a reason, which
+       lands in the queue where somebody can see it. That is the same trade
+       `read_meta` makes on the Pi: unreadable reads as absent, because every
+       caller's next move is better than a crash. */
+    payload: r.payload ? (() => {
+      try { return JSON.parse(r.payload); } catch { return null; }
+    })() : null,
     attempts: r.attempts, claimed_by: r.claimed_by, claimed_at: r.claimed_at,
     result_path: r.result_path, error: r.error,
     created_at: r.created_at, finished_at: r.finished_at,
@@ -4081,7 +6056,7 @@ export function makeApp(config = CONFIG) {
 
   /** Enqueue. Editors only — every kind here spends something that is not
    *  theirs to spend: disk, the recorder's time, or a file. */
-  app.post('/api/jobs', requireRole('editor'), (req, res) => {
+  app.post('/api/jobs', requireCap('job.create'), (req, res) => {
     const { kind, snippet_id = null, url = null, payload = null } = req.body ?? {};
     if (!JOB_KINDS.includes(kind)) {
       return res.status(400).json({ error: `kind must be one of ${JOB_KINDS}` });
@@ -4107,13 +6082,13 @@ export function makeApp(config = CONFIG) {
   /* One job, by id. The list route filters by status, which cannot answer
      "is THIS one finished yet" — and polling a 50-row list to find one row is
      a lot of rows to move to learn one word. */
-  app.get('/api/jobs/:id', requireRole('editor'), (req, res) => {
+  app.get('/api/jobs/:id', requireCap('job.read'), (req, res) => {
     const j = R.prepare('SELECT * FROM job WHERE id = ?').get(req.params.id);
     if (!j) return res.status(404).json({ error: 'no such job' });
     res.json({ job: jobRow(j) });
   });
 
-  app.get('/api/jobs', requireRole('editor'), (req, res) => {
+  app.get('/api/jobs', requireCap('job.read'), (req, res) => {
     const status = req.query.status ? String(req.query.status) : null;
     const limit = Math.min(Math.max(Number(req.query.limit ?? 50) || 50, 1), config.pageMax);
     const rows = status
@@ -4265,6 +6240,14 @@ export function makeApp(config = CONFIG) {
    */
   function jobLanded(job, status, resultPath, error, result = null) {
     if (job.kind === 'rescan') return void rescanLanded(job, status, result);
+    if (job.kind === 'audit') return void auditLanded(job, status, result, error);
+    if (job.kind === 'chat_repair') return void chatRepairLanded(job, status, result);
+    if (job.kind === 'pull') return void pullLanded(job, status, result);
+    /* `return void` like every other kind here. purgeLanded ignores a snippet
+       purge on its own (no `capture_id` in the payload), so returning costs
+       nothing and keeps this list one shape — a single entry that falls
+       through is how a kind ends up in two handlers. */
+    if (job.kind === 'purge') return void purgeLanded(job, status, result, error);
     if (job.kind === 'harvest') return void harvestLanded(job, status, result, resultPath);
     if (job.kind === 'music_probe') return void musicProbeLanded(job, status, result, error);
     if (job.kind === 'music_fetch') {
@@ -4287,6 +6270,38 @@ export function makeApp(config = CONFIG) {
         .run(JSON.stringify(pay), now(), job.id);
       return;
     }
+    /* A promote with no snippet on it is either a poster or an uploaded song.
+       A poster needs nothing: `thumb_path` was written as the destination the
+       file will have, so the row is already correct and the move makes it
+       true. A SONG is different — `video_path` is deliberately not written
+       ahead of time, because it is what `preserved` is computed from and what
+       /media/song/:id serves, and a row claiming to hold a copy that is still
+       in quarantine would be a card offering a player that 404s. So the path
+       is written HERE, when the recorder says the bytes are in place. */
+    if (job.kind === 'promote' && !job.snippet_id) {
+      let pay = null;
+      try { pay = job.payload ? JSON.parse(job.payload) : null; } catch { /* not ours */ }
+      const mid = String(pay?.music_id ?? '');
+      if (!mid || !pay?.to) return;
+      const t2 = now();
+      if (status !== 'done') {
+        W.prepare(`UPDATE music SET fetch_status = 'failed', fetch_note = ?, updated_at = ?
+                    WHERE id = ?`)
+          .run(String(error ?? 'the recorder could not move it').slice(0, 300), t2, mid);
+        bumpGeneration(W);
+        return;
+      }
+      /* The path the ARCHIVE named, not one the worker sent back. `do_promote`
+         answers with its own `rel` and they agree today — but the row's job is
+         to point at where this archive puts songs, and taking a path from the
+         other end is how a compromised worker gets to choose it. */
+      W.prepare(`UPDATE music SET video_path = ?, fetch_status = 'done',
+                                  fetch_note = NULL, updated_at = ? WHERE id = ?`)
+        .run(String(pay.to), t2, mid);
+      bumpGeneration(W);
+      return;
+    }
+
     if (!job.snippet_id) return;
     const t = now();
 
@@ -4372,6 +6387,12 @@ export function makeApp(config = CONFIG) {
        work again, and for a fetch that means downloading it twice. */
     try { jobLanded(j, status, result_path, error, result); }
     catch (e) { console.error(`job ${j.id} landed badly:`, e?.message ?? e); }
+    /* Said out loud, after the work rather than instead of it. logEvent never
+       throws into its caller, so this cannot turn a finished job into a 500 —
+       and it is here rather than inside jobLanded for the same reason
+       logChangeset is called from routes: the function that works out what
+       something MEANS should not also be the one holding the request. */
+    logJobLanded(req, j, status, error);
     bumpGeneration(W);
     res.json({ job: jobRow(R.prepare('SELECT * FROM job WHERE id = ?').get(j.id)) });
   });
@@ -4390,7 +6411,7 @@ export function makeApp(config = CONFIG) {
    *  the thing worth warning about and "it will be empty for a while" is not
    *  a thing that should be true.
    */
-  app.post('/api/snippets/:id/retranscribe', requireRole('editor'), (req, res) => {
+  app.post('/api/snippets/:id/retranscribe', requireCap('transcript.run'), (req, res) => {
     const s = R.prepare(
       'SELECT id FROM snippet WHERE id = ? AND retracted_at IS NULL').get(req.params.id);
     if (!s) return res.status(404).json({ error: 'no such snippet' });
@@ -4427,7 +6448,7 @@ export function makeApp(config = CONFIG) {
    *  other is a request — and the second is the only kind of file operation
    *  this process is allowed to ASK for rather than do.
    */
-  app.post('/api/snippets/:id/purge', requireRole('admin'), (req, res) => {
+  app.post('/api/snippets/:id/purge', requireCap('snippet.purge'), (req, res) => {
     const s = R.prepare(
       // `title` is not decoration: this row is about to become a tombstone, and
       // the log line naming what was destroyed is the only place the name
@@ -4490,7 +6511,7 @@ export function makeApp(config = CONFIG) {
    *  actually has, which is "did the thing I pressed happen", and most of its
    *  work is the two derived facts at the bottom rather than the rows.
    */
-  app.get('/api/recorder', requireRole('admin'), (req, res) => {
+  app.get('/api/recorder', requireCap('ops.read'), (req, res) => {
     const t = now();
     const marks = PI_KINDS.map(() => '?').join(',');
     const rows = R.prepare(
@@ -4591,7 +6612,7 @@ export function makeApp(config = CONFIG) {
    *  for a week, a cancelled job somebody meant to un-cancel, a failure that
    *  aged out of the panel — and each time the fix is the same reconciliation.
    */
-  app.post('/api/recorder/sweep', requireRole('admin'), (req, res) => {
+  app.post('/api/recorder/sweep', requireCap('ops.manage'), (req, res) => {
     const t = now();
     const marks = PI_KINDS.map(() => '?').join(',');
 
@@ -4658,7 +6679,7 @@ export function makeApp(config = CONFIG) {
    *  way orphans show up: a file with no row at all, left by a crash between
    *  the rename and the insert.
    */
-  app.get('/api/quarantine', requireRole('admin'), (req, res) => {
+  app.get('/api/quarantine', requireCap('ops.read'), (req, res) => {
     if (!config.quarantineRoot) return res.json({ root: null, files: [] });
     let names = [];
     try { names = readdirSync(config.quarantineRoot); } catch { /* unreadable */ }
@@ -5761,8 +7782,8 @@ export function makeApp(config = CONFIG) {
      watch, and uploads land in the review queue, so a gate that hid clips from
      staff would mean granting yourself every audience before you could do
      review at all. Gates are about audience, not staff trust. */
-  const GRANTS_OF = R.prepare('SELECT name FROM person_grant WHERE person_id = ?');
-  const grantsOf = (id) => (id ? GRANTS_OF.all(id).map((r) => r.name) : []);
+  /* `grantsOf` and its statement now live up beside `identify`, because the
+     held set travels on the person — see the comment there. */
 
   /** The WHERE fragment. Empty string when the viewer may see everything. */
   /* Parameterised over the junction, because the RULE is the subtle part and
@@ -5772,8 +7793,12 @@ export function makeApp(config = CONFIG) {
      defaults are the snippet case, so every existing caller reads the same. */
   const gateSql = (req, { junction = 'snippet_taglet', fk = 'snippet_id',
                           alias = 's' } = {}) => {
-    if (atLeast(req.person, 'editor')) return { sql: '', params: [] };
-    const held = grantsOf(req.person?.id ?? null);
+    if (can(req.person, 'gate.bypass')) return { sql: '', params: [] };
+    /* The SAME held set the row-level predicate reads, off the person, rather
+       than a second query asking the same question. The list and the row
+       agreeing is the one property this pair exists for, and two independent
+       reads of the same table is how they would eventually stop. */
+    const held = [...(req.person?.grants ?? [])];
     /* NOT EXISTS and not a join: a row can carry several gating tags and must
        clear ALL of them, and a join would return it once per gate it does
        clear. Written as "has a gating tag this person cannot open". */
@@ -5782,7 +7807,7 @@ export function makeApp(config = CONFIG) {
       : '';
     return {
       sql: `NOT EXISTS (SELECT 1 FROM ${junction} st JOIN tag t ON t.id = st.tag_id
-                         WHERE st.${fk} = ${alias}.id AND t.retracted_at IS NULL
+                         WHERE st.${fk} = ${alias}.id AND ${TAG_LIVE}
                            AND t.gate IS NOT NULL ${inner})`,
       params: held,
     };
@@ -5790,25 +7815,36 @@ export function makeApp(config = CONFIG) {
 
   const GATES_ON = R.prepare(
     `SELECT DISTINCT t.gate FROM snippet_taglet st JOIN tag t ON t.id = st.tag_id
-      WHERE st.snippet_id = ? AND t.retracted_at IS NULL AND t.gate IS NOT NULL`);
+      WHERE st.snippet_id = ? AND ${TAG_LIVE} AND t.gate IS NOT NULL`);
 
-  /** The same question about one row.
+  /* ── the gates on one row, and nothing about who may open them ───────────
    *
-   *  Fails CLOSED on a missing id. It is reached through snipVisible(), whose
-   *  callers each run their own SELECT, and one of them did not ask for `id` —
-   *  which threw inside the driver and became a 500. A 500 where every other
-   *  refusal is a 404 is itself a disclosure: it says the row exists. Denying
-   *  is the only safe answer to "I cannot tell", and a route that forgets the
-   *  column now returns a wrong-but-safe 404 instead of a leak.
+   * `null` and not `[]` for an unusable id, and the distinction is the whole
+   * of the fail-closed behaviour this pair used to carry inline. An empty
+   * array means "I looked and it is ungated", which is a VISIBLE row. `null`
+   * means "I could not determine them", which the predicate denies.
+   *
+   * It matters because it already went wrong once. `gateOk` is reached through
+   * snipVisible(), whose callers each run their own SELECT, and one of them
+   * did not ask for `id` — which threw inside the driver and became a 500. A
+   * 500 where every other refusal is a 404 is itself a disclosure: it says the
+   * row exists. A route that forgets the column gets a wrong-but-safe 404. */
+  const gatesOn = (stmt, id) =>
+    (typeof id === 'string' && id ? stmt.all(id).map((r) => r.gate) : null);
+
+  /** The same question about one row — now asked of auth.js rather than
+   *  answered here.
+   *
+   *  The rule that was written out in this function twice, once for snippets
+   *  and once for music, is `can(person, 'content.view', …)`. What is left on
+   *  this side is the part that genuinely belongs to a server with a database:
+   *  which gates are on this row. The policy — editor bypass, ungated is open,
+   *  every gate must be held — is in one place, and `musicGateOk` below is now
+   *  the same call with a different statement rather than a second copy of the
+   *  reasoning that has to be kept in step with this one.
    */
-  const gateOk = (id, req) => {
-    if (atLeast(req.person, 'editor')) return true;
-    if (typeof id !== 'string' || !id) return false;
-    const need = GATES_ON.all(id).map((r) => r.gate);
-    if (!need.length) return true;
-    const held = new Set(grantsOf(req.person?.id ?? null));
-    return need.every((g) => held.has(g));
-  };
+  const gateOk = (id, req) =>
+    can(req.person, 'content.view', { gates: gatesOn(GATES_ON, id) });
 
   /* Who may see a snippet, in one place because it is asked in four: the
      list, the detail route, the video route and the poster route. Four
@@ -5856,7 +7892,7 @@ export function makeApp(config = CONFIG) {
     // the taglet, and the client would otherwise have no way to name it.
     `SELECT st.snippet_id, st.id AS link_id, t.id, t.name, t.slug, t.kind, t.gate
        FROM snippet_taglet st JOIN tag t ON t.id = st.tag_id
-      WHERE st.snippet_id = ? AND t.retracted_at IS NULL
+      WHERE st.snippet_id = ? AND ${TAG_LIVE}
       -- Who, then what it belongs to, then what it is, then the rest: the
       -- reading order of a danbooru sidebar. media sits where copyright did;
       -- naming a kind that no longer exists silently drops the whole group to
@@ -6075,7 +8111,7 @@ export function makeApp(config = CONFIG) {
        the anonymous case, where everyone shares one validator and the held set
        is empty. Listed explicitly so the reason is on the page rather than in
        someone's head. */
-    const myGrants = atLeast(req.person, 'editor') ? ['*'] : grantsOf(me).sort();
+    const myGrants = can(req.person, 'gate.bypass') ? ['*'] : grantsOf(me).sort();
     const etag = etagFor('snips', q, tagAll, tagAny, tagNot, wantKind, tagletKind,
                          scope, limit, myGrants,
                          before, wantLines, req.query.transcript, wantStatus,
@@ -6125,7 +8161,7 @@ export function makeApp(config = CONFIG) {
       const like = `%${String(q).trim().toLowerCase()}%`;
       const clauses = [
         `EXISTS (SELECT 1 FROM snippet_taglet st JOIN tag t ON t.id = st.tag_id
-                  WHERE st.snippet_id = s.id AND t.retracted_at IS NULL
+                  WHERE st.snippet_id = s.id AND ${TAG_LIVE}
                     AND (lower(t.name) LIKE ? OR t.slug LIKE ?))`,
         `lower(s.title) LIKE ?`,
       ];
@@ -6149,7 +8185,7 @@ export function makeApp(config = CONFIG) {
        IS that single clause, which is why it gets one. */
     const HAS = (test) =>
       `SELECT 1 FROM snippet_taglet st JOIN tag t ON t.id = st.tag_id
-        WHERE st.snippet_id = s.id AND t.retracted_at IS NULL AND ${test}`;
+        WHERE st.snippet_id = s.id AND ${TAG_LIVE} AND ${test}`;
     for (const slug of tagAll) {
       where.push(`EXISTS (${HAS('t.slug = ?')})`);
       params.push(slug);
@@ -6164,7 +8200,7 @@ export function makeApp(config = CONFIG) {
     }
     if (tagletKind) {
       where.push(`EXISTS (SELECT 1 FROM snippet_taglet st JOIN tag t ON t.id = st.tag_id
-                           WHERE st.snippet_id = s.id AND t.kind = ? AND t.retracted_at IS NULL)`);
+                           WHERE st.snippet_id = s.id AND t.kind = ? AND ${TAG_LIVE})`);
       params.push(String(tagletKind));
     }
     // ?transcript=failed|none|empty|auto|edited — how you find the clips that
@@ -6235,7 +8271,7 @@ export function makeApp(config = CONFIG) {
      that a human has been through it — transcript_status flips to 'edited',
      which is also what stops the next --update pass overwriting the
      correction. */
-  app.patch('/api/snippets/:id/line/:seq', requireRole('editor'), (req, res) => {
+  app.patch('/api/snippets/:id/line/:seq', requireCap('transcript.edit'), (req, res) => {
     const text = String(req.body?.text ?? '');
     if (text.length > 2000) return res.status(400).json({ error: 'that is not a line' });
     const s = R.prepare('SELECT id FROM snippet WHERE id = ? AND retracted_at IS NULL')
@@ -6304,7 +8340,7 @@ export function makeApp(config = CONFIG) {
      lines nobody touched keep whisper's measured end — and dropped for the
      rest, where the panel's "until the next one starts" fallback is right and
      a stale end would light the wrong words as the clip plays. */
-  app.put('/api/snippets/:id/transcript', requireRole('editor'), (req, res) => {
+  app.put('/api/snippets/:id/transcript', requireCap('transcript.edit'), (req, res) => {
     const s = R.prepare('SELECT id FROM snippet WHERE id = ? AND retracted_at IS NULL')
       .get(req.params.id);
     if (!s) return res.status(404).json({ error: 'no such snippet' });
@@ -6402,7 +8438,8 @@ export function makeApp(config = CONFIG) {
     try {
       const out = propose(W, {
         authorId: req.person.id,
-        /* The route has already decided, at `requireRole('editor')` above, and
+        /* The route has already decided, at `requireCap('suggestion.decide')`
+           above, and
            the changes it builds are its own rather than the caller's. Saying so
            is what keeps propose()'s missing-person error meaningful everywhere
            else. */
@@ -6499,7 +8536,7 @@ export function makeApp(config = CONFIG) {
    *  clips and canonizing it five times is how five spellings of it end up in
    *  the vocabulary. The group is the unit of work.
    */
-  app.get('/api/suggestions', requireRole('editor'), (req, res) => {
+  app.get('/api/suggestions', requireCap('suggestion.decide'), (req, res) => {
     /* Checked before the work rather than after it. The queue is polled every
        time an editor comes back to the tab and the answer only changes when
        something in the archive does, so a 304 here should cost a generation
@@ -6516,7 +8553,7 @@ export function makeApp(config = CONFIG) {
       `SELECT s.id, s.title, s.status, s.taglet_suggestions,
               (SELECT group_concat(t.slug, char(10))
                  FROM snippet_taglet st JOIN tag t ON t.id = st.tag_id
-                WHERE st.snippet_id = s.id AND t.retracted_at IS NULL) AS have
+                WHERE st.snippet_id = s.id AND ${TAG_LIVE}) AS have
          FROM snippet s
         WHERE s.taglet_suggestions IS NOT NULL AND s.retracted_at IS NULL`).all();
 
@@ -6557,7 +8594,13 @@ export function makeApp(config = CONFIG) {
        `type` or `elements` tag was reported as having no match at all rather
        than as matching that one. It is a few hundred short rows, every group
        has to be compared against all of it, and fifty queries that each scan
-       the same small table is the slower way to write that. */
+       the same small table is the slower way to write that.
+
+       `proposed` rows are IN this one, deliberately, where every public query
+       excludes them: this route asks `suggestion.decide` and the whole job
+       here is matching strays against the vocabulary somebody is reviewing.
+       A stray that is really the pending name two rows up is the single most
+       useful match this panel can make. */
     const vocab = R.prepare(
       `SELECT id, name, slug, kind FROM tag WHERE retracted_at IS NULL`).all();
     const bySlug = new Map(vocab.map((t) => [t.slug, t]));
@@ -6648,7 +8691,7 @@ export function makeApp(config = CONFIG) {
    *  and review, not a curated one, and "who deleted the word funy" is not
    *  history anybody will ever want.
    */
-  app.post('/api/suggestions/dismiss', requireRole('editor'), (req, res) => {
+  app.post('/api/suggestions/dismiss', requireCap('suggestion.decide'), (req, res) => {
     const name = String(req.body?.name ?? '').trim();
     if (!name) return res.status(400).json({ error: 'name is required' });
     const slug = slugify(name);
@@ -6689,9 +8732,28 @@ export function makeApp(config = CONFIG) {
     /* Per-person, because the answer is: a gating taglet is absent for anyone
        who cannot open it, so one shared validator would hand the full
        vocabulary to whoever asked next. Same reasoning as the snippet list. */
-    const mayAll = atLeast(req.person, 'editor');
+    /* TWO questions, and they were one flag until step E took `gate.bypass`
+       off the editor role and the review queue went dark.
+         · may they see a PROPOSED taglet — a queue row, so `review.read`
+         · may they see a GATING one — a gate, so `gate.bypass`
+       One name covered both while the editor role held the bypass, and the
+       conflation was invisible for exactly as long as that was true. Splitting
+       them is the fix; the comment further down that says "and to editors, who
+       have to see the queue they are reviewing" is the sentence that was
+       already describing the first one. */
+    const mayQueue = can(req.person, 'review.read');
+    const mayAll = can(req.person, 'gate.bypass');
     const held = mayAll ? ['*'] : grantsOf(req.person?.id ?? null).sort();
-    const etag = etagFor('taglets', q, kind, limit, held);
+    /* The asker's own id is part of the key now, and has to be: the answer
+       carries their own pending mints and nobody else's, so two suggesters
+       with identical grants need different answers. `personal` already keeps
+       this out of shared caches; without the id in the ETAG ITSELF they would
+       still hand each other 304s off one stored copy. */
+    /* Both in the key. They moved apart in step E, so a validator built from
+       one of them would hand a reviewer without the bypass the answer built
+       for somebody with it — the gate correct and the cache wrong. */
+    const etag = etagFor('taglets', q, kind, limit, held, mayQueue,
+                         req.person?.id ?? '-');
     if (fresh(req, res, etag, { personal: !!req.person?.id })) return res.status(304).end();
 
     /* One vocabulary. This used to serve only the snippet half of it, on the
@@ -6700,6 +8762,25 @@ export function makeApp(config = CONFIG) {
        tagged Intro is a reasonable thing for an editor to want. */
     const where = ['t.retracted_at IS NULL'];
     const params = [];
+    /* And `proposed` is not vocabulary. This route had NO status filter at
+       all, which was survivable only because a proposed row was nearly
+       impossible to produce — and it is the reason the upload window kept
+       unknown names as text on the clip instead of minting them: "a proposed
+       taglet is autocompleted, and then the second person to want this name
+       is offered it before anybody agreed it should exist".
+
+       That objection is answered here rather than avoided. A pending mint is
+       autocompleted to ONE person — the author who made it, so they can put
+       her on the other nine pictures — and to whoever reads the queue, who has
+       to see what they are reviewing. To everybody else it does not exist. */
+    if (!mayQueue) {
+      if (req.person?.id) {
+        where.push(`(t.status = 'confirmed' OR (t.status = 'proposed' AND t.author_id = ?))`);
+        params.push(req.person.id);
+      } else {
+        where.push(`t.status = 'confirmed'`);
+      }
+    }
     /* A gating taglet is invisible to anyone it gates. Leaving it in leaks the
        size of the restricted set through `uses`, and offers a filter that
        silently returns nothing — the clips behind it are already excluded by
@@ -6912,7 +8993,7 @@ export function makeApp(config = CONFIG) {
   // admin
   // -------------------------------------------------------------------------
 
-  app.get('/api/admin/people', requireRole('admin'), (req, res) => {
+  app.get('/api/admin/people', requireCap('grant.manage'), (req, res) => {
     res.json({ people: R.prepare(
       `SELECT id, provider, handle, display_name, role, banned, created_at, last_seen_at
        FROM person ORDER BY created_at DESC LIMIT 500`).all() });
@@ -6920,10 +9001,22 @@ export function makeApp(config = CONFIG) {
 
   app.post('/api/admin/people/:id/role', requireCap('people.manage'), (req, res) => {
     const { role } = req.body ?? {};
-    if (!ROLES.includes(role)) return res.status(400).json({ error: `role must be one of ${ROLES}` });
-    if (req.params.id === req.person.id && role !== 'admin') {
-      return res.status(400).json({ error: 'refusing to demote yourself — you would ' +
-        'lock yourself out of the only account that can undo it' });
+    if (!roles().includes(role)) {
+      return res.status(400).json({ error: `role must be one of ${roles().join(', ')}` });
+    }
+    /* Refusing to lock yourself out, asked as the capability rather than as
+       the name `admin`.
+       It read `role !== 'admin'`, which was the right guard against a ladder
+       and the wrong one against a bag: a custom role holding `people.manage`
+       and little else is a perfectly good thing to move yourself to, and it
+       would have been refused, while a role NAMED admin that somebody had
+       unticked `people.manage` from would have been allowed. The question is
+       only ever "could I undo this", so that is what is asked. */
+    if (req.params.id === req.person.id
+        && !roleCaps(role).includes('people.manage')) {
+      return res.status(400).json({ error: `refusing to move yourself to ${role} — `
+        + 'it cannot change anybody\'s role, so you would be locking yourself '
+        + 'out of the only account that can undo it' });
     }
     if (!W.prepare('SELECT 1 FROM person WHERE id = ?').get(req.params.id)) {
       return res.status(404).json({ error: 'no such person' });
@@ -6932,6 +9025,266 @@ export function makeApp(config = CONFIG) {
     W.prepare('UPDATE person SET role = ? WHERE id = ?').run(role, req.params.id);
     logEvent(req, 'changed a role', 'person', req.params.id, { from: was, to: role });
     res.json({ id: req.params.id, role });
+  });
+
+  /* ── the role editor's four routes ───────────────────────────────────────
+   *
+   * `new -> role -> editor2: can edit tags; can upload memes` and then
+   * `exampleperson -> assign editor2`. The assignment is the route above and
+   * asks `people.manage`; these four are what a role MEANS and ask
+   * `roles.manage`, because deciding what a role is and putting somebody in
+   * one are different acts and the second is the common one.
+   *
+   * THE RULE THAT MAKES THIS SAFE, and it is one rule: you cannot hand out
+   * what you do not hold. `roles.manage` is otherwise equivalent to full
+   * control by one extra step — write yourself a role with everything in it —
+   * and nothing about a capability system prevents that in general. What this
+   * does prevent is manufacturing authority out of nothing: somebody holding
+   * `roles.manage` and a handful of tag powers can move those powers around
+   * and cannot invent `ops.manage`. Exactly the check `/api/auth/tokens`
+   * already makes about a token's scope, with the same 409 and the same
+   * `beyond` list, because it is the same question.
+   *
+   * A SOVEREIGN role is not editable here at all — see `role.sovereign`. Its
+   * capabilities are not stored, so there is nothing to PATCH, and the refusal
+   * says that rather than pretending a write happened.
+   */
+  const roleRow = (slug) => R.prepare(
+    `SELECT slug, name, builtin, sovereign, created_at FROM role WHERE slug = ?`)
+    .get(slug);
+
+  /** How many people hold this role right now. */
+  const holders = (slug) => R.prepare(
+    'SELECT count(*) c FROM person WHERE role = ?').get(slug).c;
+
+  /** Normalise and check a capability list off the wire.
+   *
+   *  Returns `{ list }` or `{ err: [code, body] }`. Three ways to be wrong and
+   *  they are different answers: a name that does not exist is a 400 (a typo),
+   *  a name that is predicate-only is a 400 with its own sentence (a real
+   *  capability, not a tickable one), and a name the CALLER does not hold is a
+   *  409 (a refusal, not a mistake) listing every one of them — because being
+   *  told about these one submit at a time reads as the feature being broken.
+   */
+  const capList = (raw, person) => {
+    if (!Array.isArray(raw)) return { err: [400, { error: 'capabilities must be an array' }] };
+    const list = [...new Set(raw.map((c) => String(c ?? '').trim()).filter(Boolean))];
+    const unknown = list.filter((c) => !CAPABILITIES.includes(c));
+    /* Split out, because `content.view` is a REAL capability that simply is
+       not a role's to grant: it is predicate-only, everybody has it, and what
+       varies is which objects it answers yes for. Telling somebody it does
+       not exist would be a lie they would waste time on. */
+    const objectOnly = unknown.filter((c) => grantable(c));
+    if (objectOnly.length) {
+      return { err: [400, { error: `${objectOnly.join(', ')} `
+        + `${objectOnly.length === 1 ? 'is' : 'are'} decided per object and `
+        + 'cannot be ticked on a role — everybody holds it, and a gate is what '
+        + 'narrows it', object_only: objectOnly }] };
+    }
+    if (unknown.length) {
+      return { err: [400, { error: `no such capability: ${unknown.join(', ')}`,
+                            unknown }] };
+    }
+    const mine = new Set(grantableBy(person));
+    const beyond = list.filter((c) => !mine.has(c));
+    if (beyond.length) {
+      return { err: [409, { error: 'you cannot give a role something you do not '
+        + `hold yourself: ${beyond.join(', ')}`, beyond }] };
+    }
+    return { list };
+  };
+
+  /** Re-read the table into auth.js. Every write below ends here. */
+  const reloadRoles = () => { loadRoles(R); };
+
+  app.get('/api/roles', requireCap('roles.manage'), (req, res) => {
+    const rows = R.prepare(
+      `SELECT slug, name, builtin, sovereign, created_at FROM role`).all();
+    res.json({
+      /* Ordered the way `roles()` orders them — floor first, then
+         alphabetically — so the screen and the API agree and neither implies a
+         hierarchy by accident. */
+      roles: roles().map((slug) => {
+        const row = rows.find((r) => r.slug === slug) ?? { slug, name: slug };
+        return {
+          slug,
+          name: roleName(slug),
+          builtin: !!row.builtin,
+          sovereign: isSovereign(slug),
+          /* Computed for a sovereign role rather than read, so the screen can
+             draw it fully ticked and disabled without a special case. */
+          capabilities: roleCaps(slug),
+          people: holders(slug),
+          created_at: row.created_at ?? null,
+        };
+      }),
+      /* Everything there is to tick, and what this caller may tick — two
+         lists, because a screen that hides the rest would look like the
+         vocabulary was smaller than it is. */
+      vocabulary: [...CAPABILITIES],
+      grantable: grantableBy(req.person),
+      /* The ticks that do not do what the checklist implies. One entry today
+         and it travels from auth.js rather than being typed into the page:
+         a warning that lives in `index.html` is a warning that survives the
+         capability being renamed. */
+      warnings: CAP_WARNINGS,
+      floor: FLOOR,
+    });
+  });
+
+  app.post('/api/roles', requireCap('roles.manage'), (req, res) => {
+    const name = String(req.body?.name ?? '').trim();
+    if (!name) return res.status(400).json({ error: 'name is required' });
+    if (name.length > 60) return res.status(400).json({ error: 'name is too long (max 60)' });
+    /* Checked BEFORE slugify, and this is not belt-and-braces.
+       `slugify` never returns empty: given nothing it can use it invents
+       `tag-<hash>`, which is exactly right for a tag — a name has to become
+       SOME slug and a collision-free one will do — and exactly wrong here.
+       `person.role` carries this string for as long as the role exists, so a
+       role called `!!!` would be filed under `tag-pa9` and nobody would ever
+       guess it. The fallback is a good answer to a different question. */
+    if (!/[a-z0-9]/i.test(name)) {
+      return res.status(400).json({ error: 'a role needs a name with letters or '
+        + 'digits in it — the name is what its identity is built from' });
+    }
+    const slug = slugify(name);
+    if (roleRow(slug)) {
+      return res.status(409).json({ error: `there is already a role at '${slug}'`, slug });
+    }
+    const caps = capList(req.body?.capabilities ?? [], req.person);
+    if (caps.err) return res.status(caps.err[0]).json(caps.err[1]);
+    const t = now();
+    tx(W, () => {
+      W.prepare(`INSERT INTO role(slug, name, builtin, sovereign, created_at, created_by)
+                 VALUES(?,?,0,0,?,?)`).run(slug, name, t, req.person.id);
+      for (const c of caps.list) {
+        W.prepare(`INSERT INTO role_grant(role_slug, capability, granted_at, granted_by)
+                   VALUES(?,?,?,?)`).run(slug, c, t, req.person.id);
+      }
+    });
+    reloadRoles();
+    logEvent(req, 'created a role', 'role', slug, { name, capabilities: caps.list });
+    res.status(201).json({ slug, name, capabilities: roleCaps(slug),
+                           builtin: false, sovereign: false, people: 0 });
+  });
+
+  app.patch('/api/roles/:slug', requireCap('roles.manage'), (req, res) => {
+    const row = roleRow(req.params.slug);
+    if (!row) return res.status(404).json({ error: 'no such role' });
+    const slug = row.slug;
+    const wantName = req.body?.name !== undefined;
+    const wantCaps = req.body?.capabilities !== undefined;
+    if (!wantName && !wantCaps) {
+      return res.status(400).json({ error: 'nothing to change' });
+    }
+
+    /* ── the sovereign role's ticks are not data, so there is nothing to write
+       It answers `can()` from the vocabulary, holds no `role_grant` rows, and
+       gains a capability minted in a future version the moment the name
+       exists. A PATCH naming `capabilities` is therefore not a permission
+       question but a category error, and it is answered as one — 409 and a
+       sentence, rather than a 200 that changed nothing.
+       Renaming is allowed: the name is a label and the slug is the identity. */
+    if (row.sovereign && wantCaps) {
+      return res.status(409).json({ error: `${roleName(slug)} holds every capability `
+        + 'there is, unconditionally — it has no list to change, which is what '
+        + 'makes it impossible to lock yourself out of your own archive',
+        sovereign: true, capabilities: roleCaps(slug) });
+    }
+
+    const changes = {};
+    if (wantName) {
+      const name = String(req.body.name ?? '').trim();
+      if (!name) return res.status(400).json({ error: 'name cannot be empty' });
+      if (name.length > 60) return res.status(400).json({ error: 'name is too long (max 60)' });
+      changes.name = name;
+    }
+    let list = null;
+    if (wantCaps) {
+      const caps = capList(req.body.capabilities, req.person);
+      if (caps.err) return res.status(caps.err[0]).json(caps.err[1]);
+      list = caps.list;
+      /* ── and do not unlock yourself out of the room ─────────────────────
+         Editing your OWN role down to something that cannot edit roles is the
+         one move here that cannot be undone from inside the archive. Same
+         shape as the self-demotion guard above it, asked as the capability,
+         and only for your own role — taking `roles.manage` off somebody
+         else's is a legitimate thing to do. */
+      if (slug === req.person.role && !list.includes('roles.manage')) {
+        return res.status(400).json({ error: 'refusing to take roles.manage off '
+          + 'your own role — nothing left in the archive could put it back' });
+      }
+    }
+
+    const was = { name: row.name, capabilities: roleCaps(slug) };
+    const t = now();
+    tx(W, () => {
+      if (changes.name) {
+        W.prepare('UPDATE role SET name = ? WHERE slug = ?').run(changes.name, slug);
+      }
+      if (list) {
+        /* Replaced wholesale rather than diffed. The screen sends the state of
+           the checklist, which is the whole answer, and a diff would need the
+           client to have read the same version — a lost-update race for no
+           gain on a table with a few dozen rows. */
+        W.prepare('DELETE FROM role_grant WHERE role_slug = ?').run(slug);
+        for (const c of list) {
+          W.prepare(`INSERT INTO role_grant(role_slug, capability, granted_at, granted_by)
+                     VALUES(?,?,?,?)`).run(slug, c, t, req.person.id);
+        }
+      }
+    });
+    reloadRoles();
+    logEvent(req, 'changed a role', 'role', slug,
+             { from: was, to: { name: roleName(slug), capabilities: roleCaps(slug) } });
+    res.json({ slug, name: roleName(slug), capabilities: roleCaps(slug),
+               builtin: !!row.builtin, sovereign: isSovereign(slug),
+               people: holders(slug) });
+  });
+
+  app.delete('/api/roles/:slug', requireCap('roles.manage'), (req, res) => {
+    const row = roleRow(req.params.slug);
+    if (!row) return res.status(404).json({ error: 'no such role' });
+    const slug = row.slug;
+    /* The four seeded ones stay. `viewer` because `person.role` defaults to it
+       and an archive without it has no answer for a stranger; `admin` because
+       it is the sovereign and deleting it is the lockout this whole flag
+       exists to prevent; the other two because they are what the archive
+       shipped with and somebody would have to rebuild them by hand to get back
+       to a working state. Empty them instead — that is what the checklist is
+       for, and it is reversible. */
+    if (row.builtin) {
+      return res.status(409).json({ error: `${roleName(slug)} is one of the four the `
+        + 'archive ships with and cannot be deleted — untick what it may do '
+        + 'instead, which is reversible', builtin: true });
+    }
+    if (slug === req.person.role) {
+      return res.status(400).json({ error: 'refusing to delete the role you are '
+        + 'holding — you would land on the floor with nothing' });
+    }
+    /* Re-homed EXPLICITLY, and reported. The schema has no foreign key on
+       `person.role` on purpose, and this is the reason: "three people became
+       viewers" is a sentence somebody should read, not a cascade nobody sees.
+       The floor rather than a caller-chosen role, because a delete is a
+       cleanup and landing people somewhere they were not put by hand would be
+       a second decision taken quietly. */
+    const moved = R.prepare('SELECT id, handle FROM person WHERE role = ?').all(slug);
+    // Read BEFORE the delete: `roleCaps` answers from the registry, and the
+    // registry is reloaded from a table this transaction is about to empty.
+    const hadCaps = roleCaps(slug);
+    tx(W, () => {
+      if (moved.length) {
+        W.prepare('UPDATE person SET role = ? WHERE role = ?').run(FLOOR, slug);
+      }
+      // The grant rows go with it, through role_grant's own ON DELETE CASCADE.
+      W.prepare('DELETE FROM role WHERE slug = ?').run(slug);
+    });
+    reloadRoles();
+    logEvent(req, 'deleted a role', 'role', slug,
+             { name: row.name, capabilities: hadCaps,
+               moved_to: FLOOR, moved: moved.map((m) => m.handle) });
+    res.json({ slug, deleted: true, moved_to: FLOOR,
+               moved: moved.map((m) => ({ id: m.id, handle: m.handle })) });
   });
 
   // -------------------------------------------------------------------------
@@ -7051,12 +9404,44 @@ export function makeApp(config = CONFIG) {
   }
 
   app.get('/media/video/:capture_id', (req, res) => {
-    const c = R.prepare('SELECT video_path FROM capture WHERE id = ?').get(req.params.capture_id);
+    /* `stream_id` alongside the path, because the gate is a property of the
+       BROADCAST and a capture is a recording of one. This route read the path
+       and served the bytes, full stop — while the comment on the thumb route
+       below claimed moving pictures were "addressed BY ID through a route that
+       reads the row and checks who is asking". It read the row. It did not
+       check. Capture ids appear in `/api/streams` responses, so the obscurity
+       that used to stand in for a check had moved rather than gone. */
+    const c = R.prepare(
+      'SELECT video_path, stream_id FROM capture WHERE id = ?')
+      .get(req.params.capture_id);
     if (!c?.video_path) return res.status(404).json({ error: 'no such capture' });
+    if (!streamGateOk(c.stream_id, req)) {
+      return res.status(404).json({ error: 'no such capture' });
+    }
     return sendMedia(req, res, c.video_path);
   });
 
-  app.get('/media/thumb/:rest(*)', (req, res) => sendMedia(req, res, req.params.rest));
+  /* ── the path-taking route, narrowed to pictures ──────────────────────────
+     This took ANY path under the media root and served whatever the MIME table
+     could type — which includes `.mp4`, `.webm` and `.mkv`. So a signed-in
+     viewer who knew or guessed a path could pull a master, a preserved
+     concert, anything, with none of the checks the list that mentions it
+     applies: no gate, no status, no tombstone. Obscurity was the whole
+     defence, and `video_path` not being in any API response was the whole of
+     the obscurity.
+
+     What it is FOR is stills — chat avatars and the poster/thumbnail tree —
+     and that is all the page ever asks it for. So it serves pictures, and
+     anything with a moving picture in it is addressed BY ID through a route
+     that reads the row and checks who is asking. The name was already telling
+     the truth; the implementation was not. */
+  const THUMB_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
+  app.get('/media/thumb/:rest(*)', (req, res) => {
+    if (!THUMB_EXT.has(extname(String(req.params.rest ?? '')).toLowerCase())) {
+      return res.status(404).json({ error: 'not on disk' });
+    }
+    return sendMedia(req, res, req.params.rest);
+  });
 
   /* The merged chat, by stream id.
    *
@@ -7067,10 +9452,12 @@ export function makeApp(config = CONFIG) {
    * video and snippets are — by id, with the row holding the only path anyone
    * gets to name — and never by a path off the URL.
    *
-   * Ungated, matching /media/video: the VODs are open and the chat is the same
-   * broadcast. When a VOD gate arrives this is where chat joins it, and
-   * /media/snippet is the pattern to copy — the lesson there was that gating
-   * the metadata and leaving the bytes open is not gating.
+   * GATED as of 17 Sep, which is what the previous version of this comment
+   * said would happen — "when a VOD gate arrives this is where chat joins it,
+   * and /media/snippet is the pattern to copy: the lesson there was that
+   * gating the metadata and leaving the bytes open is not gating." The gate
+   * arrived and the pattern was copied. The stream's own rule decides, because
+   * the chat is the same broadcast.
    */
   /* What pictures the chat assets tree actually holds.
    *
@@ -7123,6 +9510,13 @@ export function makeApp(config = CONFIG) {
       'SELECT chat_path FROM stream WHERE id = ? AND retracted_at IS NULL')
       .get(req.params.stream_id);
     if (!s?.chat_path) return res.status(404).json({ error: 'no chat for this stream' });
+    /* The gate arrived, and this is where chat joins it — which the comment
+       above said it would. Chat is the same broadcast: thousands of lines of
+       what was said during it, under the stream's own id, which would be the
+       cheapest way past a gate on the video. */
+    if (!streamGateOk(req.params.stream_id, req)) {
+      return res.status(404).json({ error: 'no chat for this stream' });
+    }
     if (!config.mediaRoot) {
       return res.status(503).json({ error: 'no media root — set TENMA_MEDIA_ROOT' });
     }
@@ -7307,6 +9701,37 @@ export function makeApp(config = CONFIG) {
     // fall back to the extension table rather than refusing to serve it.
     return sendMedia(req, res, s.file_path, { type });
   };
+  /* ── the preserved copy of a song ─────────────────────────────────────────
+     The point of the music module is that the archive holds a copy, and until
+     now nothing could play it: `muPlay` only ever built a YouTube iframe and
+     `preserved` was a badge. A video that has since been privated was
+     therefore preserved and unwatchable at the same time, which is the one
+     outcome the module exists to prevent.
+
+     BY ID, and the checks are the row-level twins of the list's own — see
+     musicVisible. Not `retracted_at IS NULL` in the SQL: the row is read
+     whole and judged in one place, so a route that forgets a column cannot
+     accidentally pass.
+
+     `sendMedia` brings range support with it, which a two-hour concert needs
+     or the browser cannot seek at all. */
+  const sendSongMedia = (req, res) => {
+    const m = R.prepare(
+      `SELECT id, video_id, title, video_path, status, author_id, retracted_at
+         FROM music WHERE id = ?`).get(req.params.id);
+    if (!musicVisible(m, req)) return res.status(404).json({ error: 'no such song' });
+    if (!m.video_path) return res.status(404).json({ error: 'the archive holds no copy' });
+    if (!req.query.dl) return sendMedia(req, res, m.video_path);
+    /* Named for a person's disk rather than for the media tree. A ULID tells
+       whoever downloaded it nothing, and every song would land in Downloads
+       under a different meaningless name. */
+    const base = String(m.title ?? m.video_id ?? 'song')
+      .replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120) || 'song';
+    return sendMedia(req, res, m.video_path,
+                     { filename: `${base}${extname(m.video_path).toLowerCase() || '.mp4'}` });
+  };
+  app.get('/media/song/:id', sendSongMedia);
+
   app.get('/media/snippet/:id', sendSnippetMedia);
   app.get('/media/snippet/:id/:name', sendSnippetMedia);
 
@@ -7364,7 +9789,7 @@ export function makeApp(config = CONFIG) {
   };
   const BROWSE_MAX = 300;
 
-  app.get('/api/media/browse', requireRole('editor'), (req, res) => {
+  app.get('/api/media/browse', requireCap('media.browse'), (req, res) => {
     if (!config.mediaRoot) {
       return res.status(503).json({ error: 'no media root — set TENMA_MEDIA_ROOT' });
     }
@@ -7457,32 +9882,332 @@ export function makeApp(config = CONFIG) {
    * By hand only, for now. A sweep over everything is what actually wants
    * doing eventually, and it waits on rate limiting rather than on this.
    */
-  app.post('/api/streams/:id/rescan', requireRole('editor'), (req, res) => {
+  /* Audit this entry, from here.
+   *
+   * The same three checks `ls-audit <idx>` runs at a terminal — the disk, the
+   * platforms, and whether each capture is on the right broadcast — except
+   * nobody has to be logged into the Pi. What comes back is a plan, and the
+   * plan becomes an open changeset; see `auditLanded`.
+   *
+   * Addressed by the archive's own stream id and queued with the VAULT index,
+   * because the index is the only name the Pi shares — its entry, its
+   * filenames and its cache are all keyed on it, and a ULID would mean
+   * teaching the worker a second identity for the same broadcast.
+   *
+   * `stream.rescan`, the same capability rescan asks: this spends the
+   * recorder's time
+   * and asks Helix a question, which is not a thing a viewer gets to do.
+   */
+  app.post('/api/streams/:id/audit', requireCap('stream.rescan'), (req, res) => {
+    const s = R.prepare(
+      'SELECT id, idx FROM stream WHERE id = ? AND retracted_at IS NULL')
+      .get(req.params.id);
+    if (!s) return res.status(404).json({ error: 'no such stream' });
+    /* An ingested stream that was never in the vault has no index to audit
+       BY, and the Pi would have nothing to look for. Said plainly rather than
+       queued and failed twenty seconds later. */
+    if (!s.idx) {
+      return res.status(400).json({
+        error: 'this stream has no vault index, so there is no entry to audit' });
+    }
+    /* On the COLUMN, because `%"idx":716%` also matches 7160 — the match
+       runs off the end of the number, so an audit queued for one entry could
+       answer "already queued" for another. */
+    const open = R.prepare(
+      `SELECT id FROM job WHERE kind = 'audit' AND status IN ('approved','claimed')
+         AND stream_id = ?`).get(s.id);
+    if (open) return res.json({ job_id: open.id, already: true });
+
+    const id = enqueueJob('audit', { payload: { idx: s.idx, stream_id: s.id },
+                                     by: req.person.id });
+    bumpGeneration(W);
+    logEvent(req, 'asked for an audit', 'stream', s.id, { idx: s.idx });
+    res.json({ job_id: id, idx: s.idx });
+  });
+
+  /* What the last audit measured and decided about one entry.
+   *
+   * `stream.rescan`, matching the POST above rather than `review.read`: this
+   * is the answer to the question that button asks, so whoever may ask may
+   * read. It also carries filenames and platform ids off the NAS, which is
+   * not a thing the public stream route has any business learning — which is
+   * why it is its own route rather than a field on `lookupStream`.
+   *
+   * 200 with `report: null` for an entry nobody has audited, rather than a
+   * 404: the entry exists, and the panel asking about it wants to draw "not
+   * audited yet" rather than an error.
+   */
+  /* Everything the record panel's audit section draws, in one answer.
+   *
+   * It grew from `{report}` to four things because they are ONE STORY and
+   * were being told in three places. An audit measures the entry (the
+   * report), says what it could not settle (the questions), and answering one
+   * queues work (the jobs) whose fate depends on what the recorder is willing
+   * to be asked for (the poll). Split across surfaces, clicking a button
+   * looked exactly like nothing happening: the question was deleted, the job
+   * went to a panel about the whole archive, and the report still described
+   * the world from before the click.
+   *
+   * One round trip rather than four, and — more to the point — one answer
+   * that cannot be internally inconsistent. Four fetches can land in an order
+   * that shows a question already answered beside a job that does not exist
+   * yet.
+   */
+  app.get('/api/streams/:id/audit', requireCap('stream.rescan'), (req, res) => {
+    /* `tz_offset_min` and `idx` travel with the report because the panel that
+       draws it is no longer the stream's own — it is the Audit tool, which
+       has no row in hand. Every clock below is an absolute instant and has to
+       be rendered in the STREAM's offset, not the viewer's and not the Pi's. */
+    const s = R.prepare(
+      `SELECT id, idx, title, tz_offset_min, duration_s FROM stream
+        WHERE id = ? AND retracted_at IS NULL`).get(req.params.id);
+    if (!s) return res.status(404).json({ error: 'no such stream' });
+    /* Parsed here so no caller has to remember these are JSON in a column —
+       the same courtesy `/api/questions` does for `answers`. A body that will
+       not parse is a report that cannot be drawn, and saying so beats handing
+       the page a string it will render as `[object Object]`. */
+    const read = (s2) => { try { return JSON.parse(s2); } catch { return null; } };
+
+    /* The entry's work, newest first. On the COLUMN, which is the whole point
+       of adding it: a job's subject used to live only inside `payload`, so
+       this question could not be asked without matching JSON text.
+       Capped, because a much-repaired entry should not hand the panel two
+       hundred rows — what a person needs is what is happening now and what
+       happened last, and the archive-wide queue is where a full history
+       belongs. */
+    const jobs = R.prepare(
+      `SELECT id, kind, status, payload, error, created_at, updated_at,
+              finished_at, claimed_at, attempts
+         FROM job WHERE stream_id = ? ORDER BY created_at DESC LIMIT 12`)
+      .all(s.id).map((j) => {
+        const pay = j.payload ? read(j.payload) : null;
+        return {
+          id: j.id, kind: j.kind, status: j.status, error: j.error,
+          created_at: j.created_at, updated_at: j.updated_at,
+          finished_at: j.finished_at, claimed_at: j.claimed_at,
+          attempts: j.attempts,
+          /* The two payload fields a reader needs to tell one repair from
+             another on the same entry. The rest of the payload is the
+             worker's business and includes paths, so it is not published
+             here for the same reason the report has its own route. */
+          platform: typeof pay?.platform === 'string' ? pay.platform : null,
+          action: typeof pay?.action === 'string' ? pay.action : null,
+          /* And for a pull, WHICH file. Two pulls on one platform sit side by
+             side in this list and are otherwise the same line twice. */
+          what: typeof pay?.what === 'string' ? pay.what : null,
+        };
+      });
+
+    /* What the audit could not settle. The same rows the Review pile draws —
+       one table, two lenses: Review is where you find them across the
+       archive, this is where you act on one entry. */
+    const questions = R.prepare(
+      `SELECT id, platform, kind, message, answers, asked_at
+         FROM question WHERE subject_type = 'stream' AND subject = ?
+        ORDER BY asked_at`).all(s.id).map((q) => ({
+      ...q, answers: read(q.answers) ?? [] }));
+
+    /* What the recorder is asking for, and when it last asked. Without this
+       the panel can say "queued" and nothing more, and "queued" is exactly
+       what a job that will NEVER be taken also looks like. `chat_repair`
+       missing from a Pi's `archive_job_kinds` is not hypothetical — it is
+       how this whole section came to be written. */
+    let poll = null;
+    try {
+      const raw = meta(R, 'worker_poll', null);
+      if (raw) poll = JSON.parse(raw);
+    } catch { /* a malformed note about a poll is not worth a 500 */ }
+
+    /* What a probe found, per platform, so the panel can put the source's own
+       number beside the file's. Read here rather than folded into the worker's
+       report because the REPORT is what ls-audit measured on the Pi, and this
+       is what the archive was told by a different job entirely — keeping them
+       apart is what lets the panel say "the platform says X, the file says Y"
+       instead of quietly picking one. */
+    const probed = {};
+    for (const c of R.prepare(
+      `SELECT id, platform, remote_duration_s, file_duration_s, checked_at,
+              alive, video_path, video_bytes, video_ok, video_state
+         FROM capture WHERE stream_id = ?`).all(s.id)) {
+      probed[String(c.platform).toLowerCase() === 'yt' ? 'yt' : 'tw'] = {
+        capture_id: c.id,
+        remote_duration_s: c.remote_duration_s ?? null,
+        file_duration_s: c.file_duration_s ?? null,
+        checked_at: c.checked_at ?? null,
+        alive: c.alive == null ? null : !!c.alive,
+        /* What deleting this one would reclaim, and whether the archive has
+           SEEN it. `video_ok` comes from stat() and never from a packet, so
+           the panel offers a deletion only for a file that is really there
+           and only while another one is too. */
+        video_path: c.video_path ?? null,
+        video_bytes: c.video_bytes ?? null,
+        video_ok: !!c.video_ok,
+        video_state: c.video_state ?? null,
+      };
+    }
+    const rest = { jobs, questions, now: now(), probed,
+                   idx: s.idx ?? null, title: s.title ?? null,
+                   duration_s: s.duration_s ?? null,
+                   tz_offset_min: s.tz_offset_min ?? 0,
+                   poll: poll ? { at: poll.at, kinds: poll.kinds } : null };
+
+    const row = R.prepare('SELECT * FROM audit_report WHERE stream_id = ?').get(s.id);
+    if (!row) return res.json({ report: null, state: null, ...rest });
+    /* Beside the report, never inside it. The report is what the recorder
+       MEASURED; this is what the archive was holding and whether that stood
+       up. Folding one into the other is how a panel ends up unable to say
+       which of the two numbers in front of you is the one on file. */
+    const state = read(row.state) ?? null;
+    const body = read(row.body);
+    if (!body) return res.json({ report: null, state, unreadable: true, ...rest });
+    res.json({ report: {
+      idx: row.idx, worst: row.worst, ran_at: row.ran_at,
+      findings: read(row.findings) ?? [],
+      ...body,
+    }, state, ...rest });
+  });
+
+  /* ── delete one of two copies of the same broadcast ──────────────────────
+   *
+   * A stream recorded on both platforms is two files of one thing, and the
+   * second one is tens of gigabytes. Deleting it by hand meant SSH-ing to the
+   * NAS and then remembering to correct the archive, which is the one order
+   * that cannot be made safe: whichever you do first, there is a window where
+   * the two disagree, and the window closes only if you remember.
+   *
+   * The whole point of this route is that the archive decides, the recorder
+   * deletes, and the row is corrected when — and only when — the recorder
+   * says the file is actually gone. See `purgeLanded`.
+   *
+   * IRREVERSIBLE, and guarded on what is on DISK rather than on what a row
+   * claims. `video_ok` is set from stat() by the probe and never from a
+   * packet, so "there is another copy" means the archive has seen the other
+   * file, not that something once said so. A row claiming a copy that is not
+   * there would otherwise authorise deleting the only one that is.
+   */
+  app.post('/api/captures/:id/purge-video', requireCap('capture.purge'), (req, res) => {
+    const c = R.prepare('SELECT * FROM capture WHERE id = ?').get(req.params.id);
+    if (!c) return res.status(404).json({ error: 'no such capture' });
+    if (!c.video_path) {
+      return res.status(400).json({ error: 'this capture has no video to delete' });
+    }
+    const s = R.prepare(
+      'SELECT id, idx, serve_pref FROM stream WHERE id = ? AND retracted_at IS NULL')
+      .get(c.stream_id);
+    if (!s) return res.status(404).json({ error: 'no such stream' });
+
+    /* The survivor. Verified on disk, not merely recorded, and not itself
+       already declined — a second copy somebody deleted last week is not a
+       copy. */
+    const keeps = R.prepare(
+      `SELECT id, platform, video_path, video_bytes FROM capture
+        WHERE stream_id = ? AND id != ? AND video_path IS NOT NULL
+          AND video_ok = 1 AND (video_state IS NULL OR video_state != 'declined')`)
+      .all(s.id, c.id);
+    if (!keeps.length) {
+      return res.status(409).json({
+        error: 'this is the only copy of this broadcast the archive can see, '
+             + 'so it will not be deleted',
+        /* Said plainly, because the honest reason matters: a second row may
+           exist and simply not have been verified, and the answer to that is
+           to probe it rather than to force this. */
+        hint: 'if another copy exists, rescan the entry so the archive can '
+            + 'confirm it is on disk, then try again' });
+    }
+
+    /* Already asked for? Two purges of one path is a job that fails the
+       second time and reads as an error for work that succeeded. */
+    const open = R.prepare(
+      `SELECT id FROM job WHERE kind = 'purge' AND status IN ('approved','claimed')
+         AND stream_id = ? AND json_valid(payload)
+         AND json_extract(payload, '$.capture_id') = ?`).get(s.id, c.id);
+    if (open) return res.json({ job_id: open.id, already: true });
+
+    const t = now();
+    tx(W, () => {
+      /* REPOINTED FIRST, and inside the same transaction that queues the job.
+         The theater picks a source through `watchSources(caps, serve_pref)`,
+         so a preference naming the platform whose file is about to be deleted
+         leaves a window where the site plays from a path being removed. The
+         window is small and the failure is a broken player on the one entry
+         somebody just touched, which is exactly when they are looking. */
+      const plat = String(c.platform).toUpperCase() === 'YT' ? 'youtube' : 'twitch';
+      if (s.serve_pref === plat) {
+        const to = String(keeps[0].platform).toUpperCase() === 'YT' ? 'youtube' : 'twitch';
+        W.prepare('UPDATE stream SET serve_pref = ?, updated_at = ? WHERE id = ?')
+          .run(to, t, s.id);
+      }
+    });
+
+    const jobId = enqueueJob('purge', {
+      by: req.person.id,
+      /* `path` is what `do_purge` reads and the only thing it needs. The rest
+         is for `purgeLanded`, which has to know WHICH row to correct once the
+         file is gone — the thing that made doing this by hand unsafe. */
+      payload: { path: c.video_path, capture_id: c.id, stream_id: s.id,
+                 platform: c.platform, bytes: c.video_bytes ?? null },
+    });
+    logEvent(req, 'asked for a duplicate recording to be deleted', 'stream', s.id,
+             { idx: s.idx, platform: c.platform, path: c.video_path,
+               bytes: c.video_bytes ?? null,
+               keeping: keeps.map((k) => k.platform).join(',') });
+    bumpGeneration(W);
+    res.json({ job_id: jobId, already: false, path: c.video_path,
+               bytes: c.video_bytes ?? null,
+               keeping: keeps.map((k) => ({ platform: k.platform, bytes: k.video_bytes })) });
+  });
+
+  app.post('/api/streams/:id/rescan', requireCap('stream.rescan'), (req, res) => {
     const s = R.prepare('SELECT id FROM stream WHERE id = ? AND retracted_at IS NULL')
       .get(req.params.id);
     if (!s) return res.status(404).json({ error: 'no such stream' });
-    const caps = R.prepare(
+    /* ONE CAPTURE, when one is named. Asking both platforms about an entry
+       where only one of them has a question is two network calls to answer
+       one, against APIs that rate-limit — and it makes the button lie about
+       what it is doing. `capture` is optional, so the old whole-stream call
+       still works exactly as it did. */
+    const want = req.body?.capture ? String(req.body.capture) : null;
+    let caps = R.prepare(
       `SELECT id, platform, remote_id, url, video_path FROM capture WHERE stream_id = ?`)
       .all(s.id);
+    if (want) {
+      caps = caps.filter((c) => c.id === want);
+      if (!caps.length) {
+        return res.status(404).json({ error: 'that capture is not on this stream' });
+      }
+    }
     if (!caps.length) {
       return res.status(400).json({ error: 'this stream has no captures to look at' });
     }
     /* Already queued? Asking twice is how a rate limit gets hit for nothing,
-       and the second answer would be the same as the first. */
+       and the second answer would be the same as the first.
+       Matched on the CAPTURE as well now: one entry can have a question about
+       each platform, and a check on the stream alone would answer "already
+       asking" to the second click — which reads, in the panel, as a button
+       that did nothing. The same mistake the chat repair made. */
     const open = R.prepare(
       `SELECT id FROM job WHERE kind = 'rescan' AND status IN ('approved','claimed')
-         AND payload LIKE ?`).get(`%"${s.id}"%`);
+         AND stream_id = ?
+         AND (? IS NULL OR (json_valid(payload)
+              AND json_extract(payload, '$.capture') = ?))`)
+      .get(s.id, want, want);
     if (open) return res.json({ job_id: open.id, already: true });
 
     const id = enqueueJob('rescan', {
-      payload: { stream_id: s.id, captures: caps.map((c) => ({
+      payload: { stream_id: s.id, capture: want, captures: caps.map((c) => ({
         id: c.id, platform: c.platform, remote_id: c.remote_id,
         url: c.url, video_path: c.video_path })) },
       by: req.person.id,
     });
     bumpGeneration(W);
-    logEvent(req, 're-read a stream from its files and links', 'stream', s.id);
-    res.json({ job_id: id, captures: caps.length });
+    logEvent(req, want ? 're-read one recording from its file and link'
+                       : 're-read a stream from its files and links', 'stream', s.id,
+             want ? { capture: want, platform: caps[0].platform } : undefined);
+    /* `already: false` said explicitly, not left undefined. The panel draws
+       "already asking" off this field, and `undefined` is falsy for that but
+       tells a caller nothing about which branch it came down. */
+    res.json({ job_id: id, already: false, captures: caps.length,
+               platform: want ? caps[0].platform : null });
   });
 
   /* Go and read what that link says about this tag.
@@ -7550,13 +10275,27 @@ export function makeApp(config = CONFIG) {
     fetch_status: r.fetch_status, fetch_note: r.fetch_note ?? null,
     // Whether the archive actually holds a copy. The point of the module.
     preserved: !!r.video_path,
+    /* How the row came to be — `link` today, and the discriminator an upload
+       will use. The player needs it: a row with no YouTube behind it has no
+       embed to fall back to, so it must reach for the preserved copy first
+       rather than offering a dead iframe. Sent now so the page has one field
+       to test rather than a shape that changes under it later. */
+    origin: r.origin,
     /* Two different removals, and the panel shows them in one pile — so the
        card has to be able to say which one happened to it. `rejected` is a
        verdict on whether the song belongs; this is a tombstone on the row. */
     retracted: !!r.retracted_at,
+    /* Both of these assumed `video_id` was a YouTube id, which it is for every
+       row that came in as a link and is not for one that came in as a file.
+       `origin` is asked first, so an uploaded row offers no embed to fall back
+       to — which is exactly what makes the player reach for the preserved copy
+       instead of rendering a dead iframe — and no ytimg thumbnail, which would
+       be a guaranteed 404 drawn over somebody's concert. */
     thumb: r.thumb_path ? `/media/thumb/${r.thumb_path}`
-                        : `https://i.ytimg.com/vi/${r.video_id}/hqdefault.jpg`,
-    embed: `https://www.youtube-nocookie.com/embed/${r.video_id}`,
+      : r.origin === 'upload' ? null
+        : `https://i.ytimg.com/vi/${r.video_id}/hqdefault.jpg`,
+    embed: r.origin === 'upload' ? null
+      : `https://www.youtube-nocookie.com/embed/${r.video_id}`,
     author_id: r.author_id,
     /* Present only where the query asked for it — the list joins it in, the
        single-row reads do not. `?? null` rather than leaving it undefined so
@@ -7578,7 +10317,7 @@ export function makeApp(config = CONFIG) {
       `SELECT mt.music_id, mt.id AS link_id, t.id, t.name, t.slug, t.kind
          FROM music_tag mt JOIN tag t ON t.id = mt.tag_id
         WHERE mt.music_id IN (${ids.map(() => '?').join(',')})
-          AND t.retracted_at IS NULL
+          AND ${TAG_LIVE}
         ORDER BY t.kind, t.name`).all(...ids)) {
       out.get(r.music_id)?.push({ id: r.id, link_id: r.link_id,
                                   name: r.name, slug: r.slug, kind: r.kind });
@@ -7597,6 +10336,35 @@ export function makeApp(config = CONFIG) {
       ? { sql: `(m.status = 'confirmed' OR m.author_id = ?)`, params: [me] }
       : { sql: `m.status = 'confirmed'`, params: [] };
   };
+
+  /* ── the same two questions about ONE song ────────────────────────────────
+     Music had only the list halves — `musicVisibleSql` above and
+     `gateSql({junction: 'music_tag'})` — because until now nothing served a
+     song by id. Snippets have the pair, and the comment on theirs is the
+     argument for why: the list and the media route disagreeing is how an id
+     that is absent from every page still hands out bytes to anyone who
+     guesses it. So the row-level twins live here, beside the fragments they
+     have to agree with. */
+  const MUSIC_GATES_ON = R.prepare(
+    `SELECT DISTINCT t.gate FROM music_tag mt JOIN tag t ON t.id = mt.tag_id
+      WHERE mt.music_id = ? AND ${TAG_LIVE} AND t.gate IS NOT NULL`);
+
+  /** The same rule, the same call, a different junction — which is the point
+   *  of the rule having moved. Fails CLOSED on a missing id for the reason
+   *  gateOk does: a throw where every other refusal is a 404 says the row
+   *  exists. */
+  const musicGateOk = (id, req) =>
+    can(req.person, 'content.view', { gates: gatesOn(MUSIC_GATES_ON, id) });
+
+  /** Published, or you may decide, or it is yours and still waiting — and not
+   *  a tombstone, and not behind a gate you do not hold. */
+  const musicVisible = (row, req) =>
+    !!row
+    && !row.retracted_at
+    && (row.status === 'confirmed'
+        || can(req.person, 'music.decide')
+        || (!!req.person?.id && row.author_id === req.person.id))
+    && musicGateOk(row.id, req);
 
   /* ---- concerts ----------------------------------------------------------
    *
@@ -7768,7 +10536,7 @@ export function makeApp(config = CONFIG) {
       const like = `%${q}%`;
       where.push(`(lower(m.title) LIKE ? OR lower(m.channel) LIKE ?
                    OR EXISTS (SELECT 1 FROM music_tag mt JOIN tag t ON t.id = mt.tag_id
-                               WHERE mt.music_id = m.id AND t.retracted_at IS NULL
+                               WHERE mt.music_id = m.id AND ${TAG_LIVE}
                                  AND (lower(t.name) LIKE ? OR t.slug LIKE ?)))`);
       params.push(like, like, like, like);
     }
@@ -7921,6 +10689,164 @@ export function makeApp(config = CONFIG) {
     });
   });
 
+  /* ── a file, rather than a link to somebody else's ────────────────────────
+   *
+   * For the case the module cannot otherwise reach: a concert that has been
+   * privated, exists on one disk, and is not on YouTube for anybody to link.
+   * Five or six of those ever, against three hundred links — so this is built
+   * narrow on purpose and reuses every part it can.
+   *
+   * WHERE THE BYTES GO is the whole design and it is not negotiable. They land
+   * in quarantine, which is the writable root, and the RECORDER moves them
+   * into `music/` — the same trip a poster takes and the same one a clip
+   * takes. The container never holds a write handle inside the tree it serves.
+   * `do_promote` already takes an arbitrary `{from, to}` and resolves it
+   * against its own root, so the Pi needed no change at all for this.
+   *
+   * NO SCHEMA CHANGE either, which is worth saying because the plan had one.
+   * `video_id` is NOT NULL UNIQUE and `url` is NOT NULL, and dropping those
+   * means rebuilding the table in SQLite — on a table `music_tag` references
+   * with ON DELETE CASCADE, so a rebuild that drops the old one takes every
+   * tag off every song. That is a real risk in exchange for tidiness. Instead
+   * the two columns hold honest non-YouTube values and `origin` carries the
+   * meaning, which is the column that already means "how did this row come to
+   * be". The two readers that assumed a YouTube id — the embed and the
+   * thumbnail — are both in musicRow and both now ask `origin` first.
+   */
+  const MUSIC_UP_MAX = Number(process.env.TENMA_MUSIC_UPLOAD_MAX_BYTES)
+    || 8 * 1024 * 1024 * 1024;
+  /* The four the media allowlist can type. A container ffprobe recognises but
+     this cannot serve is refused rather than stored, because a file nothing
+     can play is not preservation. */
+  const MUSIC_UP_EXT = { '.mp4': '.mp4', '.m4v': '.mp4', '.webm': '.webm',
+                         '.mkv': '.mkv', '.m4a': '.m4a' };
+  /* Where a song lives under the media root, which the RECORDER owns — it is
+     `archive_music_prefix` in its config, whose comment says that is the only
+     place the word lives. This is the one case the archive has to name it too,
+     because a promote payload has to say `to`; every other music path arrives
+     FROM the Pi in a report. Overridable, so the two can be kept in step
+     without a code change, and the same arrangement `posters/` already has in
+     seedArt. */
+  const MUSIC_PREFIX = (process.env.TENMA_MUSIC_PREFIX || 'music/')
+    .replace(/^\/+/, '').replace(/\/*$/, '/');
+
+  app.post('/api/music/upload', requireCap('music.upload'), async (req, res) => {
+    if (!config.quarantineRoot) {
+      return res.status(503).json({ error: 'uploads are disabled; set TENMA_QUARANTINE_ROOT' });
+    }
+    const me = req.person?.id ?? null;
+    if (!me) return res.status(401).json({ error: 'sign in first' });
+
+    /* The name comes from a header, the way /api/uploads takes it: the body is
+       the bytes and nothing else, so there is no form to read a field out of.
+       The EXTENSION is the only part trusted, and only as far as choosing
+       between four; everything about what the file IS comes from ffprobe. */
+    /* URI-decoded, because a header has to be latin-1 and a concert is called
+       something with a space and an apostrophe in it. A name that will not
+       decode is used as sent rather than refused — the name is a convenience
+       and the extension is the only part that decides anything. */
+    let given = String(req.get('x-upload-name') ?? '').trim().slice(0, 600);
+    try { given = decodeURIComponent(given); } catch { /* as sent, then */ }
+    given = given.slice(0, 300);
+    const ext = MUSIC_UP_EXT[extname(given).toLowerCase()] ?? null;
+    if (!ext) {
+      return res.status(415).json({
+        error: 'send it as .mp4, .webm, .mkv or .m4a',
+        accepts: [...new Set(Object.keys(MUSIC_UP_EXT))] });
+    }
+
+    const id = ulid();
+    const partAbs = join(config.quarantineRoot, `.part-${id}`);
+    const scrub = () => { try { rmSync(partAbs, { force: true }); } catch { /* gone */ } };
+
+    let bytes = 0, tooBig = false;
+    const meter = new Transform({
+      transform(chunk, _enc, cb) {
+        bytes += chunk.length;
+        if (bytes > MUSIC_UP_MAX) { tooBig = true; return cb(new Error('too big')); }
+        cb(null, chunk);
+      },
+    });
+    try {
+      await pipeline(req, meter, createWriteStream(partAbs));
+    } catch {
+      scrub();
+      return tooBig
+        ? res.status(413).json({
+            error: `uploads are capped at ${Math.round(MUSIC_UP_MAX / 1073741824)} GB`,
+            limit_bytes: MUSIC_UP_MAX })
+        : res.status(400).json({ error: 'the upload did not finish' });
+    }
+    if (!bytes) { scrub(); return res.status(400).json({ error: 'that was an empty file' }); }
+
+    /* ffprobe decides, exactly as it does for a clip. A duration is what this
+       row is missing that every linked row gets from the Pi, and it is also
+       what says the file is real: ffmpeg will describe a blob of nothing as a
+       stream with no duration rather than admit it cannot read it. */
+    const p = probeMedia(partAbs);
+    const cls = p ? classifyMedia(partAbs, p) : 'broken';
+    if (cls === 'broken' || cls === 'still') {
+      scrub();
+      return res.status(415).json({ error: 'that does not look like a recording' });
+    }
+    if (!(p.duration_s > 0)) {
+      scrub();
+      return res.status(415).json({ error: 'that has no duration this archive can read' });
+    }
+
+    const title = (given.replace(/\.[^.]+$/, '').replace(/[_]+/g, ' ')
+      .replace(/\s+/g, ' ').trim().slice(0, 300)) || null;
+
+    const rel = `${id}${ext}`;
+    try { renameSync(partAbs, join(config.quarantineRoot, rel)); }
+    catch (e) { scrub(); return res.status(500).json({ error: `could not store it: ${e.code}` }); }
+
+    /* `confirmed` where the uploader may also decide, which today is everyone
+       who may upload at all. Making somebody approve their own upload is a
+       screen that exists to be clicked through, and the capability at the door
+       already asked the only question worth asking. */
+    const mine = can(req.person, 'music.decide');
+    const t = now();
+    let job = null;
+    tx(W, () => {
+      W.prepare(
+        `INSERT INTO music(id, video_id, url, title, duration_s, bytes, note,
+                           probe_status, fetch_status, status, origin, author_id,
+                           created_at, updated_at)
+         VALUES(?,?,?,?,?,?,?, 'done','queued', ?, 'upload', ?,?,?)`)
+        .run(id,
+             /* Not a YouTube id and unmistakably so: eleven characters of
+                [A-Za-z0-9_-] is what one looks like, and this is twenty-nine
+                with a prefix. The Pi's own VIDEO_ID pattern rejects it too, so
+                a music job accidentally aimed at this row fails safely with
+                "the job does not name a video this worker can name a file
+                after" rather than fetching something. */
+             `up-${id}`,
+             /* Honest and useful: the archive's own copy IS where this lives,
+                and a row whose `url` pointed at nothing would read as a broken
+                link on a card that has no link. */
+             `/media/song/${id}`,
+             title, Math.round(p.duration_s), bytes,
+             String(req.body?.note ?? '').trim().slice(0, 500) || null,
+             mine ? 'confirmed' : 'proposed', me, t, t);
+      /* The tag from the duration we just measured, the same rule a probed
+         row gets. An uploaded concert with no `concert` tag lands on the wrong
+         shelf, which for a two-hour set is the whole difference. */
+      if (p.duration_s >= CONCERT_MIN_S) markConcert(id);
+      job = enqueueJob('promote', {
+        by: me, payload: { from: rel, to: `${MUSIC_PREFIX}${id}${ext}`, music_id: id } });
+    });
+
+    logEvent(req, 'uploaded', 'music', id,
+             { name: given || null, bytes, duration_s: Math.round(p.duration_s) });
+    bumpGeneration(W);
+    res.status(201).json({
+      music: musicRow(R.prepare('SELECT * FROM music WHERE id = ?').get(id),
+                      musicTagsFor([id]).get(id) ?? []),
+      job_id: job, next: 'promote',
+    });
+  });
+
   /** The verdict.
    *
    *  Through propose() rather than a direct UPDATE, and that is deliberate:
@@ -7951,7 +10877,15 @@ export function makeApp(config = CONFIG) {
 
     const t = now();
     let jobId = null;
-    if (want === 'confirmed' && m.fetch_status === 'none') {
+    /* `origin` in the condition, because an uploaded row must never queue a
+       fetch: its bytes arrived first, its `url` is this archive's own media
+       path, and sending the Pi to download a song from the server that asked
+       is a loop with nothing at the end of it. Today such a row lands
+       `confirmed` and never reaches this branch — but a promote that failed
+       leaves `fetch_status` at 'failed' rather than 'none', which is one
+       column value away from being the same bug, and the rule belongs in the
+       condition rather than in the arithmetic that happens to avoid it. */
+    if (want === 'confirmed' && m.fetch_status === 'none' && m.origin !== 'upload') {
       /* The download starts HERE and nowhere else. Fetching at submission time
          would mean the archive holds the bytes of things it has turned down —
          and deciding afterwards whether to keep them is a question nobody
@@ -8010,6 +10944,19 @@ export function makeApp(config = CONFIG) {
     const m = R.prepare('SELECT * FROM music WHERE id = ? AND retracted_at IS NULL')
       .get(req.params.id);
     if (!m) return res.status(404).json({ error: 'no such song' });
+
+    /* An uploaded row has nothing to ask the recorder FOR. There is no page to
+       re-read — the archive probed the file itself — and no video to fetch,
+       because the bytes arrived first and are the point. The `url` on such a
+       row is this archive's own media path, so a job aimed at it would send
+       the Pi to fetch a song from the server that is asking, and its own
+       VIDEO_ID pattern would refuse the id anyway. Refused here so the answer
+       is a sentence rather than a job that fails in an hour. */
+    if (m.origin === 'upload') {
+      return res.status(409).json({
+        error: 'that one was uploaded — there is no source to ask the recorder about',
+        origin: m.origin });
+    }
 
     /* Asking twice queues two of the same job, and the second answer overwrites
        the first with itself. Same guard, same wording, as the picture re-read
@@ -8199,7 +11146,7 @@ export function makeApp(config = CONFIG) {
    *  a search returns 0, 1 or many, and three different games are called
    *  Summer Camp. Picking is /api/tags/:id/seed below, and it needs no worker.
    */
-  app.post('/api/tags/:id/harvest', requireRole('editor'), (req, res) => {
+  app.post('/api/tags/:id/harvest', requireCap('tag.harvest'), (req, res) => {
     const t = R.prepare('SELECT id, name FROM tag WHERE id = ? AND retracted_at IS NULL')
       .get(req.params.id);
     if (!t) return res.status(404).json({ error: 'no such tag' });
@@ -8239,7 +11186,7 @@ export function makeApp(config = CONFIG) {
    *  recorder because the recorder is the only thing that writes the media
    *  tree. Nobody watches a cover arrive.
    */
-  app.post('/api/tags/:id/seed', requireRole('editor'), (req, res) => {
+  app.post('/api/tags/:id/seed', requireCap('tag.harvest'), (req, res) => {
     const t = R.prepare('SELECT id, name FROM tag WHERE id = ? AND retracted_at IS NULL')
       .get(req.params.id);
     if (!t) return res.status(404).json({ error: 'no such tag' });
@@ -8294,10 +11241,44 @@ export function makeApp(config = CONFIG) {
   }
 
   const POSTER_MAX_BYTES = Number(process.env.TENMA_POSTER_MAX_BYTES) || 8 * 1024 * 1024;
-  const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+  /* What a poster may BE, decided from the bytes.
+   *
+   * This was PNG and only PNG — one magic number, one hardcoded `.png` on the
+   * way out — which meant the ordinary case of dragging box art off a page was
+   * refused, because box art on the internet is a JPEG. The seeder has always
+   * written `.jpg` (IGDB serves JPEGs and converting one on a Pi to satisfy a
+   * regex would be a transcode for nothing), so the archive already held both
+   * and only the hand-upload door was narrow.
+   *
+   * The four the media allowlist can serve, and no more: the signature decides
+   * the extension, so a file is named after what it is rather than after what
+   * its sender claimed. Same reasoning as the allowlist on the way out — a
+   * browser that sniffs is how an upload becomes stored XSS on your own
+   * origin, and the defence is that every type reachable here is one a browser
+   * will not execute.
+   */
+  const POSTER_KINDS = [
+    { ext: '.png', bytes: 16, is: (b) => b.length >= 8
+      && b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
+    // FF D8 FF, and nothing about the fourth byte: it varies by encoder
+    // (E0 for JFIF, E1 for EXIF, DB for a bare table) and a stricter test
+    // refuses perfectly ordinary photographs.
+    { ext: '.jpg', bytes: 16, is: (b) => b.length >= 3
+      && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+    // RIFF....WEBP — the size is in between, so the two halves are checked
+    // apart. This is why the sniff needs twelve bytes and not eight.
+    { ext: '.webp', bytes: 16, is: (b) => b.length >= 12
+      && b.subarray(0, 4).toString('latin1') === 'RIFF'
+      && b.subarray(8, 12).toString('latin1') === 'WEBP' },
+    { ext: '.gif', bytes: 16, is: (b) => b.length >= 6
+      && ['GIF87a', 'GIF89a'].includes(b.subarray(0, 6).toString('latin1')) },
+  ];
+  const POSTER_SNIFF = 16;
+  const posterKind = (head) => POSTER_KINDS.find((k) => k.is(head)) ?? null;
 
   /* One handler, two subjects. A stream's poster and a tag's art are the same
-     operation down to the byte: PNG in, quarantine, promote job, and the
+     operation down to the byte: an image in, quarantine, promote job, and the
      caller writes `thumb_path` as the destination the file WILL have. Writing
      it twice is how one of them keeps the magic-number check and the other
      grows a content-type check instead. */
@@ -8319,10 +11300,17 @@ export function makeApp(config = CONFIG) {
     let bytes = 0, tooBig = false, head = null;
     const meter = new Transform({
       transform(chunk, _enc, cb) {
-        // The first bytes decide whether this is a PNG at all, and they are
-        // already in hand — cheaper than reading the file back afterwards, and
-        // it means a wrong file is refused without a second syscall.
-        if (head === null) head = Buffer.from(chunk.subarray(0, 8));
+        /* The first bytes decide what this is, and they are already in hand —
+           cheaper than reading the file back afterwards, and it means a wrong
+           file is refused without a second syscall.
+           ACCUMULATED rather than taken off the first chunk: WebP needs twelve
+           bytes to identify and a first chunk is not promised to be that long,
+           so reading `chunk.subarray(0, 8)` once would have failed a perfectly
+           good file that happened to arrive in small pieces. */
+        if (head === null || head.length < POSTER_SNIFF) {
+          head = head === null ? Buffer.from(chunk.subarray(0, POSTER_SNIFF))
+            : Buffer.concat([head, chunk.subarray(0, POSTER_SNIFF - head.length)]);
+        }
         bytes += chunk.length;
         if (bytes > POSTER_MAX_BYTES) { tooBig = true; return cb(new Error('too big')); }
         cb(null, chunk);
@@ -8344,12 +11332,20 @@ export function makeApp(config = CONFIG) {
        those are things the sender says, and this route names the file itself.
        Same reasoning as the media allowlist on the way out: a browser that
        sniffs is how an upload becomes stored XSS on your own origin. */
-    if (!head || head.length < 8 || !head.equals(PNG_MAGIC)) {
+    const kind = head ? posterKind(head) : null;
+    if (!kind) {
       scrub();
-      return res.status(415).json({ error: 'that is not a PNG' });
+      return res.status(415).json({
+        error: 'that is not an image this archive can serve',
+        accepts: POSTER_KINDS.map((k) => k.ext.slice(1)) });
     }
 
-    const rel = `${id}.png`;
+    /* Named after what the bytes SAY it is. The extension used to be a
+       hardcoded `.png`, which was correct while PNG was the only thing that
+       got through and would have been a quiet lie the moment a second type
+       did: `thumb_path` is written as this destination, and a JPEG stored as
+       `.png` is served as `image/png` by the extension table on the way out. */
+    const rel = `${id}${kind.ext}`;
     try { renameSync(partAbs, join(config.quarantineRoot, rel)); }
     catch (e) { scrub(); return res.status(500).json({ error: `could not store it: ${e.code}` }); }
 
@@ -8363,8 +11359,8 @@ export function makeApp(config = CONFIG) {
     res.json({ path: to, job, pending: true });
   };
 
-  app.post('/api/streams/:id/poster', requireRole('editor'), posterUpload('stream'));
-  app.post('/api/tags/:id/poster', requireRole('editor'), posterUpload('tag'));
+  app.post('/api/streams/:id/poster', requireCap('stream.poster'), posterUpload('stream'));
+  app.post('/api/tags/:id/poster', requireCap('tag.art'), posterUpload('tag'));
 
   // -------------------------------------------------------------------------
   // frontend
@@ -8455,7 +11451,8 @@ export function makeApp(config = CONFIG) {
    *  The anonymous question, deliberately — see rule 2 above. ANON is the
    *  archive's own word for nobody, and it is what every request carries
    *  before a cookie is read; asking with a bare null instead would be a
-   *  different, subtly weaker question, and `atLeast()` dereferences it.
+   *  different, subtly weaker question, and `can()` reads `person.role` off
+   *  it to find the capability set.
    */
   const publicSnippet = (id) => {
     const r = R.prepare(
@@ -8893,6 +11890,10 @@ ${r ? `  <div class="bar">
   });
 
   app.locals.close = () => { R.close(); W.close(); };
+  /* What the boot banner reads, and what a test can assert without a port.
+     On the app rather than logged from in here because makeApp() runs in every
+     suite, and a line per suite about four seeded roles is noise. */
+  app.roleState = roleState;
   return app;
 }
 
@@ -8929,9 +11930,34 @@ if (isMain) {
   };
 
   const app = makeApp();
+
+  /* The doors, checked against the manifest before the port opens.
+
+     After makeApp() and not beside assertCapabilities(), because it needs the
+     wired router rather than the tables — but still before listen(), so a
+     route somebody added without deciding who may reach it is a startup
+     failure and not a discovery. See routes.js.
+
+     `TENMA_ROUTES=1` prints the whole table and exits, which is the overview
+     and also how the manifest gets regenerated when routes legitimately
+     change: read it, check it, paste it. */
+  if (['1', 'true', 'yes'].includes((process.env.TENMA_ROUTES ?? '').toLowerCase())) {
+    console.log(renderRoutes(app));
+    process.exit(0);
+  }
+  assertRoutes(app);
+
   app.listen(CONFIG.port, CONFIG.host, () => {
     console.log(`flatfox  http://${CONFIG.host}:${CONFIG.port}`);
     console.log(`  db          ${dbPath}`);
+    /* Roles, because they are rows now and "which four" is no longer a thing
+       you can know by reading the source. Seeding is a first-run event, so it
+       is only ever printed once per archive. */
+    console.log(`  roles       ${app.roleState.roles.map((r) =>
+      r + (isSovereign(r) ? '*' : '')).join(', ')}`
+      + (app.roleState.seeded.length
+        ? `  (seeded ${app.roleState.seeded.join(', ')})` : '')
+      + `   * = holds everything`);
     console.log(`  media root  ${CONFIG.mediaRoot ?? '(unset — captures read unverified)'}`);
     console.log(`  cache root  ${CONFIG.cacheRoot ?? '(unset — posters only where the media tree has them)'}`);
     console.log(`  quarantine  ${quarantineState()}`);

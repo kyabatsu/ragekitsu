@@ -667,10 +667,26 @@ export function recompute(db, streamId, { mediaRoot = null, checkFiles = true } 
   });
 
   const verifiable = !!root;
-  const anyVideo = rows.some((r) => r.video_path);
-  const anyVideoOk = rows.some((r) => r.video_ok);
-  const anyChat = rows.some((r) => r.chat_path);
-  const anyChatOk = rows.some((r) => r.chat_ok);
+  /* A capture nobody meant to keep is not evidence of anything.
+     Both platforms get recorded and one master is usually enough, so the
+     second one is deleted on purpose — and with `declined` excluded from the
+     sums below, that deletion stops reading as `lost`. Without this the state
+     column called most of the archive lost, which is both false and the
+     fastest way to make a status nobody reads. */
+  const live = rows.filter((r) => r.video_state !== 'declined');
+  const liveChat = rows.filter((r) => r.chat_state !== 'declined');
+  const anyVideo = live.some((r) => r.video_path);
+  const anyVideoOk = live.some((r) => r.video_ok);
+  const anyChat = liveChat.some((r) => r.chat_path);
+  const anyChatOk = liveChat.some((r) => r.chat_ok);
+  /* ...and when EVERY copy was declined, the stream says so rather than
+     falling through to `never`. `never` means nobody ever had one; this means
+     somebody had one and chose. That difference is the entire reason the
+     column is a vocabulary instead of a boolean. */
+  const allDeclined = (list, key) =>
+    list.length > 0 && list.every((r) => r[key] === 'declined');
+  const vodDeclined = allDeclined(rows, 'video_state');
+  const chatDeclined = allDeclined(rows, 'chat_state');
 
   const started = s.started_at;
   let duration = s.duration_s;
@@ -702,7 +718,7 @@ export function recompute(db, streamId, { mediaRoot = null, checkFiles = true } 
   const state = (anyLink, anyOk) =>
     !anyLink ? 'never' : anyOk ? 'present' : (verifiable ? 'lost' : 'unverified');
 
-  let vod = state(anyVideo, anyVideoOk);
+  let vod = vodDeclined ? 'declined' : state(anyVideo, anyVideoOk);
   if (vod === 'present' && duration) {
     const best = Math.max(0, ...rows.filter((r) => r.video_ok)
       .map((r) => r.file_duration_s ?? 0));
@@ -730,7 +746,7 @@ export function recompute(db, streamId, { mediaRoot = null, checkFiles = true } 
   }
   const chat = s.chat_path
     ? (chatOkMerged === null ? 'unverified' : (chatOkMerged ? 'present' : 'lost'))
-    : state(anyChat, anyChatOk);
+    : chatDeclined ? 'declined' : state(anyChat, anyChatOk);
 
   // Two absolute clocks are the truth; offset_s is a view of one of them,
   // resynced here so deepLink() and anything else reading it stay correct after
@@ -1354,6 +1370,22 @@ export const WRITABLE = {
     tz_offset_min: 'int', duration_s: 'int', serve_pref: 'text',
     thumb_path: 'text', merged_into: 'text',
     chat_path: 'text', chat_sources: 'text',
+    /* What a merged chat file says about itself, in the archive's field
+       names. Writable because the audit has to be able to propose them: its
+       plan becomes a changeset, and a changeset writes one named column at a
+       time, so a description that cannot travel this road does not travel at
+       all — which is exactly what happened. Every entry merged from the
+       website got its `chat_path` and none of its description, and the
+       theater, handed nothing, drew a warning about a perfectly good file.
+       See `chat_meta_path` in apply(), which is what keeps the six together.
+
+       They are observations, not opinions — the header of a file, read — so
+       the usual argument against a machine writing a column does not apply.
+       The record editor does not offer them and should not; it enumerates
+       its own fields and has never read this table. */
+    chat_version: 'int', chat_messages: 'int',
+    chat_first_ms: 'int', chat_last_ms: 'int',
+    chat_moderation: 'chat_mod',
     // vod_state and chat_state are DELIBERATELY absent.
     //
     // They were writable, and the record editor offered them as enums, but
@@ -1392,6 +1424,17 @@ export const WRITABLE = {
     alive: 'bool',
     file_duration_s: 'int', video_path: 'text', chat_path: 'text',
     thumb_path: 'text', mirror_url: 'text', mirror_platform: 'text',
+    /* WRITABLE, where the stream's `vod_state` and `chat_state` are
+       deliberately not — and the difference is the whole reason those two are
+       refused above. Those are DERIVED: recompute() rewrites them on the next
+       write to the row, so a hand-set value reverted the instant anything
+       touched the stream and looked like a field refusing to hold.
+       These are not derived. They are an OBSERVATION the worker reports —
+       "the file is here", "I deleted it on purpose" — and recompute only ever
+       reads them, to decide whether a missing file counts as a loss. Nothing
+       rewrites them, so nothing can quietly undo an edit, and an audit needs
+       to be able to propose one. */
+    video_state: 'text', chat_state: 'text',
   },
   note: {
     stream_id: 'text', frame: 'text', anchor_id: 'text', anchor_clock: 'text',
@@ -1518,6 +1561,20 @@ const REMEMBER_ON_DELETE = {
   stream_tag: ['stream_id', 'tag_id'],
   music_tag: ['music_id', 'tag_id'],
 };
+
+// Every junction the archive has, and the pair that identifies one. The same
+// three tables as REMEMBER_ON_DELETE and the same two columns, which is not a
+// coincidence and is also not the same question: that list is what a hard
+// delete has to write down, this one is "what tables join a tag to a thing".
+// Named because there are now three places that walk it — the create dedupe,
+// the confirm-on-attach pass, and cascadeTag — and the comment on the first
+// of them already says it out loud: every junction belongs here, and a new one
+// that is not is the same bug waiting.
+const JUNCTIONS = {
+  stream_tag: ['stream_id', 'tag_id'],
+  snippet_taglet: ['snippet_id', 'tag_id'],
+  music_tag: ['music_id', 'tag_id'],
+};
 const OPS = new Set(['create', 'update', 'delete']);
 
 // Closed vocabularies, checked at validate time so a typo cannot become a
@@ -1544,6 +1601,14 @@ const ENUMS = {
      left to diverge. */
   'tag.kind': ALL_KINDS,
   'tag.status': ['proposed', 'confirmed'],
+  /* Why a capture has no local copy. Closed here as well as at the ingest
+     route, because a changeset and a worker packet are two different doors
+     into the same column and only one of them was guarded. `unverified` is in
+     the list so a state can be walked BACK to "nobody has looked" — the
+     alternative is that a wrong `declined` can only be corrected to another
+     positive claim. */
+  'capture.video_state': ['kept', 'declined', 'lost', 'unverified'],
+  'capture.chat_state': ['kept', 'declined', 'lost', 'unverified'],
   /* The three collections. Named for the panels rather than for the file types
      they tend to hold, because the split is by provenance: a meme is often an
      mp4 and a snippet is sometimes a gif. */
@@ -1571,18 +1636,32 @@ const ENUMS = {
   'music.status': ['proposed', 'confirmed', 'rejected'],
 };
 
+/** Fields a person may never write directly, whatever capability they hold.
+ *
+ *  One entry per (type, field). Both are `status`, and both are the same
+ *  thing: the answer to "is this published". See the throw in validate() for
+ *  why holding an edit capability must not be holding this. */
+const VERDICT_FIELDS = new Set(['snippet.status', 'music.status']);
+
 /* ── who may propose what ──────────────────────────────────────────────────
  *
  * One capability per (target_type, op), asked of every change in a changeset
  * before any of it is written.
  *
- * ABSENT MEANS NO CAPABILITY IS REQUIRED, and that is deliberate rather than
- * an oversight: only the tag half of the archive has moved onto capabilities
- * so far. Notes, segments, streams, captures and snippets are exactly as they
- * were — gated once at the route by requireRole('suggester') and then trusted
- * — so this change cannot break a write path it was not aimed at. Moving them
- * over later is adding rows here, and each row is a decision somebody has to
- * make on purpose.
+ * ABSENT MEANS NO CAPABILITY IS REQUIRED, which is a BYPASS and not a
+ * refusal — so the table is total. It was not, until 17 Sep: five of the ten
+ * writable types had no row here, because only the tag half of the archive had
+ * moved onto capabilities. Streams, captures, notes, segments and snippets
+ * were gated once at the route and then trusted, which was safe while the
+ * route asked for a rung and everything above that rung could do all of it.
+ *
+ * It stops being safe the moment a role is a bag somebody assembles: a role
+ * that may write chapters but not retitle a broadcast was not expressible,
+ * because both rode on the single door of `/api/changesets`. The five rows
+ * below are that gap closed — six capabilities over five types, because a
+ * broadcast and a clip each split a retraction off from an edit. Each is
+ * granted from suggester up, which is
+ * exactly who could already reach the route, so nobody's access changed.
  *
  * The whole map is about the VERB, never about the queue. Nothing here says
  * whether a change applies immediately; that is `change.apply`, asked once in
@@ -1616,6 +1695,68 @@ const CHANGE_CAPS = {
   'music_tag:create': 'tag.attach',
   'music_tag:update': 'tag.attach',
   'music_tag:delete': 'tag.detach',
+  /* ── the five that had no row until 17 Sep ───────────────────────────────
+   *
+   * A BROADCAST'S RECORD. Create and update are one capability because they
+   * are one FORM: the record panel writes both, in `new` mode and in `edit`
+   * mode, off the same fields and the same save. Two names there would be two
+   * ticks that can only ever be held together, and a role with one and not
+   * the other would meet a form that saves half of itself.
+   *
+   * A CAPTURE belongs to that same record and has no surface of its own — it
+   * is edited in the stream's panel, and one save commonly writes stream rows
+   * and capture rows in the same changeset. So it is `stream.edit` too, for
+   * the reason `music_tag` is `tag.attach` above: the name is about the act,
+   * not about the table. */
+  'stream:create': 'stream.edit',
+  'stream:update': 'stream.edit',
+  'capture:create': 'stream.edit',
+  'capture:update': 'stream.edit',
+  'capture:delete': 'stream.edit',
+  /* Its own capability, and the only one of the five that is split off,
+     because taking a broadcast out of the index is not the same trust as
+     correcting its title. It TOMBSTONES — `retracted_at` is writable so the
+     toast can offer an Undo — exactly like `tag.retract`, and the name says
+     which of the two it is. */
+  'stream:delete': 'stream.retract',
+  /* NOTES. One name over all three ops: a note is a line of text, the tick-off
+     is an `update`, and deleting your own typo is the same gesture-class as
+     writing it. `note.export` is the other half of this area and is a
+     different thing — it hands out notes that may not be published yet. */
+  'note:create': 'note.write',
+  'note:update': 'note.write',
+  'note:delete': 'note.write',
+  /* CHAPTERS. `segment` is the table; `chapter` is the word the archive uses
+     for them everywhere a person reads one, and a capability is a row on a
+     checklist somebody ticks. Sub-chapters are the same act in the inner lane
+     — `lane` is a writable field for exactly that reason — so they are not a
+     second name. */
+  'segment:create': 'chapter.edit',
+  'segment:update': 'chapter.edit',
+  'segment:delete': 'chapter.edit',
+  /* A CLIP OR PICTURE'S own record — its title, its description, which
+     collection it is filed in. Not its transcript, which is `transcript.edit`
+     through its own routes and is not a changeset at all; and not its
+     `status`, which is the verdict.
+     `status` IS in WRITABLE.snippet, so this capability can propose one — and
+     that is the same property `music.edit` has had all along, deliberately: a
+     proposed verdict on your own upload is a suggestion, and it queues, so
+     somebody holding `review.decide` still decides. What makes it worth
+     knowing rather than merely true is that `change.apply` becomes tickable on
+     its own in step D, and a role holding both would be deciding its own
+     verdicts. See AUTH.md. */
+  'snippet:update': 'snippet.edit',
+  /* NOT `snippet.purge`, which was the first answer and was wrong twice over.
+     `snippet` is in TOMBSTONED, so `op:'delete'` here sets `retracted_at` and
+     is reversible — and `snippet.purge` is the separate admin route that
+     destroys the file. Exactly the `tag:delete` -> `tag.retract` shape one
+     screen up, and named the same way so the pair reads as the pair it is.
+     `kinds.mjs` is what said so: it retracts a meme through this op, and
+     mapping it to the purge broke a test whose whole subject is that a
+     collection has no verbs of its own. */
+  'snippet:delete': 'snippet.retract',
+  // Nothing sends this one, and the table is total rather than minimal.
+  'snippet:create': 'snippet.upload',
 };
 
 /** The capability a change needs, or null when it needs none. */
@@ -1667,8 +1808,79 @@ export class ChangeError extends Error {
   }
 }
 
+const MODERATION = new Set(['complete', 'none', 'unknown']);
+
+/** Moderation coverage as one canonical string, or null if it is not one.
+ *
+ *  Canonical because it is COMPARED, not merely stored. ls-audit reads the
+ *  stream back before every write and skips whatever already matches, and
+ *  that comparison is a string one — so {"YT":"a","TW":"b"} and
+ *  {"TW":"b","YT":"a"} being two spellings of one fact would make this field
+ *  collide on every sweep for the rest of the project's life. Sorted keys,
+ *  no spaces, and the same shape produced on the ls-audit side.
+ *
+ *  Exported because the ingest route validates with it too. One wire format,
+ *  one validator: the value is read back out with JSON.parse on the way to
+ *  the page, so a spelling only one road refuses is a 500 on a stream nobody
+ *  can open.
+ */
+/** The video id inside a pasted link, and which platform it belongs to.
+ *
+ *  Mirrors `ls_common.extract_video_id_from_url` on the Pi, spelling for
+ *  spelling, because the two have to agree about what an id IS — the archive
+ *  files the claim and the recorder looks the id up.
+ *
+ *  It exists because the box that asks "which video is this?" was taking
+ *  whatever was typed and filing it verbatim. Pasting a link is the natural
+ *  thing to do there, and the claim then held a URL where every reader
+ *  expected an id: it matched nothing, settled nothing, and the next audit
+ *  asked the same question again. Silent, and permanent.
+ *
+ *  Three Twitch spellings because the archive has written all three over the
+ *  years; only the first is written now, but old vault entries hold the
+ *  others and those entries are the input. The optional `v` is yt-dlp's VOD
+ *  id form.
+ *
+ *  Returns `{ id, platform }`, or nulls when it is not a link this
+ *  recognises — which includes the ordinary case of somebody pasting a bare
+ *  id, and the caller keeps that as-is.
+ */
+export function idFromUrl(url) {
+  const s = String(url ?? '');
+  let m = s.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+  if (m) return { id: m[1], platform: 'youtube' };
+  m = s.match(/twitch\.tv\/(?:[^/]+\/)?videos?\/v?(\d+)/);
+  if (m) return { id: m[1], platform: 'twitch' };
+  return { id: null, platform: null };
+}
+
+export const canonModeration = (v) => {
+  let o = v;
+  if (typeof o === 'string') { try { o = JSON.parse(o); } catch { return null; } }
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return null;
+  const keys = Object.keys(o).sort();
+  if (!keys.length) return null;
+  for (const k of keys) {
+    if (!['YT', 'TW'].includes(k) || !MODERATION.has(String(o[k]))) return null;
+  }
+  return JSON.stringify(Object.fromEntries(keys.map((k) => [k, String(o[k])])));
+};
+
 function cast(kind, value) {
   if (value === null || value === undefined || value === '') return null;
+  /* Refused rather than coerced. This column is JSON.parse'd on the way to
+     the page, so a value that is not the agreed shape is not a cosmetic
+     wrong — it is a 500 on every read of a stream that otherwise opens
+     fine. Whatever cannot be canonicalised never reaches the column. */
+  if (kind === 'chat_mod') {
+    const c = canonModeration(value);
+    if (c === null) {
+      throw new ChangeError(
+        `${JSON.stringify(value)} is not moderation coverage ` +
+        '(expected {"YT"|"TW": "complete"|"none"|"unknown"})');
+    }
+    return c;
+  }
   if (kind === 'int') {
     const n = Number(value);
     if (!Number.isFinite(n)) throw new ChangeError(`${value} is not a number`);
@@ -1739,6 +1951,34 @@ export function validate(db, changes, person = null) {
       throw new ChangeError(`'${field}' is not writable on ${tt}; allowed: ` +
         Object.keys(WRITABLE[tt]).sort().join(', '));
     }
+    /* ── the verdict is not an edit ───────────────────────────────────────
+     *
+     * `status` is writable on `snippet` and on `music`, and CHANGE_CAPS is
+     * keyed on (type, op) — it cannot tell a verdict from a title. So
+     * `snippet.edit` and `music.edit` could each PROPOSE a publication.
+     *
+     * That was harmless while a role was a rung: nobody holding an edit
+     * capability also held `change.apply` without holding `review.decide`
+     * beside it, so the proposal queued and somebody else decided. It stops
+     * being harmless the moment a role is a bag somebody assembles, because
+     * `change.apply` becomes tickable on its own — a role given `snippet.edit`
+     * and `change.apply` and nothing else would have been applying its own
+     * verdicts.
+     *
+     * So the field is trusted-only. The two review routes keep writing it,
+     * because they go through `propose({ trusted: true })` already and are
+     * themselves behind `review.decide` and `music.decide` — so the history
+     * does not change shape at all, and the capability that decides a verdict
+     * is the one whose name says it does.
+     *
+     * It stays in WRITABLE deliberately: `currentValue` reads that table, and
+     * the change log resolving its own past depends on it. What changes is who
+     * may put a row in, not whether the column is a legitimate target. */
+    if (person && VERDICT_FIELDS.has(`${tt}.${field}`)) {
+      throw new ChangeError(
+        `${tt}.${field} is a verdict, not an edit — it is set by the review `
+        + `route, which asks for the capability that decides one`);
+    }
     const value = cast(WRITABLE[tt][field], raw.value);
     const allowed = ENUMS[`${tt}.${field}`];
     if (allowed && value !== null && !allowed.includes(value)) {
@@ -1755,13 +1995,136 @@ export function validate(db, changes, person = null) {
   }
 
   for (const [tid, tt] of creating) {
-    const got = new Set(out.filter((c) => c.target_id === tid && c.op === 'create' && c.field)
-      .map((c) => c.field));
+    const mine = out.filter((c) => c.target_id === tid && c.op === 'create' && c.field);
+    const got = new Set(mine.map((c) => c.field));
     const missing = REQUIRED[tt].filter((f) => !got.has(f));
     if (missing.length) throw new ChangeError(`creating a ${tt} needs ${missing.join(', ')}`);
+
+    /* ── a create that cannot possibly land ───────────────────────────
+     *
+     * `capture` has UNIQUE(stream_id, platform): one recording per platform
+     * per entry. Nothing checked it here, so a second YouTube capture on an
+     * entry that already had one passed validation, became a changeset, sat
+     * in Review looking like work, and threw SQLITE_CONSTRAINT at apply —
+     * an `internal error` on the press, and again on every attempt to accept
+     * it, with dismissing the only way out.
+     *
+     * Checked at PROPOSE because that is where a person is standing. A
+     * changeset that cannot be applied is not a decision anybody should be
+     * asked to review, and a constraint is not an error message: the
+     * sentence below says which entry, which platform, and what to do.
+     *
+     * The apply-time constraint stays, obviously. This is the courtesy; that
+     * is the guarantee.
+     */
+    if (tt === 'capture') {
+      const val = (f) => mine.find((c) => c.field === f)?.value ?? null;
+      const sid = val('stream_id');
+      const plat = String(val('platform') ?? '').toUpperCase();
+      if (sid && plat) {
+        const had = db.prepare(
+          'SELECT id FROM capture WHERE stream_id = ? AND platform = ?').get(sid, plat);
+        if (had) {
+          const idx = db.prepare('SELECT idx FROM stream WHERE id = ?').get(sid)?.idx;
+          throw new ChangeError(
+            `${idx ? `entry #${idx}` : 'this stream'} already has a `
+            + `${plat === 'YT' ? 'YouTube' : 'Twitch'} recording. An entry holds `
+            + `one per platform — edit the one that is there, or add the other `
+            + `platform instead.`);
+        }
+      }
+    }
   }
   authorize(person, out);
   return out;
+}
+
+/* ── one tag, one slug ─────────────────────────────────────────────────────
+ *
+ * `UNIQUE(slug)` is table-wide, so a name is owned by exactly one row and
+ * there is no minting around it — not around a live row and not around a
+ * tombstone either. Two people asking for the same tag is agreement rather
+ * than a conflict, so a create that lands on an occupied slug FOLDS onto the
+ * row already there and everything else in the changeset is repointed at it.
+ *
+ * This now happens TWICE, and both are needed. propose() folds so that the
+ * second suggester's row never exists to collide in the first place; apply()
+ * folds as the backstop, for two proposals that raced between transactions
+ * and for any changeset left open across a deploy. The detection and the
+ * repointing live here so those two cannot drift. What each side then WRITES
+ * is its own business and is deliberately different: propose() records the
+ * revival a tombstone needs and lets the approval perform it, apply()
+ * performs it.
+ */
+
+/** The row that already owns this name's slug, or null when it is free. */
+function tagSlugClash(db, name, tid) {
+  const slug = slugify(name);
+  /* `retracted_at` comes back and is deliberately NOT filtered out. It cannot
+     be: a tombstoned row still owns its name, and a second row with the same
+     slug is not a thing this schema can hold. The original bug was folding
+     onto one WITHOUT NOTICING — the changeset applied, the toast said yes, and
+     everything pointed at a row that every list filters out of existence. */
+  const existing = db.prepare(
+    'SELECT id, name, kind, status, retracted_at FROM tag WHERE slug = ?').get(slug);
+  if (!existing || existing.id === tid) return null;
+  return { slug, existing };
+}
+
+/** Point every change row and every pending create that named `tid` at `to`. */
+function repointCreate(db, { changes, creates, tid, to }) {
+  creates.delete(tid);
+  for (const ch of changes) {
+    if (ch.value === tid && ch.target_type !== 'tag') {
+      db.prepare('UPDATE change SET value = ? WHERE id = ?').run(to, ch.id);
+      ch.value = to;
+    }
+  }
+  /* `creates` was gathered before this rewrite, so it still holds the id just
+     discarded. Rewriting only the change rows leaves the pending INSERTs
+     pointing at a row that will never exist, and the whole changeset dies on
+     a foreign key instead. */
+  for (const pending of creates.values()) {
+    for (const [k, v] of Object.entries(pending.fields)) {
+      if (v === tid) pending.fields[k] = to;
+    }
+  }
+}
+
+/** A changeset's creates, gathered by the row each one builds. */
+function createsOf(changes) {
+  const creates = new Map();
+  for (const c of changes) {
+    if (c.op !== 'create') continue;
+    if (!creates.has(c.target_id)) {
+      creates.set(c.target_id, { type: c.target_type, fields: {} });
+    }
+    creates.get(c.target_id).fields[c.field] = c.value;
+  }
+  return creates;
+}
+
+/** Take a tag off everything that carries it, as ONE changeset.
+ *
+ *  Not three DELETEs. The changeset names every junction it removes, which is
+ *  what lets the log say why forty snippets lost a tag instead of forty rows
+ *  quietly changing shape — and because REMEMBER_ON_DELETE records the pair on
+ *  the way out, the changeset IS the undo.
+ *
+ *  `Retract everywhere` wants exactly this and should call it rather than
+ *  growing its own copy.
+ */
+export function cascadeTag(db, tagId, { by = null, reason = null } = {}) {
+  const changes = [];
+  for (const jt of Object.keys(JUNCTIONS)) {
+    for (const r of db.prepare(`SELECT id FROM ${jt} WHERE tag_id = ?`).all(tagId)) {
+      changes.push({ target_type: jt, target_id: r.id, op: 'delete' });
+    }
+  }
+  if (!changes.length) return { detached: 0, changeset_id: null };
+  const out = propose(db, { authorId: by, trusted: true, autoApply: true,
+                            reason, changes });
+  return { detached: changes.length, changeset_id: out?.id ?? null };
 }
 
 /** Record a changeset. Applies it immediately when the author may.
@@ -1789,6 +2152,11 @@ export function propose(db, { authorId = null, person = null, trusted = false,
   const auto = autoApply !== null ? !!autoApply : can(person, 'change.apply');
   const t = now();
   const csId = ulid();
+  /* Out here for the same reason apply()'s own copy is: the fold happens
+     inside the transaction and the response is assembled after it, so a
+     rollback throws straight past the return and a half-resolved list can
+     never be reported as an outcome. */
+  const merged = [];              // tag creates folded onto a row that existed
 
   tx(db, () => {
     db.prepare(`INSERT INTO changeset(id, author_id, reason, status, created_at)
@@ -1817,6 +2185,127 @@ export function propose(db, { authorId = null, person = null, trusted = false,
         .run(ulid(), csId, i, c.target_type, c.target_id, c.op,
              c.field ?? null, c.value ?? null, base === null ? null : String(base));
     });
+
+    /* ── the tag rows land NOW, not at approval ─────────────────────────────
+       A suggester with ten pictures of one character should type her name
+       once. That means the tag they minted has to be a real row with a real
+       id from the moment they suggest it: a junction points at an id, and
+       `taglets: ['tokoyami-towa']` on an upload matches a SLUG — and neither
+       of those exists while a create is only a change row waiting for a yes.
+       So the row is inserted here as `proposed`, and an approval PROMOTES it
+       rather than creating it.
+
+       Materialising early publishes nothing. `proposed` is out of every
+       public query — the status condition on the tag joins in server.js is
+       what holds that — and out of every picker but its author's and an
+       editor's. What it buys is the name typed once and attached ten times,
+       which is what a suggester actually does.
+
+       This is also where the slug fold has to happen, for the same reason: if
+       A's pending `smiley` is a row, B's mint of `smiley` would hit
+       UNIQUE(slug) here instead of being quietly folded onto it at approval
+       time. Folding at propose means B never creates a second row, both see
+       the one pending tag, and ONE approval serves them both. */
+    const rows = db.prepare(
+      'SELECT * FROM change WHERE changeset_id = ? ORDER BY seq').all(csId);
+    const creates = createsOf(rows);
+    let seq = rows.length;
+    const record = (id, field, from, to) => {
+      db.prepare(`INSERT INTO change(id, changeset_id, seq, target_type, target_id,
+                    op, field, value, base_value) VALUES(?,?,?,?,?,'update',?,?,?)`)
+        .run(ulid(), csId, seq++, 'tag', id, field,
+             to === null ? null : String(to), from === null ? null : String(from));
+    };
+
+    for (const [tid, c] of [...creates]) {
+      if (c.type !== 'tag' || !c.fields.name) continue;
+      const clash = tagSlugClash(db, c.fields.name, tid);
+      if (clash) {
+        const { existing } = clash;
+        repointCreate(db, { changes: rows, creates, tid, to: existing.id });
+        /* And the create rows go, which apply()'s fold never had to do: there
+           they were already written and the INSERT was driven off the
+           in-memory map, so a leftover row was invisible. Here the changeset
+           is about to be READ — by the review queue, by the author's own
+           history — and a create for a tag that will never exist is a line
+           that cannot be rendered and cannot be undone. The collision is
+           still on the record, as the `name` change row written just below,
+           which is what that row has always been for. */
+        db.prepare(
+          `DELETE FROM change WHERE changeset_id = ? AND op = 'create'
+                                AND target_type = 'tag' AND target_id = ?`)
+          .run(csId, tid);
+        for (let i = rows.length - 1; i >= 0; i--) {
+          if (rows[i].op === 'create' && rows[i].target_type === 'tag'
+              && rows[i].target_id === tid) rows.splice(i, 1);
+        }
+        /* The SAME shape apply() reports, and the same key on the way out.
+           Two lists would mean every caller had to read both and know which
+           stage resolved what, which is one more thing to get wrong than it
+           is worth — `status` is the only addition, because "you folded onto
+           something that is itself still pending" is a different sentence from
+           "onto a tag that exists". */
+        merged.push({ wanted: tid, resolved_to: existing.id, slug: clash.slug,
+                      status: existing.status,
+                      ...(existing.retracted_at ? { restored: true } : {}) });
+        if (existing.retracted_at) {
+          /* QUEUED, not done. Asking for the name again is the reversal, and
+             `tag.retract` says "reversible" out loud at the same rank as
+             `tag.create` — so there is nothing to escalate. But a suggester's
+             ask still waits for the yes every other ask waits for, so the
+             revival is written as change rows and the approval performs it.
+             The name goes in AS TYPED: slugify() is case-insensitive, so
+             "Limbus Company" and "LIMBUS COMPANY" are one row, and handing
+             back a tombstone still wearing its old shouting is not what was
+             asked for. */
+          record(existing.id, 'retracted_at', existing.retracted_at, null);
+          record(existing.id, 'name', existing.name, c.fields.name);
+        } else {
+          /* From and to the name it already has. This row exists so the log
+             shows the name was what collided; recording the TYPED name on
+             both sides read as a rename that never happened. A LIVE row keeps
+             its name — renaming a tag forty streams already carry, as a side
+             effect of somebody else's mint colliding with it, is a bigger
+             edit than the one they made and not one they were shown. */
+          record(existing.id, 'name', existing.name, existing.name);
+        }
+        /* And the KIND, if they disagreed about it.
+           `name` and `slug` are UNIQUE and `kind` is an ordinary column, so
+           "smiley · general" and "smiley · meta" are not two tags — they are
+           one tag and an argument about which drawer it goes in. Dropping the
+           create silently would throw that argument away, and applying it
+           silently would let a mint that collided re-file a tag forty streams
+           already carry. So it becomes an ordinary kind change on the row that
+           exists: applied where the person may apply, queued where they may
+           not, and visible in the review queue either way.
+           Never FROM a real kind TO 'unknown' — that direction is the mint
+           row's default rather than anybody's opinion, and a tag somebody has
+           already filed should not be un-filed by a name collision. */
+        const want = c.fields.kind;
+        if (want && want !== 'unknown' && want !== existing.kind) {
+          record(existing.id, 'kind', existing.kind, want);
+        }
+        continue;
+      }
+      /* Provenance is stamped here and never taken from the payload, and
+         `status` with it — `tag.status` is a writable field, so a create
+         carrying `status: 'confirmed'` is exactly the escalation this has to
+         refuse. Set after the spread, so the payload cannot win. */
+      const fields = { ...c.fields };
+      fields.slug = slugify(fields.name);
+      fields.origin = 'user';
+      fields.author_id = authorId;
+      fields.status = 'proposed';
+      // No guess at a category. 'unknown' is shared, so an unfiled row shows
+      // up in both pickers rather than hiding on the surface it was not
+      // minted from; whoever files it decides where it belongs.
+      if (!fields.kind) fields.kind = 'unknown';
+      const cols = ['id', ...Object.keys(fields), 'created_at', 'updated_at'];
+      db.prepare(`INSERT INTO tag(${cols.join(',')}) ` +
+                 `VALUES(${cols.map(() => '?').join(',')})`)
+        .run(tid, ...Object.values(fields), t, t);
+    }
+
     /* A proposal is a write. It adds rows the read API serves — the review
        queue, the stream's history, the "2 open suggestions" badge — and
        `generation` is what every ETag is keyed on. Without this bump the
@@ -1846,7 +2335,13 @@ export function propose(db, { authorId = null, person = null, trusted = false,
     resolved = done?.merged ?? null;
   }
   const out = summary(db, csId);
-  if (resolved?.length) out.merged = resolved;
+  /* One list, in the order the two stages ran. propose() folds first, so by
+     the time apply() looks there is usually nothing left for it — but a
+     changeset that was already open, or a genuine race between two
+     transactions, still resolves there, and a caller should not have to know
+     which of the two answered in order to read the answer. */
+  const all = [...merged, ...(resolved ?? [])];
+  if (all.length) out.merged = all;
   return out;
 }
 
@@ -1951,19 +2446,18 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
     // A create arrives as several rows sharing one target_id; collect them into
     // a single INSERT so the row is never half-built and a reviewer can never
     // leave half a stream behind.
-    const creates = new Map();          // target_id -> { type, fields }
-    for (const c of changes) {
-      if (c.op !== 'create') continue;
-      if (!creates.has(c.target_id)) {
-        creates.set(c.target_id, { type: c.target_type, fields: {} });
-      }
-      creates.get(c.target_id).fields[c.field] = c.value;
-    }
+    const creates = createsOf(changes);  // target_id -> { type, fields }
     // Two people can both propose "Mario Kart" before either is reviewed. Both
     // mint their own ULID, and the second to be approved would hit UNIQUE(slug)
     // and roll the whole changeset back — losing an otherwise good suggestion
     // over a race. Resolve instead: point the rest of the changeset at the row
     // that already exists, and write down that it happened.
+    //
+    // THE BACKSTOP now, rather than the only line of defence: propose() folds
+    // first, so by the time anything reaches here the two mints of one name
+    // have usually already become one row. What is left for this to catch is a
+    // genuine race between two transactions, and any changeset that was open
+    // before propose-time folding existed.
     //
     // One vocabulary now, so this runs once. It used to loop over `tag` and
     // `taglet` — two lists that collided in exactly the same way, which was
@@ -1972,33 +2466,13 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
       const vocab = 'tag';
       for (const [tid, c] of [...creates]) {
         if (c.type !== vocab || !c.fields.name) continue;
-        const slug = slugify(c.fields.name);
-        /* retracted_at comes back too, and the query deliberately does NOT
-           filter it out. It cannot: UNIQUE(slug) is table-wide, so a
-           tombstoned row still owns its name and there is no minting around
-           it — a second row with the same slug is not a thing this schema can
-           hold. The bug was folding onto one WITHOUT NOTICING: the changeset
-           applied, the toast said yes, and everything pointed at a row that
-           every list filters out of existence. */
-        const existing = db.prepare(
-          `SELECT id, name, retracted_at FROM ${vocab} WHERE slug = ?`).get(slug);
-        if (!existing || existing.id === tid) continue;
-        creates.delete(tid);
-        for (const ch of changes) {
-          if (ch.value === tid && ch.target_type !== vocab) {
-            db.prepare('UPDATE change SET value = ? WHERE id = ?').run(existing.id, ch.id);
-            ch.value = existing.id;
-          }
-        }
-        // `creates` was collected from `changes` before this rewrite, so it
-        // still holds the id we just discarded. Rewriting only the change rows
-        // leaves the pending INSERTs pointing at a row that will never exist,
-        // and the whole changeset dies on a foreign key instead.
-        for (const pending of creates.values()) {
-          for (const [k, v] of Object.entries(pending.fields)) {
-            if (v === tid) pending.fields[k] = existing.id;
-          }
-        }
+        /* Detection and repointing are shared with propose() — see the block
+           above tagSlugClash(). What differs is only what happens next, and
+           this side PERFORMS the revival where propose() queues it. */
+        const clash = tagSlugClash(db, c.fields.name, tid);
+        if (!clash) continue;
+        const { slug, existing } = clash;
+        repointCreate(db, { changes, creates, tid, to: existing.id });
         /* Asking for the name again IS the reversal.
            `tag.retract` is a tombstone and the capability list says so out
            loud — "reversible" — and it sits at the same rank as `tag.create`:
@@ -2078,20 +2552,19 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
         fields.origin = 'user';
         fields.author_id = cs.author_id;
         /* Confirmed, because by the time this line runs somebody with the
-           authority to say yes has said it.
-           It used to read the AUTHOR's role and file a suggester's tag as
-           'proposed', and that was wrong in the one case it was written for.
-           A tag row is only ever created HERE, inside apply() — and apply() is
-           only reached two ways: an editor's own changeset, which auto-applies
-           because they may decide, or the review route, which requires
-           `review.decide`. So a suggester's tag came into existence at the
-           exact moment an editor approved it, and was then hidden from the
-           autocomplete that approval existed to put it in. The editor had to
-           find it again and confirm it a second time, on a screen that does
-           not explain why.
-           `proposed` is still a real state and still writable by hand — an
-           editor parking a tag they are unsure about — it simply is not
-           something an approval produces. */
+           authority to say yes has said it. Never read off the AUTHOR's role,
+           and never taken from the payload — `tag.status` is writable, so a
+           create carrying `status: 'confirmed'` is the escalation this refuses
+           by being set after the spread.
+
+           This used to be the ONLY place a tag row came into existence, and
+           the comment here used to argue from that: apply() is reached only by
+           an editor's own auto-applied changeset or by the review route, so
+           anything arriving here has been said yes to. That argument still
+           holds for the status — an approval always produces a confirmed tag —
+           but the premise is gone. propose() materialises the row as
+           `proposed` the moment it is suggested, so the usual job here is to
+           PROMOTE rather than to insert (see just below). */
         fields.status = 'confirmed';
         // No guess at a category. A row minted from an autocomplete miss has
         // none until someone gives it one, and picking the most common one for
@@ -2100,6 +2573,29 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
         // pickers rather than hiding on the surface it was not minted from;
         // whoever files it decides which surfaces it belongs to.
         if (!fields.kind) fields.kind = 'unknown';
+        /* The promotion. The row is normally already here — propose() put it
+           there as `proposed` — so an approval updates it into the vocabulary
+           instead of inserting it twice and dying on UNIQUE(id).
+           The INSERT below still runs when the row is genuinely absent, which
+           is a changeset left open across the deploy that added this. That is
+           why this is a branch and not a rewrite: both shapes have to keep
+           applying, or approving yesterday's queue fails. */
+        const had = db.prepare('SELECT status FROM tag WHERE id = ?').get(tid);
+        if (had) {
+          const set = Object.keys(fields);
+          db.prepare(`UPDATE tag SET ${set.map((f) => `${f} = ?`).join(', ')},` +
+                     ' updated_at = ? WHERE id = ?')
+            .run(...Object.values(fields), t, tid);
+          /* Recorded, because "this tag became real" is the single most
+             interesting thing an approval of a mint does, and without the row
+             the history shows a create that was already there and no event at
+             the moment it entered the vocabulary. */
+          if (had.status !== 'confirmed') {
+            record('tag', tid, 'status', had.status, 'confirmed');
+          }
+          for (const s of streamsOf(db, tt, tid)) touched.add(s);
+          continue;
+        }
       } else if (tt === 'snippet') {
         fields.origin = 'user';
         fields.author_id = cs.author_id;
@@ -2121,6 +2617,52 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
       db.prepare(`INSERT INTO ${tt}(${cols.join(',')}) ` +
                  `VALUES(${cols.map(() => '?').join(',')})`).run(...vals);
       for (const s of streamsOf(db, tt, tid)) touched.add(s);
+    }
+
+    /* ── a pending tag becomes vocabulary when something carrying it is said
+       yes to ──────────────────────────────────────────────────────────────
+       An editor approving "put Tokoyami Towa on this picture" has approved
+       Tokoyami Towa. Without this the junction applies and then every query
+       filters the tag straight back out, so the approval would appear to have
+       done nothing — the same shape as the bug the old comment on
+       `fields.status` above records, one level along.
+
+       It is also what makes ONE approval serve two suggesters: the second one
+       folded onto this row at propose time and has no create of their own, so
+       their attach is the only thing that can speak for it.
+
+       TWO TRIGGERS, because a tag reaches a row two ways. A junction inside
+       this changeset is the obvious one. The other is an upload: the taglet
+       route writes `snippet_taglet` directly, outside the changeset system,
+       so by the time an editor approves the CLIP the junctions are already
+       there and nothing in `changes` mentions a tag at all. Miss that and
+       approving the upload publishes a clip whose tags silently vanish. */
+    const bless = new Set();
+    for (const c of changes) {
+      if (c.op === 'create' && c.field === 'tag_id'
+          && Object.prototype.hasOwnProperty.call(JUNCTIONS, c.target_type)) {
+        bless.add(c.value);
+      }
+      // The owning row being approved, for the two kinds that get approved.
+      if (c.op === 'update' && c.field === 'status' && c.value === 'confirmed') {
+        const via = c.target_type === 'snippet'
+          ? ['snippet_taglet', 'snippet_id']
+          : c.target_type === 'music' ? ['music_tag', 'music_id'] : null;
+        if (via) {
+          for (const r of db.prepare(
+            `SELECT tag_id FROM ${via[0]} WHERE ${via[1]} = ?`).all(c.target_id)) {
+            bless.add(r.tag_id);
+          }
+        }
+      }
+    }
+    for (const id of bless) {
+      const tg = db.prepare('SELECT status FROM tag WHERE id = ?').get(id);
+      if (tg?.status !== 'proposed') continue;
+      db.prepare("UPDATE tag SET status = 'confirmed', updated_at = ? WHERE id = ?")
+        .run(t, id);
+      record('tag', id, 'status', 'proposed', 'confirmed');
+      for (const s of streamsOf(db, 'tag', id)) touched.add(s);
     }
 
     /* Editing any of these on a tag means a human has been over the row, so it
@@ -2194,6 +2736,67 @@ export function apply(db, csId, { reviewerId = null, note = null, force = false,
       }
     }
 
+    /* ── the chat description and the file it describes, kept together ──────
+     *
+     * `chat_meta_path` records WHICH file the five `chat_*` metadata columns
+     * describe, and `lookupStream` serves that metadata only while it matches
+     * `chat_path`. Otherwise it serves null, and the theater reads null as
+     * "this log cannot say what it is" and shows the old-format warning.
+     *
+     * The ingest route has always kept the two in step, which is why a merge
+     * pushed from a terminal was fine. An audit run from the website is not
+     * that road: its plan becomes a CHANGESET, and a changeset writes one
+     * named column at a time — so `chat_path` landed, the description landed,
+     * and the note saying they belong together did not. Every entry audited
+     * from the UI then carried a warning about a file that was perfectly good.
+     *
+     * The rule lives in two places and that is deliberate rather than
+     * careless: ingest folds it into the single UPDATE it was already
+     * building, and this repairs after the fact because a changeset has
+     * already written its columns one by one. Forcing one function would make
+     * the ingest path worse to spare six lines here. See `INGEST_STREAM` in
+     * server.js, which carries the other half of this comment.
+     *
+     * Anything this changeset did NOT mention described the OLD file and is
+     * cleared rather than left wearing the new file's path.
+     *
+     * Triggered by the DESCRIPTION, never by the path alone — the same
+     * condition ingest uses. A changeset that only moves `chat_path` has said
+     * nothing about what the new file contains, and writing `chat_meta_path`
+     * for it would file five nulls as a description of that file: the page
+     * would show the same warning it shows now, and the old file's real
+     * numbers would be gone. Left alone, the two simply fail to match, and
+     * "this log cannot say what it is" is the truth.
+     */
+    const CHAT_META_COLS = ['chat_version', 'chat_messages', 'chat_first_ms',
+                            'chat_last_ms', 'chat_moderation'];
+    const chatWrote = new Map();
+    for (const c of changes) {
+      if (c.target_type !== 'stream' || c.op !== 'update') continue;
+      if (!CHAT_META_COLS.includes(c.field)) continue;
+      if (!chatWrote.has(c.target_id)) chatWrote.set(c.target_id, new Set());
+      chatWrote.get(c.target_id).add(c.field);
+    }
+    for (const [sid, wrote] of chatWrote) {
+      /* Read AFTER this changeset's own columns have landed, so `chat_path`
+         is already whatever the set moved it to. Nothing here has to know
+         whether the path was in the same changeset. */
+      const cur = db.prepare(
+        'SELECT chat_path, chat_meta_path FROM stream WHERE id = ?').get(sid);
+      if (!cur) continue;
+      const target = cur.chat_path ?? null;
+      const set = { chat_meta_path: target };
+      /* Re-filed against a different file, so whatever this changeset did not
+         mention described the OLD one and is cleared rather than inherited.
+         Partial updates only mean anything while the file underneath stays
+         the same. */
+      if ((cur.chat_meta_path ?? null) !== target) {
+        for (const k of CHAT_META_COLS) if (!wrote.has(k)) set[k] = null;
+      }
+      db.prepare(`UPDATE stream SET ${Object.keys(set).map((k) => `${k}=?`).join(',')},
+                  updated_at=? WHERE id=?`).run(...Object.values(set), t, sid);
+    }
+
     db.prepare(`UPDATE changeset SET status='applied', reviewed_by=?, reviewed_at=?,
                 review_note=? WHERE id=?`).run(reviewerId, t, note, csId);
     // Deliberately NOT auto-superseding other open changesets for the same
@@ -2254,9 +2857,77 @@ export function reject(db, csId, { reviewerId = null, note = null } = {}) {
   const cs = db.prepare('SELECT status FROM changeset WHERE id = ?').get(csId);
   if (!cs) throw new ChangeError(`no changeset ${csId}`, 404);
   if (cs.status !== 'open') throw new ChangeError(`changeset is already ${cs.status}`);
+
+  /* ── the rows this changeset brought into existence go with it ────────────
+     This used to be a single status update and nothing else, because a tag
+     create did not become a row until apply(). It does now — propose()
+     materialises it as `proposed` so a suggester can type a name once and use
+     it ten times — so turning the suggestion down has to un-create it.
+
+     READ BY ID, off this changeset's own `op:'create'` rows. Never by name and
+     never by slug, and that is the whole safety property rather than a
+     detail: there is no code path here that can look a name up, so a rejection
+     cannot reach a row this changeset did not make, and "that name was
+     rejected once" can never become an answer about a different tag.
+
+     AND ONLY WHILE STILL `proposed`. A row that has since been confirmed — by
+     an editor, or by an approval of somebody else's changeset that attached it
+     — is a live tag other people are now using. Turning down the suggestion
+     that happened to mint it is not a decision about that tag, so this leaves
+     it alone. Two people suggest `smiley`, the first is approved, the second
+     is turned down: nobody loses `smiley`. */
+  const mine = db.prepare(
+    `SELECT DISTINCT target_id FROM change
+      WHERE changeset_id = ? AND op = 'create' AND target_type = 'tag'`).all(csId);
+  const doomed = [];
+  for (const { target_id } of mine) {
+    const row = db.prepare(
+      `SELECT id, name, slug FROM tag
+        WHERE id = ? AND status = 'proposed' AND retracted_at IS NULL`).get(target_id);
+    if (row) doomed.push(row);
+  }
+
+  /* Before the status flip, and each in its own transaction rather than all of
+     it in one. That is deliberate and both failure orders are safe: if a
+     cascade throws, the suggestion is still open and nothing has been
+     destroyed; if the flip below throws after one, rejecting again finds the
+     row already gone and does nothing. One transaction around the lot is not
+     available anyway — cascadeTag proposes, and propose() opens its own. */
+  const withdrew = [];
+  for (const row of doomed) {
+    /* Detached first, as one changeset naming every junction — so the log can
+       say why ten pictures lost a tag, and so the pairs are on the record.
+       A rejected slur has to come OFF the ten images its author put it on;
+       leaving them attached to an invisible row would mean a later revive
+       silently re-tagged all ten. */
+    const cut = cascadeTag(db, row.id, {
+      by: reviewerId,
+      reason: `the suggestion that minted ${row.name} was turned down`,
+    });
+    /* And then the row goes, rather than tombstoning. A tombstone would own
+       `smiley` forever — that is the documented trap `?retracted=1` exists to
+       dig out of — and this row was never confirmed, never public and never
+       used by anyone but its author. Freeing the slug is the point: the next
+       person to suggest the name should get a clean mint, not a collision with
+       something an editor already said no to.
+       Guarded on `proposed` a second time, in the statement itself, because
+       between the read above and here an approval of somebody else's attach
+       could have confirmed it. */
+    const gone = db.prepare(
+      "DELETE FROM tag WHERE id = ? AND status = 'proposed'").run(row.id);
+    if (gone.changes) withdrew.push({ ...row, detached: cut.detached,
+                                      changeset_id: cut.changeset_id });
+  }
+
   db.prepare(`UPDATE changeset SET status='rejected', reviewed_by=?, reviewed_at=?,
               review_note=? WHERE id=?`).run(reviewerId, now(), note, csId);
-  return summary(db, csId);
+  if (withdrew.length) bumpGeneration(db);
+  const out = summary(db, csId);
+  /* Handed back so the route can narrate it. A tag that stopped existing is
+     not something summary() can work out from the changeset's own rows — the
+     row it would have to read is the one that just went. */
+  if (withdrew.length) out.withdrew = withdrew;
+  return out;
 }
 
 function streamsOf(db, tt, tid) {

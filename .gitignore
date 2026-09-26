@@ -3,6 +3,7 @@ data/
 cache/
 whisper/
 models/
+.annex/
 
 # Scratch databases
 *.try.db
@@ -12,6 +13,7 @@ models/
 
 src/node_modules/
 .DS_Store
+
 docker-compose.yml
 *.log
 @eaDir/

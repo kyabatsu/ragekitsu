@@ -96,6 +96,170 @@ const MIGRATIONS = [
   ['snippet', 'kind',
    `ALTER TABLE snippet ADD COLUMN kind TEXT NOT NULL DEFAULT 'snippet'`],
   ['snippet', 'source', `ALTER TABLE snippet ADD COLUMN source TEXT`],
+
+  /* ── 2026-09-14, API tokens ───────────────────────────────────────────────
+     A session gains the four columns that let it be handed to a script rather
+     than held by a browser: what it may do (less than its owner, never more),
+     what it is for, how many writes it has left, and who issued it. The
+     reasoning is on the columns themselves in schema.sql.
+
+     ADD COLUMN and nothing else, which is why this is here and not in
+     REBUILDS — including on a WITHOUT ROWID table, where it works exactly the
+     same. Every existing row comes out with NULL in all four, and NULL `scope`
+     is defined as "everything this person may do": a browser session that was
+     open while the server restarted keeps working and keeps its authority. */
+  ['session', 'scope', `ALTER TABLE session ADD COLUMN scope TEXT`],
+  ['session', 'label', `ALTER TABLE session ADD COLUMN label TEXT`],
+  ['session', 'uses_left', `ALTER TABLE session ADD COLUMN uses_left INTEGER`],
+  /* With the REFERENCES clause, so a migrated database and a fresh one come
+     out identical rather than differing by one constraint nobody would think
+     to look for. SQLite allows it on ADD COLUMN precisely because the default
+     is NULL — a non-NULL default with a foreign key is the case it refuses. */
+  ['session', 'created_by',
+   `ALTER TABLE session ADD COLUMN created_by TEXT
+      REFERENCES person(id) ON DELETE SET NULL`],
+
+  /* Why a capture has no local copy. `video_ok = 0` has always meant three
+     different things at once — missing, unchecked, and deliberately not kept —
+     and the third is the common one, because both platforms get recorded and
+     one master is usually enough. Nullable and undefaulted on purpose: every
+     existing row comes out NULL, which reads as `unverified`, so nothing
+     claims to know something nobody observed. The reasoning is on the columns
+     in schema.sql. */
+  ['capture', 'video_state', `ALTER TABLE capture ADD COLUMN video_state TEXT`],
+  ['capture', 'chat_state', `ALTER TABLE capture ADD COLUMN chat_state TEXT`],
+
+  /* ── 2026-09-17, a grant says what it confers ──────────────────────────────
+     `person_grant` was (person_id, name) where `name` was a gate, so the row
+     said who and what-over and never what it CONFERS. It gains `capability`
+     and two scope terms, and the old `name` becomes one of them. The reasoning
+     is on the columns in schema.sql; the mechanics are here.
+
+     A REBUILD and not four ALTERs, and it is NOT in REBUILDS below. Two
+     reasons, both load-bearing:
+
+     · `name` was `TEXT NOT NULL`, and the renamed `scope_gate` must be
+       NULLABLE — a `snippet.replace` grant has a tag and no gate. SQLite
+       cannot loosen a column constraint with ALTER, so the table has to be
+       rewritten. Measured first: with NOT NULL still on it, a scoped grant
+       insert fails outright, and `INSERT OR IGNORE` in the grant endpoint
+       SWALLOWS that failure and answers 201 having written nothing. Both are
+       fixed here and at the endpoint.
+
+     · it cannot live in REBUILDS, which is where a data-copying change
+       belongs, because REBUILDS runs inside migrate() — AFTER create() execs
+       schema.sql. schema.sql declares the new UNIQUE index over `capability`,
+       and `CREATE INDEX IF NOT EXISTS` on a live database would look for a
+       column the rebuild had not added yet and refuse to boot. This is the
+       same ordering trap the note under REBUILDS describes, and the same
+       answer: the shape change runs before the schema exec.
+
+     Wrapped in BEGIN IMMEDIATE/COMMIT because it copies rows and REBUILDS'
+     argument for tx() is right — a half-moved table is not a state anybody can
+     reason about. Verified that a failure part-way leaves the transaction open
+     so closing the connection rolls it back: the database is untouched and the
+     boot fails loudly, which is what you want from a migration that did not
+     finish.
+
+     Keyed on `capability` being ABSENT, so it runs exactly once and is a no-op
+     on a fresh database, which schema.sql already builds in the finished
+     shape. Every existing row is a gate grant, which is why the backfill is a
+     literal: 'content.view' is what every one of them has always meant. */
+  ['person_grant', 'capability', `
+    BEGIN IMMEDIATE;
+    CREATE TABLE person_grant_new (
+      id         TEXT PRIMARY KEY,
+      person_id  TEXT NOT NULL REFERENCES person(id) ON DELETE CASCADE,
+      capability TEXT NOT NULL,
+      scope_gate TEXT,
+      scope_tag  TEXT REFERENCES tag(id) ON DELETE CASCADE,
+      scope_kind TEXT,
+      granted_by TEXT REFERENCES person(id) ON DELETE SET NULL,
+      created_at INTEGER NOT NULL
+    );
+    INSERT INTO person_grant_new(id, person_id, capability, scope_gate,
+                                 scope_tag, scope_kind, granted_by, created_at)
+      SELECT id, person_id, 'content.view', name, NULL, NULL, granted_by, created_at
+        FROM person_grant;
+    DROP TABLE person_grant;
+    ALTER TABLE person_grant_new RENAME TO person_grant;
+    COMMIT;
+  `],
+
+  /* ── 2026-09-18, the sovereign role ───────────────────────────────────────
+     `role` and `role_grant` landed one day earlier and needed no entry here,
+     because `schema.sql`'s CREATE TABLE IF NOT EXISTS reaches a database that
+     has neither. A COLUMN on an existing table is the case that does not, so
+     this is the ALTER, plus the one row it is about.
+
+     Two shapes of database arrive here and both come out right. One that has
+     never seen the role tables skips this — `hasTable` is false — and gets the
+     finished column from the schema exec that follows. One from the day in
+     between has the tables without the column, and gets it here.
+
+     The UPDATE is not decoration: `installRoles` only ever writes a role row
+     that is ABSENT, deliberately, so that an edited role keeps its edits
+     across a restart. An `admin` row written yesterday is present, so nothing
+     would set its flag and the archive would come up with no sovereign at all
+     — which is precisely the "nobody can fix it" state the flag exists to make
+     impossible. Keyed on the slug and on `builtin`, so a role somebody built
+     themselves and happened to call admin is left alone. */
+  ['role', 'sovereign', `
+    ALTER TABLE role ADD COLUMN sovereign INTEGER NOT NULL DEFAULT 0;
+    UPDATE role SET sovereign = 1 WHERE slug = 'admin' AND builtin = 1;
+    DELETE FROM role_grant WHERE role_slug IN
+      (SELECT slug FROM role WHERE sovereign = 1);
+  `],
+
+  /* ── 2026-09-24, the entry a job is about ─────────────────────────────
+     `job.stream_id`, so a stream's work can be found by asking for it rather
+     than by matching JSON text. See the column's own comment in schema.sql.
+
+     The UPDATE backfills what is already queued, and it is the reason this is
+     a migration rather than just a column. Every stream-scoped job ever
+     enqueued put its `stream_id` in the payload, so the value is right there
+     — json_extract lifts it out. Without this, a repair queued before the
+     restart would come up with a null column and be invisible to the panel
+     that exists to show it, which is precisely the confusion the column is
+     being added to end.
+
+     json_extract over LIKE because this one is exact: it reads the named key
+     rather than matching a substring, so it cannot confuse #744 with #7441.
+
+     Two guards, and both are load-bearing in the literal sense that removing
+     either stops the server BOOTING — a migration that throws takes create()
+     with it, and there is no half-migrated file to serve from.
+
+     The CASE is not decoration over a plain `WHERE json_valid(payload)`.
+     json_extract raises `malformed JSON` on a payload that is not JSON, and
+     AND does not short-circuit by definition — SQLite happens to evaluate
+     that WHERE left to right today, which means the plain form works by
+     planner accident. CASE short-circuits by language rule.
+
+     The SELECT is the second guard: the column has a foreign key, so a
+     payload naming a stream that no longer exists raises `FOREIGN KEY
+     constraint failed`. Looking the id up first turns that into a null. */
+  /* ── 2026-09-24, what the platform says a video is ────────────────────
+     `capture.remote_duration_s`. See the column's own comment in schema.sql.
+     A plain ADD COLUMN: every existing row comes out NULL, which is the
+     honest value — nobody has asked the platform about them. */
+  ['capture', 'remote_duration_s',
+   `ALTER TABLE capture ADD COLUMN remote_duration_s INTEGER`],
+
+  /* ── 2026-09-26, what the archive was holding when the audit ran ───────
+     `audit_report.state`. A plain ADD COLUMN: every existing row comes out
+     NULL, which is honest — those audits ran before the archive sent its own
+     state to be checked against, so nothing was read back. */
+  ['audit_report', 'state', `ALTER TABLE audit_report ADD COLUMN state TEXT`],
+
+  ['job', 'stream_id', `
+    ALTER TABLE job ADD COLUMN stream_id TEXT REFERENCES stream(id) ON DELETE CASCADE;
+    UPDATE job
+       SET stream_id = (SELECT s.id FROM stream s WHERE s.id =
+             CASE WHEN json_valid(payload)
+                  THEN json_extract(payload, '$.stream_id') END)
+     WHERE payload IS NOT NULL;
+  `],
 ];
 
 /* Rebuilds — for the shape changes ALTER TABLE cannot express: a new PRIMARY
@@ -183,6 +347,40 @@ export const ALL_KINDS = [...KINDS, 'unknown'];
    really a rule fires once, records itself, and then quietly stops being
    enforced, which is indistinguishable from working. */
 const BACKFILLS = [
+  /* ── 2026-09-18, the gate stops leaking to editors ────────────────────────
+   *
+   * The one behaviour change in the whole permission refactor, and it needs a
+   * one-shot because nothing else can reach it.
+   *
+   * `gate.bypass` was `atLeast(person, 'editor')` written out at five sites, a
+   * capability seeded to the editor role after that, and belongs to nobody but
+   * the sovereign as of step E — because one of this archive's gates names the
+   * performer's previous life, and a gate that a trusted editor can see
+   * through is not a gate.
+   *
+   * Changing the seed fixes a FRESH archive and nothing else. `installRoles`
+   * writes a role row only when it is absent, deliberately, so that an edit
+   * somebody made survives a restart — which means a database seeded before
+   * today keeps the editor's `gate.bypass` row forever and the change would
+   * never arrive where it matters. Hence this.
+   *
+   * Narrow, and the narrowness is the whole of why it is safe to run:
+   *   · SOVEREIGN roles are untouched, and hold it regardless — they have no
+   *     rows at all, so there is nothing here to match.
+   *   · a role somebody BUILT and ticked this onto is untouched, because
+   *     `builtin = 1` is the condition. That is a deliberate choice by an
+   *     owner and not ours to undo.
+   *   · it runs once, by label, and `backfills_ran` remembers. Re-granting it
+   *     in the role editor afterwards sticks.
+   *
+   * What replaces it: a GRANT, one person and one gate, under Gate ownership.
+   * That is the axis gates have always been on and the only one where
+   * "trusted for this, not for that" can be said at all. */
+  ['role_grant', 'gate_bypass_off_builtins', `
+    DELETE FROM role_grant
+     WHERE capability = 'gate.bypass'
+       AND role_slug IN (SELECT slug FROM role WHERE builtin = 1 AND sovereign = 0)
+  `],
 ];
 
 /** Accept a file or a directory. Pointing at a folder is the natural reading of
