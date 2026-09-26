@@ -16269,8 +16269,15 @@
         const spec = INLINE[k];
         const raw = pop5.querySelector(`[data-r="${k}"]`).value;
         if (mode === 'edit' && raw === spec.get(stream)) continue;
+        /* `hrToMin`, because that box is displayed in HOURS and `parse`
+           multiplies what it is handed by 60. Passing the raw `-5` made it
+           `-300 seconds` where it meant `-18000`, so a start time typed as
+           09:01 was stored as 09:06 UTC and redisplayed as 04:06 local —
+           every hand-typed start misfiled by (offset_hours x 59) seconds.
+           The REC_EXTRA loop below has always converted; this one did not.
+           On a UTC archive the bug is exactly zero and invisible for ever. */
         const out = spec.parse(raw, { ...stream, tz_offset_min:
-          Number(pop5.querySelector('[data-r="tz_offset_min"]').value || 0) });
+          hrToMin(pop5.querySelector('[data-r="tz_offset_min"]').value || 0) });
         if (out.error) return { error: `${spec.label}: ${out.error}` };
         if (mode === 'new' && (out.value === null || out.value === '')) continue;
         ch.push({ target_type: 'stream', target_id: sid, op, field: spec.write, value: out.value });
